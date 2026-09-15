@@ -384,6 +384,16 @@ class MemoryManager:
             # DRIFT signal (the scoped data lives under another slug),
             # not an explicit global-mode request.
             "project_scope_fallback_total": 0,
+            # ADR-0030 A0 (issue #324, review fix) — enrichment split
+            # by SOURCE LEG, never a single conflated numerator: the
+            # unconditional supersedes leg (v1 #315, always on) and the
+            # flag-gated relates_to walk (#324) each count their own
+            # requests. The A0-review's acceptance share is the WALK
+            # counter — a default deployment (flag off) reads 0 there
+            # however busy the supersedes leg is. Both count the merged
+            # page (a request enriched by both legs counts in both).
+            "graph_supersedes_enriched_requests_total": 0,
+            "graph_walk_enriched_requests_total": 0,
             "latency_samples_ms": [],
             "results_counts": [],
         }
@@ -1496,7 +1506,11 @@ class MemoryManager:
         explicit ``status=`` drill-down), quarantine (ADR-0019 §5) and
         refined_only (§4). Headroom-gated: the expansion runs only when
         the fused legs left room (a full fused page needs no
-        enrichment); no edges → the leg is a no-op.
+        enrichment); no edges → the leg is a no-op. ADR-0030 A0 (issue
+        #324): with ``mnemos.graph_walk`` ON (default OFF) the walk
+        additionally expands ``relates_to`` neighbours under the
+        identical gates and decay — invariants I1-I3 are pinned by
+        tests/test_graph_walk_invariants.py.
 
         Status filtering precedence:
           1. Explicit ``status`` — always wins (caller knows what they want).
@@ -1584,6 +1598,24 @@ class MemoryManager:
             if scope_fallback_used:
                 self._search_stats["project_scope_fallback_total"] = (
                     int(self._search_stats["project_scope_fallback_total"]) + 1
+                )
+            # ADR-0030 A0 (issue #324, review fix): the enrichment
+            # share SPLIT BY SOURCE LEG — ``via_graph`` alone conflates
+            # the unconditional supersedes leg with the flag-gated
+            # relates_to walk, so the walk counter would read non-zero
+            # on a default deployment whenever supersedes edges enrich
+            # pages. The rows carry their first-anchor discovery kind
+            # (``via_graph_kind``); each leg counts the requests its
+            # own rows enriched.
+            if any(
+                r.via_graph and r.via_graph_kind == "supersedes" for r in results
+            ):
+                self._search_stats["graph_supersedes_enriched_requests_total"] = (
+                    int(self._search_stats["graph_supersedes_enriched_requests_total"]) + 1
+                )
+            if any(r.via_graph and r.via_graph_kind == "relates_to" for r in results):
+                self._search_stats["graph_walk_enriched_requests_total"] = (
+                    int(self._search_stats["graph_walk_enriched_requests_total"]) + 1
                 )
             samples: list[float] = self._search_stats["latency_samples_ms"]
             samples.append(latency_ms)
@@ -1786,32 +1818,53 @@ class MemoryManager:
             if len(results) >= limit:
                 break
 
-        # ── Graph leg v1 (issue #313) ─────────────────────────────────────
-        # 1-hop expansion along memory_edges (supersedes, BOTH directions)
-        # from the top-``limit`` fused ids. Edge-sourced rows that are NOT
-        # already fused get appended with a decayed RRF slot — deterministic
-        # rule: an expansion row's weight is (1-alpha)/(rrf_k +
-        # 2*anchor_rank) where anchor_rank is its FIRST anchor's 1-based
-        # position in the fused ranking, so the appended block is a pure
-        # function of the fused ranking + the edge table. The expansion
-        # passes the SAME gates as the fused rows on EVERY axis: project
-        # (the A9 authoritative guard, review F2), status (the default
-        # ``allowed`` set AND the explicit ``status=`` drill-down, review
-        # F1), quarantine (absolute per ADR-0019 §5 — an edge is never a
-        # side door) and refined_only (§4). Headroom-gated: the expansion
-        # runs only when the fused legs left room (``len(results) < limit``
-        # — a full fused page needs no enrichment) and is capped at
-        # ``limit`` extra rows (so a search can at most double). No edges
-        # in the store → the whole leg is a no-op. Rows already surfaced by
-        # the fused legs (by id) are never re-appended via the graph.
+        # ── Graph leg (v1 issue #313; relates_to walk issue #324) ────────
+        # 1-hop expansion along memory_edges from the top-``limit`` fused
+        # ids. Kinds walked: ``supersedes`` BOTH directions (v1, the
+        # unconditional leg) and, when ``mnemos.graph_walk`` is ON,
+        # ``relates_to`` both directions (ADR-0030 A0, issue #324 — the
+        # minted fuel reaches search; the flag is default-OFF, and
+        # invariants I1-I3 are pinned by tests/test_graph_walk_invariants.py).
+        # Edge-sourced rows that are NOT already fused get appended with a
+        # decayed RRF slot — deterministic rule: an expansion row's weight
+        # is (1-alpha)/(rrf_k + 2*anchor_rank) where anchor_rank is its
+        # FIRST anchor's 1-based position in the fused ranking, so the
+        # appended block is a pure function of the fused ranking + the
+        # edge table. Edge ``weight`` deliberately does NOT enter the A0
+        # decay (the w_edge ranking formula is A1, #325) and can never
+        # influence eligibility — I3.
+        # The expansion passes the SAME gates as the fused rows on EVERY
+        # axis and for BOTH kinds: project (the A9 authoritative guard,
+        # review F2 / I1), status (the default ``allowed`` set AND the
+        # explicit ``status=`` drill-down, review F1 / I1), quarantine
+        # (absolute per ADR-0019 §5 — an edge is never a side door, I2)
+        # and refined_only (§4). Headroom-gated: the expansion runs only
+        # when the fused legs left room (``len(results) < limit`` — a full
+        # fused page needs no enrichment) and is capped at ``limit`` extra
+        # rows (so a search can at most double). No edges in the store →
+        # the whole leg is a no-op. Rows already surfaced by the fused
+        # legs (by id) are never re-appended via the graph.
+        # Each appended row is TAGGED with its first-anchor discovery
+        # kind (``via_graph_kind``) so the enrichment telemetry splits by
+        # SOURCE LEG (#324 review fix): a neighbour reachable via both
+        # kinds from its first anchor counts as supersedes — the
+        # unconditional leg reached it; the walk counter claims only what
+        # the relates_to leg alone surfaced.
         if len(results) < limit:
             fused_ids = [r.memory.id for r in results]
             anchor_rank: dict[str, int] = {}
+            walk_sourced: set[str] = set()
             for pos, anchor_id in enumerate(fused_ids, start=1):
-                for neighbour_id in sorted(self._graph_adjacent(anchor_id)):
+                supersedes_adj = self._graph_adjacent(anchor_id)
+                relates_adj: set[str] = set()
+                if self.settings.mnemos.graph_walk:
+                    relates_adj = self._graph_adjacent(anchor_id, kind="relates_to")
+                for neighbour_id in sorted(supersedes_adj | relates_adj):
                     if neighbour_id in anchor_rank or neighbour_id in scores:
                         continue  # first anchor wins; fused rows never re-surface
                     anchor_rank[neighbour_id] = pos
+                    if neighbour_id in relates_adj and neighbour_id not in supersedes_adj:
+                        walk_sourced.add(neighbour_id)
             for neighbour_id, pos in anchor_rank.items():
                 if len(results) >= limit + limit:
                     break
@@ -1848,11 +1901,14 @@ class MemoryManager:
                         score=decayed,
                         search_type=search_type,
                         via_graph=True,
+                        via_graph_kind="relates_to"
+                        if neighbour_id in walk_sourced
+                        else "supersedes",
                     )
                 )
         return results
 
-    # ── Graph leg v1 helpers (issue #313) ─────────────────────────────────
+    # ── Graph leg helpers (v1 issue #313; relates_to walk issue #324) ────
 
     def _graph_adjacent(self, memory_id: str, *, kind: str = "supersedes") -> set[str]:
         """1-hop neighbour ids along ``memory_edges`` (both directions).
@@ -1863,6 +1919,12 @@ class MemoryManager:
         older sibling it replaced. Returns the neighbour ids only (the
         caller excludes / resolves them); a missing memory id simply has
         no rows in memory_edges.
+
+        ``kind`` is the extension point (ADR-0030): issue #324's walk
+        consults ``relates_to`` through the SAME primitive — the walk
+        loop in ``_search_core`` holds the flag policy (supersedes
+        always; relates_to only behind ``mnemos.graph_walk``) and tags
+        each appended row with its first-anchor discovery kind.
         """
         neighbours: set[str] = set()
         try:
@@ -2777,6 +2839,18 @@ class MemoryManager:
             # and were retried without the scope — the project-drift
             # (scope slug vs stored slug) audit signal.
             "project_scope_fallback_total": int(self._search_stats["project_scope_fallback_total"]),
+            # ADR-0030 A0 (issue #324, review fix): enrichment split by
+            # source leg — the unconditional supersedes leg and the
+            # flag-gated relates_to walk. The WALK counter over
+            # requests is the acceptance share the A0-review reads
+            # alongside ``graph_mint_stats``; the supersedes counter is
+            # the v1 leg's own (always-on) signal.
+            "graph_supersedes_enriched_requests_total": int(
+                self._search_stats["graph_supersedes_enriched_requests_total"]
+            ),
+            "graph_walk_enriched_requests_total": int(
+                self._search_stats["graph_walk_enriched_requests_total"]
+            ),
             "avg_latency_ms": avg_latency_ms,
             "avg_results": avg_results,
         }
@@ -3002,6 +3076,12 @@ class MemoryManager:
                 "requests_total": s_stats["requests_total"],
                 "cross_project_requests_total": s_stats["cross_project_requests_total"],
                 "project_scope_fallback_total": s_stats["project_scope_fallback_total"],
+                "graph_supersedes_enriched_requests_total": s_stats[
+                    "graph_supersedes_enriched_requests_total"
+                ],
+                "graph_walk_enriched_requests_total": s_stats[
+                    "graph_walk_enriched_requests_total"
+                ],
                 "avg_latency_ms": s_stats["avg_latency_ms"],
                 "avg_results": s_stats["avg_results"],
             },
@@ -3015,10 +3095,14 @@ class MemoryManager:
                 "captured_used_total": fb_stats["captured_used_total"],
                 "captured_rejected_total": fb_stats["captured_rejected_total"],
             },
-            # ADR-0030 A0 (issue #322) — the minting-rate leg: flag state
-            # plus per-project NEW-edge counters (in-memory, since restart).
+            # ADR-0030 A0 (issues #322/#324) — the fuel and walk legs:
+            # flag states plus per-project NEW-edge counters (in-memory,
+            # since restart). The walk share rides ``search`` above
+            # (graph_walk_enriched_requests_total / requests_total —
+            # split from the supersedes leg per the #324 review fix).
             "graph": {
                 "auto_mint_enabled": self.settings.mnemos.graph_auto_mint,
+                "walk_enabled": self.settings.mnemos.graph_walk,
                 "auto_dedupe_edges_total": g_stats["auto_dedupe_edges_total"],
                 "auto_dedupe_edges_by_project": g_stats["auto_dedupe_edges_by_project"],
             },
@@ -5185,8 +5269,10 @@ class MemoryManager:
         """Record a directed edge ``from_memory_id`` → ``to_memory_id``.
 
         Thin wrapper over ``SQLiteStore.add_memory_edge`` (validation and
-        constraints live there). ADR-0030 A0 (issue #321): ``kind`` now
-        also accepts ``relates_to``, and the edge carries ``weight`` /
+        constraints live there — including the #324 weight validation:
+        finite and strictly positive, negative/0/inf/NaN rejected with a
+        caller-actionable ValueError). ADR-0030 A0 (issue #321): ``kind``
+        now also accepts ``relates_to``, and the edge carries ``weight`` /
         ``provenance`` / ``scope_project`` / ``scope_agent`` with the
         contract defaults (1.0 / 'declared' / NULL / NULL). Returns
         ``True`` when inserted, ``False`` when the edge already existed
