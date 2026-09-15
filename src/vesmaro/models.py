@@ -603,10 +603,20 @@ class SearchResult(BaseModel):
     # original request and the caller must be able to see that.
     project_scope_fallback: bool = False
     # ``via_graph``: the row was appended by the 1-hop memory_edges
-    # expansion (supersedes neighbours of fused hits), not by lexical /
+    # expansion (edge neighbours of fused hits), not by lexical /
     # vector matching. Edge-sourced rows pass the same status /
     # quarantine / refined_only gates as every other result.
     via_graph: bool = False
+    # ``via_graph_kind`` (#324 review fix): the edge kind of the row's
+    # FIRST-ANCHOR discovery — "supersedes" (the unconditional v1 leg,
+    # always on) or "relates_to" (the flag-gated A0 walk). ``None`` for
+    # ordinary fused hits. Splits the enrichment telemetry by SOURCE
+    # LEG so the flag-gated walk share is measurable without conflating
+    # it with the unconditional supersedes leg (a neighbour reachable
+    # via both kinds from its first anchor counts as supersedes — the
+    # unconditional leg reached it; the walk claims only what it alone
+    # surfaced).
+    via_graph_kind: str | None = None
 
 
 # ── Trace model (M6 — explainability layer) ────────────────────────────────────
