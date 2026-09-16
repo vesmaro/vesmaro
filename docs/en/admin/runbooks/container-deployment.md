@@ -3,23 +3,27 @@
 **🌐 Language / Язык:** English · [Русский](../../../ru/admin/runbooks/container-deployment.md)
 
 > Admin-tier runbook for building, pushing, and running Mnemos in a container.
-> Covers five deployment paths: `deploy.sh` helper, `podman-compose`, raw `podman run`,
-> Kubernetes (`podman kube play`), and systemd via quadlet.
+> Covers the container-native paths: `deploy.sh` helper, docker/podman-compose,
+> raw `podman run`, `podman kube play`, and systemd via quadlet. For real
+> Kubernetes/K3s clusters use the Helm chart —
+> [kubernetes-deployment.md](../kubernetes-deployment.md).
 
 ---
 
 ## Overview
 
 Mnemos ships a `Containerfile` (OCI-compatible, podman/buildah) and a ready-made `compose.yaml`.
-Five deployment paths are available — pick the one that fits your environment:
+Seven deployment paths are available — pick the one that fits your environment:
 
 | Path | Tool | When to use |
 |------|------|-------------|
 | `./scripts/deploy.sh` | podman + podman-compose | Dev and automation — wraps every other option |
 | `podman-compose up` | podman-compose | Recommended for single-host production |
+| `docker compose up` | Docker Compose | Same on Docker — `deploy/docker/` (pre-built image) |
 | `podman run` | podman | Minimal dependencies; use the pre-built image from ghcr.io |
 | `podman kube play` | podman | Kubernetes-style pod on a single host |
 | systemd quadlet | podman + systemd | Long-running user service with automatic restart |
+| Helm chart | Helm 3 + K8s/K3s | Real clusters — [kubernetes-deployment.md](../kubernetes-deployment.md) |
 
 The container exposes **port 8787** and uses two named volumes: `mnemos-data` (SQLite + vector index)
 and `mnemos-vault` (Obsidian markdown mirror).
@@ -58,8 +62,10 @@ The deploy helper does the same:
 ./scripts/deploy.sh build
 ```
 
-> **CI**: `.github/workflows/release.yml` builds and tags the image automatically on every `v*.*.*`
-> tag push. Manual builds are needed only for local testing or out-of-band deploys.
+> **Release builds**: the local release pipeline (`scripts/local-release.sh`) builds and
+> pushes the image on every release — GitHub Actions are disabled, and this script is the
+> canonical path (see [ci-cd.md](ci-cd.md)). Manual builds are needed only for local testing
+> or out-of-band deploys.
 
 ---
 
@@ -82,8 +88,10 @@ Makefile shortcut:
 make push-image
 ```
 
-> **CI**: `release.yml` pushes both the versioned tag and `:latest` to `ghcr.io/korrnals/mnemos`
-> automatically using `GITHUB_TOKEN`. No manual push is required as part of the normal release cycle.
+> **Release pushes**: `scripts/local-release.sh` pushes both the versioned tag and `:latest`
+> to `ghcr.io/korrnals/mnemos` on every release. No manual push is required as part of the
+> normal release cycle. The registry moves to `ghcr.io/vesmaro/vesmaro` in the 5.0.0 wave
+> (ADR-0031); chart, compose and docs carry the one-line switch.
 
 ---
 
@@ -173,17 +181,20 @@ mount is required unless you want to override settings.
 
 ---
 
-## Run — Kubernetes
+## Run — Kubernetes-style pod (podman kube play)
 
-Mnemos ships a Kubernetes-style pod manifest (`deploy/kube/mnemos-pod.yaml`) compatible with
-`podman kube play`. The manifest uses `PersistentVolumeClaims`, so named volumes must exist first.
+Mnemos ships a Kubernetes-style pod manifest (`deploy/podman/kube/mnemos-pod.yaml`) compatible
+with `podman kube play`. The manifest uses `PersistentVolumeClaims`, so named volumes must exist
+first, and it injects the TOTP key from a podman secret plus health probes.
 
 ### Start
 
 ```bash
+printf 'MNEMOS_API__TOTP_MASTER_KEY=<your-key>\nVESMARO_API__TOTP_MASTER_KEY=<your-key>\n' \
+  | podman secret create vesmaro-totp -
 podman volume create mnemos-data
 podman volume create mnemos-vault
-podman kube play deploy/kube/mnemos-pod.yaml
+podman kube play deploy/podman/kube/mnemos-pod.yaml
 ```
 
 Shortcut (creates volumes automatically before playing the manifest):
@@ -214,12 +225,13 @@ service. The unit references `localhost/mnemos:latest`, so build the image local
 
 ### Set the TOTP key
 
-Edit `deploy/quadlet/mnemos.container` and add the key before installing:
+The unit reads the key from `~/.vesmaro.env` (`EnvironmentFile`), so no unit
+editing is needed. Both env spellings must carry the same value — 4.x images
+read `MNEMOS_API__*`, 5.x images read `VESMARO_API__*` (ADR-0031):
 
-```ini
-[Container]
-# ... existing lines ...
-Environment=MNEMOS_API__TOTP_MASTER_KEY=<your-key>
+```bash
+KEY=$(openssl rand -hex 32)
+printf 'MNEMOS_API__TOTP_MASTER_KEY=%s\nVESMARO_API__TOTP_MASTER_KEY=%s\n' "$KEY" "$KEY" > ~/.vesmaro.env
 ```
 
 ### Install the unit
@@ -228,7 +240,7 @@ Environment=MNEMOS_API__TOTP_MASTER_KEY=<your-key>
 ./scripts/deploy.sh quadlet
 ```
 
-This copies `deploy/quadlet/mnemos.container` to `~/.config/containers/systemd/` and runs
+This copies `deploy/podman/quadlet/mnemos.container` to `~/.config/containers/systemd/` and runs
 `systemctl --user daemon-reload`.
 
 ### Start and enable
@@ -322,6 +334,8 @@ Prints running containers (name, status, ports) and named volumes.
 
 ## See also
 
+- [kubernetes-deployment.md](../kubernetes-deployment.md) — Helm chart for real K8s/K3s clusters
+- [`deploy/README.md`](../../../../deploy/README.md) — all deployment paths at a glance
 - [install.md](install.md) — bare-metal / virtualenv install
 - [../security.md](../security.md) — threat model, auth model, SSRF guard
 - [../../user/getting-started.md](../../user/getting-started.md) — first run guide
@@ -329,4 +343,5 @@ Prints running containers (name, status, ports) and named volumes.
 ---
 
 _Source files: `Containerfile`, `compose.yaml`, `config.container.yaml`, `scripts/deploy.sh`,
-`deploy/quadlet/mnemos.container`, `deploy/kube/mnemos-pod.yaml`_
+`deploy/podman/quadlet/mnemos.container`, `deploy/podman/kube/mnemos-pod.yaml`,
+`deploy/docker/`, `deploy/helm/vesmaro/`_

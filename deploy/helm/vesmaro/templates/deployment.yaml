@@ -1,0 +1,110 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vesmaro.fullname" . }}
+  labels:
+    {{- include "vesmaro.labels" . | nindent 4 }}
+spec:
+  # SQLite + ReadWriteOnce storage allow a single live pod; Recreate avoids
+  # a stuck rollout where the old pod holds the volume.
+  strategy:
+    type: Recreate
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "vesmaro.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+      labels:
+        {{- include "vesmaro.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "vesmaro.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: vesmaro
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8787
+              protocol: TCP
+          # 4.x images read MNEMOS_API__*; 5.x+ read VESMARO_API__*
+          # (ADR-0031 dual-prefix contract) — set both from one secret.
+          env:
+            - name: MNEMOS_API__TOTP_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vesmaro.secretName" . }}
+                  key: {{ .Values.auth.existingSecretKey }}
+            - name: VESMARO_API__TOTP_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vesmaro.secretName" . }}
+                  key: {{ .Values.auth.existingSecretKey }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: data
+              mountPath: /data
+            - name: vault
+              mountPath: /vault
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "vesmaro.fullname" . }}
+        - name: data
+          {{- if .Values.persistence.data.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "vesmaro.fullname" . }}-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: vault
+          {{- if .Values.persistence.vault.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "vesmaro.fullname" . }}-vault
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

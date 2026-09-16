@@ -92,6 +92,61 @@ mnemos search "remembers across sessions"
 
 That is the whole loop: **write, find, never lose it — and the agent knows when to look.**
 
+### Server in a container or a cluster
+
+The same server as a prebuilt image — three more ways to run it, from a single host to any
+Kubernetes cluster. Full guides live in the admin docs.
+
+<details>
+<summary><strong>☸️ Kubernetes / K3s — Helm chart with ingress</strong></summary>
+
+```bash
+helm install vesmaro deploy/helm/vesmaro \
+  --namespace vesmaro --create-namespace \
+  --set auth.totpMasterKey="$(openssl rand -hex 32)" \
+  --set ingress.className=traefik \
+  --set 'ingress.hosts[0].host=mnemos.example.com'
+kubectl -n vesmaro rollout status deploy/vesmaro
+```
+
+K3s ships Traefik and local-path storage, so the commands work as-is — chart, values and
+TLS setup: **[Kubernetes deployment](docs/en/admin/kubernetes-deployment.md)**.
+</details>
+
+<details>
+<summary><strong>🐳 Docker / Docker Compose</strong></summary>
+
+```bash
+cd deploy/docker
+cp .env.example .env                    # put your TOTP_MASTER_KEY=$(openssl rand -hex 32) inside
+docker compose up -d                    # podman-compose works too
+curl -fsS http://localhost:8787/health  # → {"status":"ok"}
+```
+
+Full guide: **[container deployment](docs/en/admin/runbooks/container-deployment.md)**.
+</details>
+
+<details>
+<summary><strong>🦭 Podman — systemd quadlet or kube play</strong></summary>
+
+```bash
+# systemd user service (preferred for a long-running host)
+podman build -t localhost/mnemos:latest -f Containerfile .
+cp deploy/podman/quadlet/mnemos.container ~/.config/containers/systemd/
+# add the TOTP key to ~/.vesmaro.env (both env spellings), then:
+systemctl --user daemon-reload && systemctl --user start mnemos
+curl -fsS http://localhost:8787/health
+```
+
+Both Podman recipes (quadlet + `podman kube play`):
+**[deploy/podman/README.md](deploy/podman/README.md)** · full guide:
+**[container deployment](docs/en/admin/runbooks/container-deployment.md)**.
+</details>
+
+> ℹ️ The prebuilt image (`ghcr.io/korrnals/mnemos`) is currently **private** — run
+> `docker login ghcr.io` / `podman login ghcr.io` first, or build locally:
+> `podman build -f Containerfile .`
+
 > 📘 **Want every detail?** The extended guide covers all install variants (`uv tool`, `pipx`,
 > CLI-only, external LLM extras, installer script, container), per-harness connection
 > walkthroughs, configuration, and troubleshooting:
@@ -285,6 +340,7 @@ conversations that survive restarts. See [a2a-sessions.md](docs/en/architecture/
 | [http-api.md](docs/en/user/http-api.md) | Every HTTP endpoint (memory CRUD, workflow, hooks, A2A Sessions) |
 | [tag-contract.md](docs/en/user/tag-contract.md) | The `project:` / `agent:` / `mnemos:` schema enforced on every memory |
 | [security.md](docs/en/admin/security.md) | Threat model, SSRF guard, FTS5 escape, auth model |
+| [kubernetes-deployment.md](docs/en/admin/kubernetes-deployment.md) | Helm chart for K8s/K3s clusters: ingress, storage, TLS, TOTP secret |
 | [runbooks/](docs/en/admin/runbooks/) | Install, migrate, backup / restore, dependency updates, container deployment |
 | [adr/](docs/project/adr/) | Architectural decision records — the *why* behind the design |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes — Keep a Changelog format |

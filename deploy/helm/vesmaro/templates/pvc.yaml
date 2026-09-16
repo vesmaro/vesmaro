@@ -1,0 +1,20 @@
+{{- range $name, $vol := dict "data" .Values.persistence.data "vault" .Values.persistence.vault }}
+{{- if $vol.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "vesmaro.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "vesmaro.labels" $ | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml $vol.accessModes | nindent 4 }}
+  {{- with $vol.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $vol.size }}
+---
+{{- end }}
+{{- end }}

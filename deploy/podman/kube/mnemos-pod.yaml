@@ -1,0 +1,65 @@
+# Kubernetes-style pod manifest for `podman kube play` — single-host Podman.
+# For a real cluster (K8s/K3s) use the Helm chart: deploy/helm/vesmaro/.
+#
+# Usage:
+#   printf 'MNEMOS_API__TOTP_MASTER_KEY=<your-key>\nVESMARO_API__TOTP_MASTER_KEY=<your-key>\n' \
+#     | podman secret create vesmaro-totp -
+#   podman volume create mnemos-data && podman volume create mnemos-vault
+#   podman kube play deploy/podman/kube/mnemos-pod.yaml
+# Stop:
+#   podman kube down deploy/podman/kube/mnemos-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mnemos
+  labels:
+    app: mnemos
+spec:
+  containers:
+    - name: api
+      # Local build (see docs Build section). Swap for the published image:
+      #   ghcr.io/korrnals/mnemos:4.3.0
+      image: localhost/mnemos:latest
+      ports:
+        - containerPort: 8787
+          hostPort: 8787
+          protocol: TCP
+      env:
+        - name: MNEMOS_CONFIG
+          value: /app/config.yaml
+      # 4.x images read MNEMOS_API__*, 5.x read VESMARO_API__* (ADR-0031) —
+      # the secret must carry both lines (see header example).
+      envFrom:
+        - secretRef:
+            name: vesmaro-totp
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8787
+        initialDelaySeconds: 20
+        periodSeconds: 30
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8787
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      resources:
+        limits:
+          memory: "2Gi"
+          cpu: "2"
+        requests:
+          memory: "512Mi"
+          cpu: "500m"
+      volumeMounts:
+        - name: mnemos-data
+          mountPath: /data
+        - name: mnemos-vault
+          mountPath: /vault
+  volumes:
+    - name: mnemos-data
+      persistentVolumeClaim:
+        claimName: mnemos-data
+    - name: mnemos-vault
+      persistentVolumeClaim:
+        claimName: mnemos-vault
