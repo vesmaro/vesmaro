@@ -6,13 +6,13 @@
 replicaCount: 1
 
 image:
-  # Published images currently use the mnemos brand. After the 5.0.0 registry
-  # migration (ADR-0031 / GWS card #331, phase g) switch to
-  # ghcr.io/vesmaro/vesmaro.
-  repository: ghcr.io/korrnals/mnemos
+  # Canonical org registry (backfilled from the legacy user namespace in the
+  # 4.3.0 wave; the release pipeline moves here permanently in 5.0.0 phase-g).
+  repository: ghcr.io/vesmaro/vesmaro
   tag: ""            # empty = Chart.yaml appVersion
   pullPolicy: IfNotPresent
-  pullSecrets: []    # image is private on ghcr.io — set a docker-registry secret here if needed
+  pullSecrets: []    # package is private until made Public in Package settings;
+                     # until then pass a docker-registry secret here
 
 nameOverride: ""
 fullnameOverride: ""

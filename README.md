@@ -131,9 +131,9 @@ Full guide: **[container deployment](docs/en/admin/runbooks/container-deployment
 
 ```bash
 # systemd user service (preferred for a long-running host)
-podman build -t localhost/mnemos:latest -f Containerfile .
 cp deploy/podman/quadlet/mnemos.container ~/.config/containers/systemd/
 # add the TOTP key to ~/.vesmaro.env (both env spellings), then:
+podman pull ghcr.io/vesmaro/vesmaro:4.3.0
 systemctl --user daemon-reload && systemctl --user start mnemos
 curl -fsS http://localhost:8787/health
 ```
@@ -143,9 +143,8 @@ Both Podman recipes (quadlet + `podman kube play`):
 **[container deployment](docs/en/admin/runbooks/container-deployment.md)**.
 </details>
 
-> ℹ️ The prebuilt image (`ghcr.io/korrnals/mnemos`) is currently **private** — run
-> `docker login ghcr.io` / `podman login ghcr.io` first, or build locally:
-> `podman build -f Containerfile .`
+> ℹ️ The published image (`ghcr.io/vesmaro/vesmaro`) is currently **private** — run
+> `docker login ghcr.io` / `podman login ghcr.io` first if the pull is denied.
 
 > 📘 **Want every detail?** The extended guide covers all install variants (`uv tool`, `pipx`,
 > CLI-only, external LLM extras, installer script, container), per-harness connection

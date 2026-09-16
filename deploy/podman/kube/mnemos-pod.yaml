@@ -17,9 +17,9 @@ metadata:
 spec:
   containers:
     - name: api
-      # Local build (see docs Build section). Swap for the published image:
-      #   ghcr.io/korrnals/mnemos:4.3.0
-      image: localhost/mnemos:latest
+      # Published image (org namespace). Local build alternative:
+      #   podman build -t localhost/mnemos:latest -f Containerfile .
+      image: ghcr.io/vesmaro/vesmaro:4.3.0
       ports:
         - containerPort: 8787
           hostPort: 8787

@@ -131,7 +131,8 @@ helm upgrade vesmaro deploy/helm/vesmaro -n vesmaro --reuse-values \
 
 ## Статус реестра образов
 
-Опубликованные образы сейчас живут в **`ghcr.io/korrnals/mnemos`** и **приватные**:
+Опубликованные образы живут в **`ghcr.io/vesmaro/vesmaro`** (org-неймспейс,
+перезалит из легаси-user-неймспейса в волне 4.3.0). Пакет сейчас **приватный**:
 
 - если pull падает, создайте `docker-registry`-секрет и передайте его:
 
@@ -142,12 +143,12 @@ helm upgrade vesmaro deploy/helm/vesmaro -n vesmaro --reuse-values \
     --set 'image.pullSecrets[0].name=ghcr-login'
   ```
 
-- после миграции реестра в 5.0.0 (ADR-0031 / GWS card #331, фаза g)
-  переключитесь на org-неймспейс:
+- после переключения пакета в **Public** (Package settings → Danger
+  Zone → Change visibility) обычный pull работает везде без секретов.
 
-  ```bash
-  --set image.repository=ghcr.io/vesmaro/vesmaro
-  ```
+Релизный конвейер пока таргетит легаси-имя `ghcr.io/korrnals/mnemos` до
+миграции реестра в 5.0.0 (ADR-0031 / GWS card #331, фаза g); новые релизы
+в это время дотягиваются в org-неймспейс вручную.
 
 ## Обновления и удаление
 

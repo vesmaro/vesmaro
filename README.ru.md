@@ -131,9 +131,9 @@ curl -fsS http://localhost:8787/health  # → {"status":"ok"}
 
 ```bash
 # systemd user-сервис (предпочтительно для постоянно работающего хоста)
-podman build -t localhost/mnemos:latest -f Containerfile .
 cp deploy/podman/quadlet/mnemos.container ~/.config/containers/systemd/
 # впишите TOTP-ключ в ~/.vesmaro.env (оба имени переменной), затем:
+podman pull ghcr.io/vesmaro/vesmaro:4.3.0
 systemctl --user daemon-reload && systemctl --user start mnemos
 curl -fsS http://localhost:8787/health
 ```
@@ -143,9 +143,8 @@ curl -fsS http://localhost:8787/health
 **[контейнерное развёртывание](docs/ru/admin/runbooks/container-deployment.md)**.
 </details>
 
-> ℹ️ Готовый образ (`ghcr.io/korrnals/mnemos`) сейчас **приватный** — сначала выполните
-> `docker login ghcr.io` / `podman login ghcr.io`, либо соберите локально:
-> `podman build -f Containerfile .`
+> ℹ️ Опубликованный образ (`ghcr.io/vesmaro/vesmaro`) сейчас **приватный** — если pull
+> отклонён, сначала выполните `docker login ghcr.io` / `podman login ghcr.io`.
 
 > 📘 **Хотите каждую деталь?** Расширенный гид покрывает все варианты установки (`uv tool`, `pipx`,
 > только CLI, внешние LLM-экстры, скрипт-установщик, контейнер), пошаговое подключение каждого

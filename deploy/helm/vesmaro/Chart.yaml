@@ -4,11 +4,10 @@ description: Vesmaro (Mnemos) — local-first memory & knowledge server for AI a
 type: application
 
 # Chart version — bump on any template or default change (semver).
-version: 0.1.0
-# Version of the container image deployed by default. The published images
-# live at ghcr.io/korrnals/mnemos (mnemos brand) until the 5.0.0 registry
-# migration completes (ADR-0031 / GWS card #331, phase g) — after that,
-# switch image.repository to ghcr.io/vesmaro/vesmaro.
+version: 0.1.1
+# Version of the container image deployed by default, published at
+# ghcr.io/vesmaro/vesmaro (backfilled in the 4.3.0 wave; the release
+# pipeline moves here permanently in 5.0.0 phase-g, GWS card #331).
 appVersion: "4.3.0"
 kubeVersion: ">=1.25.0-0"
 
@@ -29,4 +28,4 @@ annotations:
   artifacthub.io/license: Apache-2.0
   artifacthub.io/images: |
     - name: vesmaro
-      image: ghcr.io/korrnals/mnemos:4.3.0
+      image: ghcr.io/vesmaro/vesmaro:4.3.0

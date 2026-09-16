@@ -8,10 +8,11 @@
 #   systemctl --user daemon-reload && systemctl --user start mnemos
 [Container]
 ContainerName=mnemos
-# Local build (see docs Build section). Swap for the published image:
-#   Image=ghcr.io/korrnals/mnemos:4.3.0   (then remove AutoUpdate=local)
-Image=localhost/mnemos:latest
-AutoUpdate=local
+# Published image (org namespace). Local build alternative:
+#   podman build -t localhost/mnemos:latest -f Containerfile .
+#   → then set Image=localhost/mnemos:latest and AutoUpdate=local
+Image=ghcr.io/vesmaro/vesmaro:4.3.0
+AutoUpdate=registry
 
 PublishPort=8787:8787
 Volume=mnemos-data:/data
