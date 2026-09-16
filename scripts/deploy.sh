@@ -68,18 +68,18 @@ cmd_kube_up() {
     # Ensure volumes exist
     podman volume create mnemos-data 2>/dev/null || true
     podman volume create mnemos-vault 2>/dev/null || true
-    podman kube play deploy/kube/mnemos-pod.yaml
+    podman kube play deploy/podman/kube/mnemos-pod.yaml
     echo "Mnemos API:   http://localhost:8787"
 }
 
 cmd_kube_down() {
-    podman kube down deploy/kube/mnemos-pod.yaml
+    podman kube down deploy/podman/kube/mnemos-pod.yaml
 }
 
 cmd_quadlet() {
     local target_dir="$HOME/.config/containers/systemd"
     mkdir -p "$target_dir"
-    cp deploy/quadlet/mnemos.container "$target_dir/"
+    cp deploy/podman/quadlet/mnemos.container "$target_dir/"
     systemctl --user daemon-reload
     echo "Quadlet installed. Start with:"
     echo "  systemctl --user start mnemos"

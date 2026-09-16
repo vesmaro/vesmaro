@@ -1,0 +1,44 @@
+# Podman deployments
+
+Two Podman paths for single-host setups. For Kubernetes/K3s clusters use the
+[Helm chart](../helm/vesmaro/) instead; umbrella over all paths:
+[../README.md](../README.md).
+
+## Option A — systemd quadlet (recommended for long-running hosts)
+
+Installs a systemd **user** unit; the container restarts on failure and on login.
+
+```bash
+podman build -t localhost/mnemos:latest -f Containerfile .   # from repo root
+mkdir -p ~/.config/containers/systemd
+cp deploy/podman/quadlet/mnemos.container ~/.config/containers/systemd/
+KEY=$(openssl rand -hex 32)
+printf 'MNEMOS_API__TOTP_MASTER_KEY=%s\nVESMARO_API__TOTP_MASTER_KEY=%s\n' "$KEY" "$KEY" > ~/.vesmaro.env
+systemctl --user daemon-reload && systemctl --user start mnemos
+curl -fsS http://localhost:8787/health
+```
+
+> The two env spellings in `~/.vesmaro.env` must hold the SAME key value —
+> 4.x images read `MNEMOS_API__*`, 5.x images read `VESMARO_API__*`.
+
+## Option B — `podman kube play` (Kubernetes-style pod on a single host)
+
+```bash
+printf 'MNEMOS_API__TOTP_MASTER_KEY=<your-key>\nVESMARO_API__TOTP_MASTER_KEY=<your-key>\n' \
+  | podman secret create vesmaro-totp -
+podman build -t localhost/mnemos:latest -f Containerfile .   # from repo root
+podman volume create mnemos-data && podman volume create mnemos-vault
+podman kube play deploy/podman/kube/mnemos-pod.yaml
+curl -fsS http://localhost:8787/health
+```
+
+Stop: `podman kube down deploy/podman/kube/mnemos-pod.yaml`.
+
+## Notes
+
+- `podman secret create` / `envFrom` in kube play need podman ≥ 4.8.
+- The TOTP key is REQUIRED: the baked container config binds to `0.0.0.0`,
+  and an empty master key is rejected at startup.
+- Full runbook with the compose path, Ollama sidecar and ops commands:
+  [container-deployment.md](../../docs/en/admin/runbooks/container-deployment.md)
+  ([RU](../../docs/ru/admin/runbooks/container-deployment.md)).

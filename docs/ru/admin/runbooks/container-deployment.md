@@ -3,23 +3,26 @@
 **🌐 Language / Язык:** [English](../../../en/admin/runbooks/container-deployment.md) · Русский
 
 > Runbook уровня администратора для сборки, залития и запуска Mnemos в контейнере.
-> Охватывает пять путей развёртывания: хелпер `deploy.sh`, `podman-compose`, сырой `podman run`,
-> Kubernetes (`podman kube play`) и systemd через quadlet.
+> Охватывает контейнерные пути: хелпер `deploy.sh`, docker/podman-compose, сырой `podman run`,
+> `podman kube play` и systemd через quadlet. Для настоящих кластеров K8s/K3s используйте
+> helm-чарт — [kubernetes-deployment.md](../kubernetes-deployment.md).
 
 ---
 
 ## Обзор
 
 Mnemos поставляется с `Containerfile` (совместим с OCI, podman/buildah) и готовым `compose.yaml`.
-Доступны пять путей развёртывания — выберите подходящий для вашей среды:
+Доступны семь путей развёртывания — выберите подходящий для вашей среды:
 
 | Путь | Инструмент | Когда использовать |
 |------|-----------|-------------------|
 | `./scripts/deploy.sh` | podman + podman-compose | Разработка и автоматизация — оборачивает все остальные варианты |
 | `podman-compose up` | podman-compose | Рекомендуется для production на одном хосте |
+| `docker compose up` | Docker Compose | То же на Docker — `deploy/docker/` (готовый образ) |
 | `podman run` | podman | Минимальные зависимости; использование готового образа из ghcr.io |
 | `podman kube play` | podman | Kubernetes-подобный pod на одном хосте |
 | systemd quadlet | podman + systemd | Постоянный user-сервис с автоматическим перезапуском |
+| Helm-чарт | Helm 3 + K8s/K3s | Настоящие кластеры — [kubernetes-deployment.md](../kubernetes-deployment.md) |
 
 Контейнер открывает **порт 8787** и использует два named volume: `mnemos-data` (SQLite + векторный
 индекс) и `mnemos-vault` (Obsidian markdown mirror).
@@ -59,9 +62,10 @@ make build-image
 ./scripts/deploy.sh build
 ```
 
-> **CI**: `.github/workflows/release.yml` автоматически собирает и тегирует образ при каждом
-> push-е тега `v*.*.*`. Ручная сборка нужна только для локального тестирования или
-> нестандартных деплоев.
+> **Релизные сборки**: локальный релизный конвейер (`scripts/local-release.sh`) собирает и
+> заливает образ при каждом релизе — GitHub Actions отключены, и этот скрипт является
+> каноническим путём (см. [ci-cd.md](ci-cd.md)). Ручная сборка нужна только для локального
+> тестирования или нестандартных деплоев.
 
 ---
 
@@ -84,8 +88,10 @@ Shortcut через Makefile:
 make push-image
 ```
 
-> **CI**: `release.yml` автоматически пушит версионный тег и `:latest` в `ghcr.io/korrnals/mnemos`
-> с помощью `GITHUB_TOKEN`. Ручное залитие в стандартном цикле релиза не требуется.
+> **Релизные залития**: `scripts/local-release.sh` при каждом релизе пушит версионный тег и
+> `:latest` в `ghcr.io/korrnals/mnemos`. Ручное залитие в стандартном цикле релиза не требуется.
+> Реестр переедет в `ghcr.io/vesmaro/vesmaro` в волне 5.0.0 (ADR-0031); чарт, compose и доки
+> несут однострочный переключатель.
 
 ---
 
@@ -175,18 +181,21 @@ podman run -d -v mnemos-data:/data -v mnemos-vault:/vault -p 8787:8787 \
 
 ---
 
-## Запуск — Kubernetes
+## Запуск — Kubernetes-подобный pod (podman kube play)
 
-Mnemos поставляется с Kubernetes-подобным манифестом pod'а (`deploy/kube/mnemos-pod.yaml`)
+Mnemos поставляется с Kubernetes-подобным манифестом pod'а (`deploy/podman/kube/mnemos-pod.yaml`)
 для `podman kube play`. Манифест использует `PersistentVolumeClaims`, поэтому named volumes
-необходимо создать заранее.
+необходимо создать заранее; он также инжектит TOTP-ключ из podman-секрета и определяет пробы
+здоровья.
 
 ### Запуск
 
 ```bash
+printf 'MNEMOS_API__TOTP_MASTER_KEY=<your-key>\nVESMARO_API__TOTP_MASTER_KEY=<your-key>\n' \
+  | podman secret create vesmaro-totp -
 podman volume create mnemos-data
 podman volume create mnemos-vault
-podman kube play deploy/kube/mnemos-pod.yaml
+podman kube play deploy/podman/kube/mnemos-pod.yaml
 ```
 
 Shortcut (создаёт volumes автоматически перед запуском манифеста):
@@ -217,12 +226,13 @@ Shortcut:
 
 ### Задать TOTP-ключ
 
-Отредактируйте `deploy/quadlet/mnemos.container` и добавьте ключ перед установкой:
+Юнит читает ключ из `~/.vesmaro.env` (`EnvironmentFile`), править юнит не нужно.
+Оба имени переменной должны нести одно значение — образы 4.x читают `MNEMOS_API__*`,
+5.x читают `VESMARO_API__*` (ADR-0031):
 
-```ini
-[Container]
-# ... существующие строки ...
-Environment=MNEMOS_API__TOTP_MASTER_KEY=<your-key>
+```bash
+KEY=$(openssl rand -hex 32)
+printf 'MNEMOS_API__TOTP_MASTER_KEY=%s\nVESMARO_API__TOTP_MASTER_KEY=%s\n' "$KEY" "$KEY" > ~/.vesmaro.env
 ```
 
 ### Установка юнита
@@ -231,7 +241,7 @@ Environment=MNEMOS_API__TOTP_MASTER_KEY=<your-key>
 ./scripts/deploy.sh quadlet
 ```
 
-Копирует `deploy/quadlet/mnemos.container` в `~/.config/containers/systemd/` и выполняет
+Копирует `deploy/podman/quadlet/mnemos.container` в `~/.config/containers/systemd/` и выполняет
 `systemctl --user daemon-reload`.
 
 ### Запуск и автозапуск
@@ -326,6 +336,8 @@ podman inspect --format '{{.State.Health.Status}}' mnemos
 
 ## См. также
 
+- [kubernetes-deployment.md](../kubernetes-deployment.md) — helm-чарт для настоящих кластеров K8s/K3s
+- [`deploy/README.md`](../../../../deploy/README.md) — все пути развёртывания одним взглядом
 - [install.md](install.md) — установка на bare-metal / в virtualenv
 - [../security.md](../security.md) — модель угроз, аутентификация, SSRF-защита
 - [../../user/getting-started.md](../../user/getting-started.md) — руководство по первому запуску
@@ -333,4 +345,5 @@ podman inspect --format '{{.State.Health.Status}}' mnemos
 ---
 
 _Исходные файлы: `Containerfile`, `compose.yaml`, `config.container.yaml`, `scripts/deploy.sh`,
-`deploy/quadlet/mnemos.container`, `deploy/kube/mnemos-pod.yaml`_
+`deploy/podman/quadlet/mnemos.container`, `deploy/podman/kube/mnemos-pod.yaml`,
+`deploy/docker/`, `deploy/helm/vesmaro/`_

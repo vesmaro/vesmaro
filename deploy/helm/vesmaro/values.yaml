@@ -1,0 +1,134 @@
+# Default values for the vesmaro chart.
+# Full walkthrough: docs/en/admin/kubernetes-deployment.md (RU mirror in docs/ru).
+
+# Must stay 1: the store is SQLite + a local vector index (single writer).
+# Scale-out is a federation concern, not a replica-count concern.
+replicaCount: 1
+
+image:
+  # Published images currently use the mnemos brand. After the 5.0.0 registry
+  # migration (ADR-0031 / GWS card #331, phase g) switch to
+  # ghcr.io/vesmaro/vesmaro.
+  repository: ghcr.io/korrnals/mnemos
+  tag: ""            # empty = Chart.yaml appVersion
+  pullPolicy: IfNotPresent
+  pullSecrets: []    # image is private on ghcr.io — set a docker-registry secret here if needed
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+service:
+  type: ClusterIP
+  port: 8787
+
+ingress:
+  enabled: true
+  # "" lets the cluster default apply (K3s ships `traefik`); set explicitly
+  # for vanilla clusters: nginx, traefik, haproxy, ...
+  className: ""
+  annotations: {}
+  hosts:
+    - host: vesmaro.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # - secretName: vesmaro-tls
+  #   hosts:
+  #     - vesmaro.example.com
+
+auth:
+  # TOTP master key. Deployed pods read it from BOTH env spellings
+  # (MNEMOS_API__TOTP_MASTER_KEY on 4.x images, VESMARO_API__TOTP_MASTER_KEY
+  # on 5.x+) — one secret, two names, see ADR-0031 dual-prefix contract.
+  # With neither existingSecret nor totpMasterKey set, the rendered pods
+  # reference a Secret that does not exist and sit in CreateContainerConfigError.
+  existingSecret: ""            # pre-created Secret name — preferred for prod
+  existingSecretKey: totp-master-key
+  totpMasterKey: ""             # direct value — dev only; prefer --set / existingSecret
+
+api:
+  authEnabled: true        # must stay true for a non-loopback bind
+  totpEnabled: true        # requires the master key above
+  sessionTtlSec: 28800     # 8 hours
+  sessionPinIp: true
+  behindTlsProxy: true     # TLS terminates at the ingress
+  trustedProxies:          # CIDRs whose X-Forwarded-For is trusted — add your ingress pod CIDR
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+  cors:
+    enabled: true
+    allowOrigins:
+      - http://localhost:5173
+    allowCredentials: true
+    allowMethods: [GET, POST, DELETE]
+    allowHeaders: [Authorization, Content-Type]
+
+embedding:
+  provider: nano               # mnema-embed-v1 ships in the image, works offline
+  model: nomic-embed-text      # used when provider=ollama
+  ollamaUrl: http://ollama:11434
+
+search:
+  defaultLimit: 20
+  hybridAlpha: 0.5
+
+mcp:
+  # stdio is used by harnesses on the same host; a cluster deploy exposes the
+  # REST/HTTP API through the ingress instead.
+  transport: stdio
+
+persistence:
+  data:
+    enabled: true
+    storageClass: ""       # "" = cluster default (K3s: local-path)
+    accessModes: [ReadWriteOnce]
+    size: 5Gi
+  vault:
+    enabled: true
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 1Gi
+
+resources:
+  requests:
+    memory: 512Mi
+    cpu: 250m
+  limits:
+    memory: 2Gi
+    cpu: "2"
+
+podAnnotations: {}
+podSecurityContext:
+  fsGroup: 1000
+containerSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  # The image writes temp files outside the volumes; flip to true together
+  # with an emptyDir mount on /tmp when hardening further.
+  readOnlyRootFilesystem: false
+
+probes:
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    initialDelaySeconds: 20
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+extraEnv: []             # additional env entries verbatim
+nodeSelector: {}
+tolerations: []
+affinity: {}
