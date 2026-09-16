@@ -43,7 +43,7 @@ Mnemos поставляется с `Containerfile` (совместим с OCI, p
 Собрать локальный образ с версией из исходников:
 
 ```bash
-podman build -t localhost/mnemos:4.0.0 -f Containerfile .
+podman build -t localhost/mnemos:4.3.0 -f Containerfile .
 ```
 
 `Containerfile` использует `python:3.12-slim` в качестве базового образа, устанавливает пакет (MCP SDK едет в core),
@@ -71,15 +71,15 @@ make build-image
 
 ## Залитие в ghcr.io
 
-> Пропустите этот раздел, если вы используете готовый образ из `ghcr.io/korrnals/mnemos`.
+> Пропустите этот раздел, если вы используете готовый образ из `ghcr.io/vesmaro/vesmaro`.
 
 **Ручное залитие** (требует PAT с правом `write:packages`):
 
 ```bash
 podman login ghcr.io
-podman tag localhost/mnemos:4.0.0 ghcr.io/korrnals/mnemos:4.0.0
-podman push ghcr.io/korrnals/mnemos:4.0.0
-podman push ghcr.io/korrnals/mnemos:latest
+podman tag localhost/mnemos:4.3.0 ghcr.io/vesmaro/vesmaro:4.3.0
+podman push ghcr.io/vesmaro/vesmaro:4.3.0
+podman push ghcr.io/vesmaro/vesmaro:latest
 ```
 
 Shortcut через Makefile:
@@ -89,9 +89,9 @@ make push-image
 ```
 
 > **Релизные залития**: `scripts/local-release.sh` при каждом релизе пушит версионный тег и
-> `:latest` в `ghcr.io/korrnals/mnemos`. Ручное залитие в стандартном цикле релиза не требуется.
-> Реестр переедет в `ghcr.io/vesmaro/vesmaro` в волне 5.0.0 (ADR-0031); чарт, compose и доки
-> несут однострочный переключатель.
+> `:latest`. Конвейер пока таргетит легаси-имя `ghcr.io/korrnals/mnemos` (переезд — часть
+> 5.0.0 phase-g, GWS card #331) — новые релизы в это время дотягиваются в org-неймспейс
+> `ghcr.io/vesmaro/vesmaro` вручную. Ручное залитие в стандартном цикле релиза не требуется.
 
 ---
 
@@ -171,9 +171,9 @@ embedding:
 Скачать готовый образ и сразу запустить:
 
 ```bash
-podman pull ghcr.io/korrnals/mnemos:4.0.0
+podman pull ghcr.io/vesmaro/vesmaro:4.3.0
 podman run -d -v mnemos-data:/data -v mnemos-vault:/vault -p 8787:8787 \
-  --env MNEMOS_API__TOTP_MASTER_KEY=<your-key> ghcr.io/korrnals/mnemos:4.0.0
+  --env MNEMOS_API__TOTP_MASTER_KEY=<your-key> ghcr.io/vesmaro/vesmaro:4.3.0
 ```
 
 В образ встроен `config.container.yaml` как `/app/config.yaml` — отдельное монтирование
@@ -221,8 +221,9 @@ Shortcut:
 ## Запуск — systemd (quadlet)
 
 Путь через quadlet устанавливает systemd **user**-юнит и управляет контейнером как постоянным
-сервисом. Юнит ссылается на `localhost/mnemos:latest`, поэтому сначала соберите образ локально
-(см. [Сборка](#сборка)).
+сервисом. Юнит ссылается на опубликованный `ghcr.io/vesmaro/vesmaro:4.3.0`, образ скачивается
+автоматически; для локальной сборки соберите образ заранее (см. [Сборка](#сборка)) и укажите
+`Image=localhost/mnemos:latest` в юните.
 
 ### Задать TOTP-ключ
 

@@ -56,7 +56,7 @@ pip install https://github.com/Korrnals/mnemos/releases/download/v4.3.0/mnemos_m
 ```
 <!-- /version:pip -->
 
-**Pre-built image** (published to `ghcr.io/korrnals/mnemos` on every release; `docker` works too — swap `podman` for `docker`):
+**Pre-built image** (published at `ghcr.io/vesmaro/vesmaro`; `docker` works too — swap `podman` for `docker`):
 
 ```bash
 export MNEMOS_API__TOTP_MASTER_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
@@ -66,7 +66,7 @@ podman run -d --name mnemos \
   -v mnemos-vault:/vault \
   -e MNEMOS_API__TOTP_MASTER_KEY="${MNEMOS_API__TOTP_MASTER_KEY}" \
 <!-- version:image -->
-  ghcr.io/korrnals/mnemos:4.3.0
+  ghcr.io/vesmaro/vesmaro:4.3.0
 <!-- /version:image -->
 
 curl -s http://localhost:8787/health | jq

@@ -18,7 +18,7 @@ The default embedding model (`mnema-embed-v1`, ~30 MB) is bundled in the wheel �
 
 > ⚠️ The PyPI name is **`mnemos-memory-server`** — `pip install mnemos` installs an unrelated project.
 
-npm (pi extension): `pi-mnemos` · `mnemos-pi` · `@korrlabs/mnemospi` · `@korrlabs/mnemos-pi`. Container: `ghcr.io/korrnals/mnemos`.
+npm (pi extension): `pi-mnemos` · `mnemos-pi` · `@korrlabs/mnemospi` · `@korrlabs/mnemos-pi`. Container: `ghcr.io/vesmaro/vesmaro`.
 
 ---
 

@@ -34,10 +34,11 @@ address. `helm test vesmaro` runs an in-cluster health check.
 
 ## Image registry status
 
-The default image is `ghcr.io/korrnals/mnemos` (private). After the 5.0.0
-registry migration (ADR-0031 / GWS card #331, phase g) published images move to
-`ghcr.io/vesmaro/vesmaro` — switch with `--set image.repository=ghcr.io/vesmaro/vesmaro`.
-For private-registry pulls set `image.pullSecrets` (a `docker-registry` secret).
+The default image is `ghcr.io/vesmaro/vesmaro` (org namespace, backfilled in
+the 4.3.0 wave). The package is **private until made Public in its Package
+settings** — until then either pass `image.pullSecrets` (a `docker-registry`
+secret) or `docker login ghcr.io` before pulling. The legacy
+`ghcr.io/korrnals/mnemos` package remains available and will be archived.
 
 ## Values
 

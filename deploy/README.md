@@ -21,11 +21,11 @@ Full documentation:
 
 - **TOTP master key** — required in any non-loopback deployment. Generate:
   `openssl rand -hex 32`. An empty key is rejected at startup.
-- **Image**: published to `ghcr.io/korrnals/mnemos` (currently **private**;
-  set visibility in Package settings, or `docker login ghcr.io` to pull).
-  After the 5.0.0 registry migration (ADR-0031 / GWS card #331, phase g)
-  images publish to `ghcr.io/vesmaro/vesmaro` — the Helm chart, compose file
-  and docs carry the one-line switch.
+- **Image**: published at `ghcr.io/vesmaro/vesmaro` (tags `4.3.0`, `latest`;
+  backfilled from the legacy `ghcr.io/korrnals/mnemos` user namespace).
+  The package is **private until made Public in Package settings** — until
+  then `docker/podman login ghcr.io` is required for pulls. The release
+  pipeline targets the legacy name until 5.0.0 phase-g (GWS card #331).
 - **Data**: two volumes — `/data` (SQLite + vector index) and `/vault`
   (Obsidian markdown mirror). Health surface: unauthenticated `GET /health`.
 

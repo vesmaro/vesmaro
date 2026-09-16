@@ -44,7 +44,7 @@ and `mnemos-vault` (Obsidian markdown mirror).
 Build a versioned local image from the source tree:
 
 ```bash
-podman build -t localhost/mnemos:4.0.0 -f Containerfile .
+podman build -t localhost/mnemos:4.3.0 -f Containerfile .
 ```
 
 The `Containerfile` uses `python:3.12-slim` as the base, installs the package (the MCP SDK rides in core), copies
@@ -71,15 +71,15 @@ The deploy helper does the same:
 
 ## Push to ghcr.io
 
-> Skip this section if you are consuming the pre-built image from `ghcr.io/korrnals/mnemos`.
+> Skip this section if you are consuming the pre-built image from `ghcr.io/vesmaro/vesmaro`.
 
 **Manual push** (requires a PAT with `write:packages` scope):
 
 ```bash
 podman login ghcr.io
-podman tag localhost/mnemos:4.0.0 ghcr.io/korrnals/mnemos:4.0.0
-podman push ghcr.io/korrnals/mnemos:4.0.0
-podman push ghcr.io/korrnals/mnemos:latest
+podman tag localhost/mnemos:4.3.0 ghcr.io/vesmaro/vesmaro:4.3.0
+podman push ghcr.io/vesmaro/vesmaro:4.3.0
+podman push ghcr.io/vesmaro/vesmaro:latest
 ```
 
 Makefile shortcut:
@@ -89,9 +89,10 @@ make push-image
 ```
 
 > **Release pushes**: `scripts/local-release.sh` pushes both the versioned tag and `:latest`
-> to `ghcr.io/korrnals/mnemos` on every release. No manual push is required as part of the
-> normal release cycle. The registry moves to `ghcr.io/vesmaro/vesmaro` in the 5.0.0 wave
-> (ADR-0031); chart, compose and docs carry the one-line switch.
+> on every release. It currently targets the legacy `ghcr.io/korrnals/mnemos` name (the
+> pipeline flip is part of the 5.0.0 phase-g, GWS card #331) — new releases are backfilled
+> to the org namespace `ghcr.io/vesmaro/vesmaro` manually in the meantime. No manual push
+> is required as part of the normal release cycle.
 
 ---
 
@@ -171,9 +172,9 @@ embedding:
 Pull the released image and start it directly:
 
 ```bash
-podman pull ghcr.io/korrnals/mnemos:4.0.0
+podman pull ghcr.io/vesmaro/vesmaro:4.3.0
 podman run -d -v mnemos-data:/data -v mnemos-vault:/vault -p 8787:8787 \
-  --env MNEMOS_API__TOTP_MASTER_KEY=<your-key> ghcr.io/korrnals/mnemos:4.0.0
+  --env MNEMOS_API__TOTP_MASTER_KEY=<your-key> ghcr.io/vesmaro/vesmaro:4.3.0
 ```
 
 The image includes `config.container.yaml` baked in as `/app/config.yaml` — no separate config
@@ -220,8 +221,9 @@ Shortcut:
 ## Run — systemd (quadlet)
 
 The quadlet path installs a systemd **user** unit and manages the container as a persistent
-service. The unit references `localhost/mnemos:latest`, so build the image locally first
-(see [Build](#build)).
+service. The unit references the published `ghcr.io/vesmaro/vesmaro:4.3.0`, pulled
+automatically; to run a local build instead, build the image first (see [Build](#build))
+and set `Image=localhost/mnemos:latest` in the unit.
 
 ### Set the TOTP key
 

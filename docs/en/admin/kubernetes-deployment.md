@@ -132,8 +132,9 @@ consistent procedure).
 
 ## Image registry status
 
-Published images currently live at **`ghcr.io/korrnals/mnemos`** and are
-**private**:
+Published images live at **`ghcr.io/vesmaro/vesmaro`** (org namespace,
+backfilled from the legacy user namespace in the 4.3.0 wave). The package is
+currently **private**:
 
 - if the pull fails, create a `docker-registry` secret and pass it:
 
@@ -144,12 +145,12 @@ Published images currently live at **`ghcr.io/korrnals/mnemos`** and are
     --set 'image.pullSecrets[0].name=ghcr-login'
   ```
 
-- after the 5.0.0 registry migration (ADR-0031 / GWS card #331, phase g)
-  switch to the new org namespace:
+- once the package is switched to **Public** (Package settings → Danger
+  Zone → Change visibility), plain pulls work everywhere with no secret.
 
-  ```bash
-  --set image.repository=ghcr.io/vesmaro/vesmaro
-  ```
+The release pipeline still targets the legacy `ghcr.io/korrnals/mnemos` name
+until the 5.0.0 registry migration (ADR-0031 / GWS card #331, phase g); new
+releases are backfilled to the org namespace manually in the meantime.
 
 ## Upgrades & uninstall
 

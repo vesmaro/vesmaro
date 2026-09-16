@@ -27,7 +27,7 @@ pip install mnemos-memory-server
 > устанавливает не связанный проект.
 
 npm (расширение pi): `pi-mnemos` · `mnemos-pi` · `@korrlabs/mnemospi` ·
-`@korrlabs/mnemos-pi`. Контейнер: `ghcr.io/korrnals/mnemos`.
+`@korrlabs/mnemos-pi`. Контейнер: `ghcr.io/vesmaro/vesmaro`.
 
 ---
 

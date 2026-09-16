@@ -29,7 +29,7 @@ Connect — and it is there. No extra wiring required for anything in this table
 | **Self-protection** | Injection and secret detectors on input and publication; every output is scanned; a full audit trail tied to each entry |
 | **Auto-pipeline** | A background processor: clustering, deduplication, quality gate, publication |
 | **Bundled embedding model** | `mnema-embed-v1` (~30 MB int8 ONNX) ships inside the wheel — hybrid vector search works fully offline, on CPU, with no downloads and no API keys |
-| **Packaging & delivery** | PyPI [`mnemos-memory-server`](https://pypi.org/project/mnemos-memory-server/) (wheel bundles the integration pack and the model), npm `pi-mnemos` + aliases, GHCR image `ghcr.io/korrnals/mnemos`, one-line installer script, benchmark framework S1–S4 in-repo |
+| **Packaging & delivery** | PyPI [`mnemos-memory-server`](https://pypi.org/project/mnemos-memory-server/) (wheel bundles the integration pack and the model), npm `pi-mnemos` + aliases, GHCR image `ghcr.io/vesmaro/vesmaro`, one-line installer script, benchmark framework S1–S4 in-repo |
 
 ## Partial — core exists, completeness in progress
 

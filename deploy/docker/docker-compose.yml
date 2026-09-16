@@ -10,9 +10,8 @@
 
 services:
   vesmaro:
-    image: ghcr.io/korrnals/mnemos:${VESMARO_IMAGE_TAG:-4.3.0}
-    # After the 5.0.0 registry migration (ADR-0031 / GWS card #331) switch to:
-    # image: ghcr.io/vesmaro/vesmaro:${VESMARO_IMAGE_TAG:-5.0.0}
+    image: ghcr.io/vesmaro/vesmaro:${VESMARO_IMAGE_TAG:-4.3.0}
+    # Legacy namespace (pre-rebrand releases): ghcr.io/korrnals/mnemos
     container_name: vesmaro
     restart: unless-stopped
     ports:
