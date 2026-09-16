@@ -92,6 +92,61 @@ mnemos search "помнит между сессиями"
 
 Это весь цикл: **записал, нашёл, не потерял — и агент знает, когда заглянуть в память.**
 
+### Сервер в контейнере или кластере
+
+Тот же сервер готовым образом — ещё три способа запуска, от одного хоста до любого
+Kubernetes-кластера. Полные руководства — в админ-доках.
+
+<details>
+<summary><strong>☸️ Kubernetes / K3s — helm-чарт с ингрессом</strong></summary>
+
+```bash
+helm install vesmaro deploy/helm/vesmaro \
+  --namespace vesmaro --create-namespace \
+  --set auth.totpMasterKey="$(openssl rand -hex 32)" \
+  --set ingress.className=traefik \
+  --set 'ingress.hosts[0].host=mnemos.example.com'
+kubectl -n vesmaro rollout status deploy/vesmaro
+```
+
+В K3s Traefik и local-path хранилище есть из коробки — команды работают как есть.
+Чарт, values и настройка TLS: **[Развёртывание в Kubernetes](docs/ru/admin/kubernetes-deployment.md)**.
+</details>
+
+<details>
+<summary><strong>🐳 Docker / Docker Compose</strong></summary>
+
+```bash
+cd deploy/docker
+cp .env.example .env                    # впишите TOTP_MASTER_KEY=$(openssl rand -hex 32)
+docker compose up -d                    # podman-compose тоже подходит
+curl -fsS http://localhost:8787/health  # → {"status":"ok"}
+```
+
+Полное руководство: **[контейнерное развёртывание](docs/ru/admin/runbooks/container-deployment.md)**.
+</details>
+
+<details>
+<summary><strong>🦭 Podman — systemd quadlet или kube play</strong></summary>
+
+```bash
+# systemd user-сервис (предпочтительно для постоянно работающего хоста)
+podman build -t localhost/mnemos:latest -f Containerfile .
+cp deploy/podman/quadlet/mnemos.container ~/.config/containers/systemd/
+# впишите TOTP-ключ в ~/.vesmaro.env (оба имени переменной), затем:
+systemctl --user daemon-reload && systemctl --user start mnemos
+curl -fsS http://localhost:8787/health
+```
+
+Оба рецепта Podman (quadlet + `podman kube play`):
+**[deploy/podman/README.md](deploy/podman/README.md)** · полное руководство:
+**[контейнерное развёртывание](docs/ru/admin/runbooks/container-deployment.md)**.
+</details>
+
+> ℹ️ Готовый образ (`ghcr.io/korrnals/mnemos`) сейчас **приватный** — сначала выполните
+> `docker login ghcr.io` / `podman login ghcr.io`, либо соберите локально:
+> `podman build -f Containerfile .`
+
 > 📘 **Хотите каждую деталь?** Расширенный гид покрывает все варианты установки (`uv tool`, `pipx`,
 > только CLI, внешние LLM-экстры, скрипт-установщик, контейнер), пошаговое подключение каждого
 > харнеса, конфигурацию и разбор неполадок:
@@ -286,6 +341,7 @@ HTTP-поверхность также открывает **A2A Sessions API** �
 | [http-api.md](docs/ru/user/http-api.md) | Все HTTP-эндпоинты (CRUD памяти, workflow, хуки, A2A Sessions) |
 | [tag-contract.md](docs/ru/user/tag-contract.md) | Схема `project:` / `agent:` / `mnemos:`, обязательная для каждой записи памяти |
 | [security.md](docs/ru/admin/security.md) | Модель угроз, SSRF-защита, FTS5 escape, модель аутентификации |
+| [kubernetes-deployment.md](docs/ru/admin/kubernetes-deployment.md) | Helm-чарт для кластеров K8s/K3s: ингресс, хранилище, TLS, TOTP-секрет |
 | [runbooks/](docs/ru/admin/runbooks/) | Установка, миграция, резервное копирование / восстановление, обновление зависимостей, развёртывание в контейнере |
 | [adr/](docs/project/adr/) | Архитектурные решения (ADR) — *почему* за каждым решением в дизайне |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes — формат Keep a Changelog |

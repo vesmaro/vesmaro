@@ -1,0 +1,47 @@
+{{/* Rendered container config — mounted over the image-baked /app/config.yaml. */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vesmaro.fullname" . }}
+  labels:
+    {{- include "vesmaro.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    mnemos:
+      vault_path: /vault
+      data_dir: /data
+
+    embedding:
+      provider: {{ .Values.embedding.provider | quote }}
+      # model is meaningful for nano (bundled artifact) and onnx (HF id) too
+      model: {{ .Values.embedding.model | quote }}
+      {{- if eq .Values.embedding.provider "ollama" }}
+      ollama_url: {{ .Values.embedding.ollamaUrl | quote }}
+      {{- end }}
+
+    search:
+      default_limit: {{ .Values.search.defaultLimit }}
+      hybrid_alpha: {{ .Values.search.hybridAlpha }}
+
+    api:
+      host: 0.0.0.0
+      port: 8787
+      auth_enabled: {{ .Values.api.authEnabled }}
+      totp_enabled: {{ .Values.api.totpEnabled }}
+      # totp_master_key is env-only (pod secret), never written to config
+      session_ttl_sec: {{ .Values.api.sessionTtlSec }}
+      session_pin_ip: {{ .Values.api.sessionPinIp }}
+      behind_tls_proxy: {{ .Values.api.behindTlsProxy }}
+      trusted_proxies:
+        {{- toYaml .Values.api.trustedProxies | nindent 8 }}
+      cors_enabled: {{ .Values.api.cors.enabled }}
+      cors_allow_origins:
+        {{- toYaml .Values.api.cors.allowOrigins | nindent 8 }}
+      cors_allow_credentials: {{ .Values.api.cors.allowCredentials }}
+      cors_allow_methods:
+        {{- toYaml .Values.api.cors.allowMethods | nindent 8 }}
+      cors_allow_headers:
+        {{- toYaml .Values.api.cors.allowHeaders | nindent 8 }}
+
+    mcp:
+      transport: {{ .Values.mcp.transport | quote }}

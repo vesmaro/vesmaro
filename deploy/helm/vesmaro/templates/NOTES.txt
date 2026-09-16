@@ -1,0 +1,31 @@
+{{- $fullName := include "vesmaro.fullname" . -}}
+{{- $scheme := ternary "https" "http" (gt (len .Values.ingress.tls) 0) -}}
+Vesmaro (Mnemos) has been deployed to namespace "{{ .Release.Namespace }}".
+{{- if not (or .Values.auth.existingSecret .Values.auth.totpMasterKey) }}
+
+  ⚠️  NO TOTP MASTER KEY SET. The pods reference a Secret that does not exist
+  and will sit in CreateContainerConfigError (and an empty key value is
+  rejected at startup when api.totpEnabled=true). Fix and re-apply:
+
+    helm upgrade {{ .Release.Name }} \
+      --set auth.totpMasterKey="$(openssl rand -hex 32)" \
+      --reuse-values
+{{- end }}
+
+1. Reach the server:
+  {{- if .Values.ingress.enabled }}
+  {{- range .Values.ingress.hosts }}
+  Ingress:  {{ $scheme }}://{{ .host }}
+  {{- end }}
+  {{- else }}
+  Port-forward:
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fullName }} 8787:{{ .Values.service.port }}
+    then open http://localhost:8787
+  {{- end }}
+
+2. Verify it is up (health is unauthenticated):
+
+    curl -fsS <address-from-step-1>/health   # → {"status":"ok"}
+
+3. Authenticate clients per docs: auth model and TOTP enrollment are covered in
+   docs/en/admin/security.md; REST endpoints in docs/en/user/http-api.md.

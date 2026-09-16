@@ -1,0 +1,35 @@
+# Podman Quadlet — systemd user unit for the Vesmaro (Mnemos) container.
+# For a real cluster (K8s/K3s) use the Helm chart: deploy/helm/vesmaro/.
+#
+# Install:
+#   mkdir -p ~/.config/containers/systemd
+#   cp deploy/podman/quadlet/mnemos.container ~/.config/containers/systemd/
+#   printf 'MNEMOS_API__TOTP_MASTER_KEY=<your-key>\nVESMARO_API__TOTP_MASTER_KEY=<your-key>\n' > ~/.vesmaro.env
+#   systemctl --user daemon-reload && systemctl --user start mnemos
+[Container]
+ContainerName=mnemos
+# Local build (see docs Build section). Swap for the published image:
+#   Image=ghcr.io/korrnals/mnemos:4.3.0   (then remove AutoUpdate=local)
+Image=localhost/mnemos:latest
+AutoUpdate=local
+
+PublishPort=8787:8787
+Volume=mnemos-data:/data
+Volume=mnemos-vault:/vault
+
+Environment=MNEMOS_CONFIG=/app/config.yaml
+# TOTP master key lives outside the unit — 4.x images read MNEMOS_API__*,
+# 5.x read VESMARO_API__* (ADR-0031); keep both lines in the file.
+EnvironmentFile=%h/vesmaro.env
+
+# Unauthenticated /health endpoint; kept CLI-independent on purpose
+# (the CLI binary name changes in the 5.0.0 rebrand).
+HealthCmd=python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)"
+HealthInterval=30s
+
+[Service]
+Restart=always
+TimeoutStartSec=30
+
+[Install]
+WantedBy=default.target
