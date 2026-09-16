@@ -44,7 +44,7 @@ and `mnemos-vault` (Obsidian markdown mirror).
 Build a versioned local image from the source tree:
 
 ```bash
-podman build -t localhost/mnemos:4.0.0 -f Containerfile .
+podman build -t localhost/mnemos:4.3.0 -f Containerfile .
 ```
 
 The `Containerfile` uses `python:3.12-slim` as the base, installs the package (the MCP SDK rides in core), copies
@@ -221,8 +221,9 @@ Shortcut:
 ## Run — systemd (quadlet)
 
 The quadlet path installs a systemd **user** unit and manages the container as a persistent
-service. The unit references `localhost/mnemos:latest`, so build the image locally first
-(see [Build](#build)).
+service. The unit references the published `ghcr.io/vesmaro/vesmaro:4.3.0`, pulled
+automatically; to run a local build instead, build the image first (see [Build](#build))
+and set `Image=localhost/mnemos:latest` in the unit.
 
 ### Set the TOTP key
 

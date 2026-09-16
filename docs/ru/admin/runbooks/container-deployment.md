@@ -43,7 +43,7 @@ Mnemos поставляется с `Containerfile` (совместим с OCI, p
 Собрать локальный образ с версией из исходников:
 
 ```bash
-podman build -t localhost/mnemos:4.0.0 -f Containerfile .
+podman build -t localhost/mnemos:4.3.0 -f Containerfile .
 ```
 
 `Containerfile` использует `python:3.12-slim` в качестве базового образа, устанавливает пакет (MCP SDK едет в core),
@@ -221,8 +221,9 @@ Shortcut:
 ## Запуск — systemd (quadlet)
 
 Путь через quadlet устанавливает systemd **user**-юнит и управляет контейнером как постоянным
-сервисом. Юнит ссылается на `localhost/mnemos:latest`, поэтому сначала соберите образ локально
-(см. [Сборка](#сборка)).
+сервисом. Юнит ссылается на опубликованный `ghcr.io/vesmaro/vesmaro:4.3.0`, образ скачивается
+автоматически; для локальной сборки соберите образ заранее (см. [Сборка](#сборка)) и укажите
+`Image=localhost/mnemos:latest` в юните.
 
 ### Задать TOTP-ключ
 
