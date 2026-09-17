@@ -111,7 +111,7 @@ info "Installing Mnemos v${VERSION} (extras: ${EXTRAS})"
 
 # ── Container path ────────────────────────────────────────────────
 if [[ "$CONTAINER" == true ]]; then
-  info "Container mode — pulling image ghcr.io/korrnals/mnemos:${VERSION}…"
+  info "Container mode — pulling image ghcr.io/vesmaro/vesmaro:${VERSION}…"
 
   RUNTIME=""
   for r in podman docker; do
@@ -122,11 +122,11 @@ if [[ "$CONTAINER" == true ]]; then
   # PyPI and GHCR are independent registries: an auto-detected PyPI version
   # may not be tagged on GHCR yet. Fall back to :latest only when the version
   # was not pinned explicitly by the caller.
-  if ! "$RUNTIME" pull "ghcr.io/korrnals/mnemos:${VERSION}"; then
-    [[ "$VERSION_EXPLICIT" == true ]] && die "Failed to pull image ghcr.io/korrnals/mnemos:${VERSION}."
+  if ! "$RUNTIME" pull "ghcr.io/vesmaro/vesmaro:${VERSION}"; then
+    [[ "$VERSION_EXPLICIT" == true ]] && die "Failed to pull image ghcr.io/vesmaro/vesmaro:${VERSION}."
     warn "Tag ${VERSION} is not on GHCR (yet) — falling back to :latest."
     VERSION="latest"
-    "$RUNTIME" pull "ghcr.io/korrnals/mnemos:${VERSION}" || die "Failed to pull image."
+    "$RUNTIME" pull "ghcr.io/vesmaro/vesmaro:${VERSION}" || die "Failed to pull image."
   fi
 
   if "$RUNTIME" ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^mnemos$'; then
@@ -150,7 +150,7 @@ if [[ "$CONTAINER" == true ]]; then
     -v mnemos-data:/data \
     -v mnemos-vault:/vault \
     -e MNEMOS_API__TOTP_MASTER_KEY="${MNEMOS_API__TOTP_MASTER_KEY}" \
-    "ghcr.io/korrnals/mnemos:${VERSION}" || die "Failed to start container."
+    "ghcr.io/vesmaro/vesmaro:${VERSION}" || die "Failed to start container."
 
   ok "Mnemos container started on port ${CONTAINER_PORT}."
   echo ""
