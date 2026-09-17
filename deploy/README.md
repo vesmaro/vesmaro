@@ -8,7 +8,7 @@ Deployment assets for the Vesmaro (Mnemos) memory server, grouped by target:
 | [`docker/`](docker/) | **Docker / Docker Compose** (pre-built image) | `cp .env.example .env && docker compose up -d` (podman-compose compatible) |
 | [`podman/quadlet/`](podman/quadlet/) | **Podman** as a systemd user unit | copy unit + `systemctl --user start mnemos` |
 | [`podman/kube/`](podman/kube/) | **Podman** `kube play` (single-host pod) | `podman kube play deploy/podman/kube/mnemos-pod.yaml` |
-| [`../../compose.yaml`](../compose.yaml) | Build-from-source compose (root) | `podman-compose up --build` |
+| [`../../compose.yaml`](../compose.yaml) | Compose from the repo root (published image, historic `mnemos-*` names) | `TOTP_MASTER_KEY=$(openssl rand -hex 32) docker compose up -d` |
 
 Full documentation:
 
