@@ -2,191 +2,124 @@
 
 **🌐 Language / Язык:** [English](../../../en/admin/runbooks/container-deployment.md) · Русский
 
-> Runbook уровня администратора для сборки, залития и запуска Mnemos в контейнере.
-> Охватывает контейнерные пути: хелпер `deploy.sh`, docker/podman-compose, сырой `podman run`,
-> `podman kube play` и systemd через quadlet. Для настоящих кластеров K8s/K3s используйте
-> helm-чарт — [kubernetes-deployment.md](../kubernetes-deployment.md).
+> Runbook уровня администратора для запуска Mnemos в контейнере. **Опубликованный
+> образ — основной путь: достаточно его скачать, локальная сборка не нужна.**
+> Сборка из исходников — фолбэк для разработки, собственных патчей или
+> air-gapped-сред. Для настоящих кластеров K8s/K3s используйте helm-чарт —
+> [kubernetes-deployment.md](../kubernetes-deployment.md).
 
 ---
 
 ## Обзор
 
-Mnemos поставляется с `Containerfile` (совместим с OCI, podman/buildah) и готовым `compose.yaml`.
-Доступны семь путей развёртывания — выберите подходящий для вашей среды:
+Один опубликованный образ — `ghcr.io/vesmaro/vesmaro` — покрывает все пути. Выбирайте по среде:
 
 | Путь | Инструмент | Когда использовать |
 |------|-----------|-------------------|
-| `./scripts/deploy.sh` | podman + podman-compose | Разработка и автоматизация — оборачивает все остальные варианты |
-| `podman-compose up` | podman-compose | Рекомендуется для production на одном хосте |
-| `docker compose up` | Docker Compose | То же на Docker — `deploy/docker/` (готовый образ) |
-| `podman run` | podman | Минимальные зависимости; использование готового образа из ghcr.io |
+| Скачать и запустить | podman / docker | Самый быстрый старт — одна команда, репо не нужно |
+| docker/podman-compose | Compose | Production на одном хосте — [`deploy/docker/`](../../../../deploy/docker/) |
+| Helm-чарт | Helm 3 + K8s/K3s | Настоящие кластеры — [kubernetes-deployment.md](../kubernetes-deployment.md) |
 | `podman kube play` | podman | Kubernetes-подобный pod на одном хосте |
 | systemd quadlet | podman + systemd | Постоянный user-сервис с автоматическим перезапуском |
-| Helm-чарт | Helm 3 + K8s/K3s | Настоящие кластеры — [kubernetes-deployment.md](../kubernetes-deployment.md) |
+| Сборка из исходников | podman / buildah | Фолбэк: разработка, патчи, air-gapped |
 
-Контейнер открывает **порт 8787** и использует два named volume: `mnemos-data` (SQLite + векторный
-индекс) и `mnemos-vault` (Obsidian markdown mirror).
+Контейнер открывает **порт 8787** и использует два named volume — `mnemos-data` (SQLite + векторный
+индекс) и `mnemos-vault` (Obsidian markdown mirror); путь compose называет их `vesmaro-data`/`vesmaro-vault`.
 
 ---
 
 ## Предварительные требования
 
-- **podman** ≥ 4.0 — rootless-режим полностью поддерживается и рекомендуется
-- **podman-compose** — необходим для пути через compose (`pip install podman-compose` или пакет дистрибутива)
-- **buildah** — альтернатива `podman build`; опционально
+- **podman** ≥ 4.0 (rootless-режим полностью поддерживается) или **docker**
+- **podman-compose** или **docker compose** — только для пути через compose
 - Python и `git` на хосте **не требуются** — всё запускается внутри контейнера
+- Пакет образа может быть **приватным**: если pull отклонён, выполните один раз
+  `podman login ghcr.io` / `docker login ghcr.io` (после переключения пакета в
+  Public логин не нужен)
 
 ---
 
-## Сборка
+## Запуск — готовый образ (быстрее всего)
 
-Собрать локальный образ с версией из исходников:
-
-```bash
-podman build -t localhost/mnemos:4.3.0 -f Containerfile .
-```
-
-`Containerfile` использует `python:3.12-slim` в качестве базового образа, устанавливает пакет (MCP SDK едет в core),
-копирует `config.container.yaml` как `/app/config.yaml` и задаёт `CMD ["mnemos", "serve"]` на
-порту 8787.
-
-Shortcut через Makefile (собирает `localhost/mnemos:latest`):
+Скачайте опубликованный образ и запустите сразу — собирать ничего не нужно:
 
 ```bash
-make build-image
+podman pull ghcr.io/vesmaro/vesmaro:4.3.0      # :latest указывает на свежий релиз
+podman run -d --name mnemos \
+  -v mnemos-data:/data -v mnemos-vault:/vault \
+  -p 8787:8787 \
+  --env MNEMOS_API__TOTP_MASTER_KEY=<your-key> \
+  ghcr.io/vesmaro/vesmaro:4.3.0
 ```
 
-Хелпер делает то же самое:
+`docker` работает идентично — замените `podman` на `docker`. В образ встроен
+`config.container.yaml` как `/app/config.yaml` — монтировать конфиг не требуется,
+если только вы не хотите переопределить настройки. TOTP-мастер-ключ обязателен
+(вшитый конфиг биндится на `0.0.0.0`); образы 4.x читают написание
+`MNEMOS_API__*`, 5.x+ — `VESMARO_API__*`; задать оба всегда безопасно.
+
+Проверка:
 
 ```bash
-./scripts/deploy.sh build
+curl -fsS http://localhost:8787/health    # → {"status":"ok"}
 ```
-
-> **Релизные сборки**: локальный релизный конвейер (`scripts/local-release.sh`) собирает и
-> заливает образ при каждом релизе — GitHub Actions отключены, и этот скрипт является
-> каноническим путём (см. [ci-cd.md](ci-cd.md)). Ручная сборка нужна только для локального
-> тестирования или нестандартных деплоев.
 
 ---
 
-## Залитие в ghcr.io
+## Запуск — compose (production на одном хосте)
 
-> Пропустите этот раздел, если вы используете готовый образ из `ghcr.io/vesmaro/vesmaro`.
-
-**Ручное залитие** (требует PAT с правом `write:packages`):
-
-```bash
-podman login ghcr.io
-podman tag localhost/mnemos:4.3.0 ghcr.io/vesmaro/vesmaro:4.3.0
-podman push ghcr.io/vesmaro/vesmaro:4.3.0
-podman push ghcr.io/vesmaro/vesmaro:latest
-```
-
-Shortcut через Makefile:
+Готовый compose-файл лежит в [`deploy/docker/`](../../../../deploy/docker/) и использует
+опубликованный образ — без сборки:
 
 ```bash
-make push-image
-```
-
-> **Релизные залития**: `scripts/local-release.sh` при каждом релизе пушит версионный тег и
-> `:latest`. Конвейер пока таргетит легаси-имя `ghcr.io/korrnals/mnemos` (переезд — часть
-> 5.0.0 phase-g, GWS card #331) — новые релизы в это время дотягиваются в org-неймспейс
-> `ghcr.io/vesmaro/vesmaro` вручную. Ручное залитие в стандартном цикле релиза не требуется.
-
----
-
-## Запуск — compose (рекомендуется)
-
-Путь через compose использует `compose.yaml` и монтирует `./config.container.yaml` из корня
-репозитория как `/app/config.yaml` внутри контейнера (read-only).
-
-### Запуск
-
-```bash
-podman-compose up -d
-```
-
-При успехе хелпер выводит:
-
-```text
-Mnemos API:   http://localhost:8787
-Swagger UI:   http://localhost:8787/docs
-```
-
-### Логи
-
-```bash
-podman-compose logs -f mnemos
-```
-
-### Остановка
-
-```bash
+cd deploy/docker
+cp .env.example .env          # затем впишите: TOTP_MASTER_KEY=$(openssl rand -hex 32)
+docker compose up -d          # или: podman-compose up -d
+podman-compose logs -f vesmaro
 podman-compose down
 ```
 
-### Обязательная переменная окружения
+Детали (env-файл, фиксация тега образа, Ollama sidecar): [deploy/docker/README.md](../../../../deploy/docker/README.md).
 
-`config.container.yaml` привязывается к `0.0.0.0`, что **требует** включённой аутентификации.
-Передавайте TOTP-мастер-ключ в runtime — никогда не сохраняйте его в файле конфигурации:
-
-```bash
-MNEMOS_API__TOTP_MASTER_KEY=<your-key> podman-compose up -d
-```
-
-Или добавьте его в файл `.env`, указанный в `.gitignore`:
+Ollama sidecar (опциональные embeddings):
 
 ```bash
-echo 'MNEMOS_API__TOTP_MASTER_KEY=<your-key>' >> .env
-podman-compose up -d
+docker compose --profile ollama up -d
+docker exec vesmaro-ollama ollama pull nomic-embed-text
 ```
 
-### Ollama sidecar (опциональные embeddings)
+Чтобы активировать Ollama как провайдер эмбеддингов, задайте `embedding.provider: ollama`
+в конфиге контейнера (см. [Конфигурация](#конфигурация)).
 
-Запуск Mnemos совместно с локальным Ollama через встроенный profile:
-
-```bash
-podman-compose --profile ollama up -d
-```
-
-Скачать модель эмбеддингов в sidecar:
-
-```bash
-podman exec mnemos-ollama ollama pull nomic-embed-text
-```
-
-Чтобы активировать Ollama как провайдер эмбеддингов, обновите `config.container.yaml`:
-
-```yaml
-embedding:
-  provider: ollama
-  model: nomic-embed-text
-  ollama_url: http://ollama:11434
-```
+> Корневой [`compose.yaml`](../../../../compose.yaml) — вариант со сборкой из исходников
+> (используется с `podman-compose up --build`) — инструмент разработки, см.
+> [Сборка из исходников](#сборка-из-исходников-фолбэк).
 
 ---
 
-## Запуск — одиночный контейнер
+## Запуск — Kubernetes / K3s (кластер)
 
-Скачать готовый образ и сразу запустить:
+Используйте helm-чарт — он разворачивает опубликованный образ с ингрессом, TLS
+и постоянным хранилищем:
 
 ```bash
-podman pull ghcr.io/vesmaro/vesmaro:4.3.0
-podman run -d -v mnemos-data:/data -v mnemos-vault:/vault -p 8787:8787 \
-  --env MNEMOS_API__TOTP_MASTER_KEY=<your-key> ghcr.io/vesmaro/vesmaro:4.3.0
+helm install vesmaro deploy/helm/vesmaro \
+  --namespace vesmaro --create-namespace \
+  --set auth.totpMasterKey="$(openssl rand -hex 32)" \
+  --set ingress.className=traefik \
+  --set 'ingress.hosts[0].host=mnemos.example.com'
 ```
 
-В образ встроен `config.container.yaml` как `/app/config.yaml` — отдельное монтирование
-конфига не требуется, если только вам не нужно переопределить настройки.
+Полное руководство по values, TLS и разбору неполадок:
+**[kubernetes-deployment.md](../kubernetes-deployment.md)**.
 
 ---
 
 ## Запуск — Kubernetes-подобный pod (podman kube play)
 
 Mnemos поставляется с Kubernetes-подобным манифестом pod'а (`deploy/podman/kube/mnemos-pod.yaml`)
-для `podman kube play`. Манифест использует `PersistentVolumeClaims`, поэтому named volumes
-необходимо создать заранее; он также инжектит TOTP-ключ из podman-секрета и определяет пробы
-здоровья.
+для `podman kube play`. Манифест скачивает опубликованный образ, инжектит TOTP-ключ из
+podman-секрета и определяет пробы здоровья.
 
 ### Запуск
 
@@ -207,7 +140,7 @@ Shortcut (создаёт volumes автоматически перед запу�
 ### Остановка
 
 ```bash
-podman kube down deploy/kube/mnemos-pod.yaml
+podman kube down deploy/podman/kube/mnemos-pod.yaml
 ```
 
 Shortcut:
@@ -222,7 +155,8 @@ Shortcut:
 
 Путь через quadlet устанавливает systemd **user**-юнит и управляет контейнером как постоянным
 сервисом. Юнит ссылается на опубликованный `ghcr.io/vesmaro/vesmaro:4.3.0`, образ скачивается
-автоматически; для локальной сборки соберите образ заранее (см. [Сборка](#сборка)) и укажите
+автоматически; для локальной сборки соберите образ заранее (см.
+[Сборка из исходников](#сборка-из-исходников-фолбэк)) и укажите
 `Image=localhost/mnemos:latest` в юните.
 
 ### Задать TOTP-ключ
@@ -260,33 +194,75 @@ systemctl --user status mnemos
 
 ---
 
+## Сборка из исходников (фолбэк)
+
+> Нужна только для разработки, собственных патчей или air-gapped-сред.
+> Опубликованный образ синхронизируется с каждым релизом — конечным
+> пользователям этот раздел не нужен.
+
+```bash
+podman build -t localhost/mnemos:4.3.0 -f Containerfile .
+```
+
+`Containerfile` использует `python:3.12-slim` в качестве базового образа, устанавливает пакет (MCP SDK едет в core),
+копирует `config.container.yaml` как `/app/config.yaml` и задаёт serve-команду на
+порту 8787.
+
+Shortcut через Makefile (собирает `localhost/mnemos:latest`):
+
+```bash
+make build-image
+```
+
+Хелпер делает то же самое:
+
+```bash
+./scripts/deploy.sh build
+```
+
+**Залитие в ghcr.io (мейнтейнеры):** релизный конвейер (`scripts/local-release.sh`)
+при каждом релизе пушит версионный тег и `:latest` — GitHub Actions отключены, и этот
+скрипт является каноническим путём (см. [ci-cd.md](ci-cd.md)). Конвейер пока таргетит
+легаси-имя `ghcr.io/korrnals/mnemos` (переезд — часть 5.0.0 phase-g, GWS card #331);
+новые релизы в это время дотягиваются в org-неймспейс `ghcr.io/vesmaro/vesmaro` вручную.
+Ручное залитие, если когда-нибудь понадобится (PAT с правом `write:packages`):
+
+```bash
+podman login ghcr.io
+podman tag localhost/mnemos:4.3.0 ghcr.io/vesmaro/vesmaro:4.3.0
+podman push ghcr.io/vesmaro/vesmaro:4.3.0
+podman push ghcr.io/vesmaro/vesmaro:latest
+```
+
+---
+
 ## Конфигурация
 
 Mnemos использует `config.container.yaml` в качестве конфига контейнера. Файл:
 
 - Встроен в образ при сборке как `/app/config.yaml`
-- Перекрывается в compose-пути монтированием `./config.container.yaml:/app/config.yaml:ro`
+- Перекрывается монтированием своего конфига по тому же пути (read-only)
 
 Ключевые настройки:
 
 | Параметр | Значение | Примечания |
 |---------|---------|-----------|
-| `mnemos.data_dir` | `/data` | Mapped to named volume `mnemos-data` |
-| `mnemos.vault_path` | `/vault` | Mapped to named volume `mnemos-vault` |
+| `mnemos.data_dir` | `/data` | Маппится на named volume `mnemos-data` |
+| `mnemos.vault_path` | `/vault` | Маппится на named volume `mnemos-vault` |
 | `api.host` | `0.0.0.0` | Привязка ко всем интерфейсам — **требует auth** |
 | `api.port` | `8787` | Внутренний порт контейнера; маппинг задаётся в compose/run |
 | `api.auth_enabled` | `true` | Обязательно `true` при `host: 0.0.0.0` |
-| `api.totp_enabled` | `true` | Требует TOTP 2FA; ключ через `MNEMOS_API__TOTP_MASTER_KEY` |
-| `api.behind_tls_proxy` | `true` | TLS завершается выше по стеку (Caddy, nginx и т.п.) |
+| `api.totp_enabled` | `true` | Требует TOTP 2FA; ключ через `MNEMOS_API__TOTP_MASTER_KEY` (+ `VESMARO_API__*` с 5.x — ADR-0031) |
+| `api.behind_tls_proxy` | `true` | TLS завершается выше по стеку (Caddy, nginx, ingress и т.п.) |
 | `embedding.provider` | `nano` | mnema-embed-v1: встроенная локальная модель, работает офлайн; GPU не требуется |
 
 ### Требования безопасности
 
 Привязка к `0.0.0.0` **требует** одновременно `auth_enabled: true` и `totp_enabled: true`.
-TOTP-мастер-ключ должен передаваться через `MNEMOS_API__TOTP_MASTER_KEY` — он никогда не должен
+TOTP-мастер-ключ должен передаваться через env-переменную — он никогда не должен
 присутствовать в файле конфигурации или в любом коммитируемом файле.
 
-Размещайте Mnemos за TLS-терминирующим реверс-прокси (Caddy, nginx и т.п.).
+Размещайте Mnemos за TLS-терминирующим реверс-прокси (Caddy, nginx, ingress и т.п.).
 Задайте `trusted_proxies` с CIDR-диапазоном вашего прокси, чтобы заголовки `X-Forwarded-For`
 доверялись корректно.
 
@@ -296,7 +272,7 @@ TOTP-мастер-ключ должен передаваться через `MNE
 
 - **По умолчанию**: `nano` — встроенная локальная ONNX-модель `mnema-embed-v1` (без torch, без GPU, работает офлайн; внешние провайдеры вроде `onnx`/`sentence-transformers` остаются доступны)
 - **Ollama sidecar**: задайте `embedding.provider: ollama` и `embedding.ollama_url: http://ollama:11434`
-  (см. [Ollama sidecar](#ollama-sidecar-опциональные-embeddings) выше)
+  (см. раздел compose выше)
 
 ---
 
@@ -304,8 +280,8 @@ TOTP-мастер-ключ должен передаваться через `MNE
 
 ### Healthcheck контейнера
 
-Healthcheck в compose запускает `mnemos stats` каждые 30 секунд с таймаутом 5 секунд.
-Проверить текущее состояние:
+Healthcheck'и опрашивают неаутентифицированный HTTP-эндпоинт `/health` (и compose,
+и quadlet) — без зависимости от CLI. Проверить текущее состояние:
 
 ```bash
 podman inspect --format '{{.State.Health.Status}}' mnemos

@@ -21,7 +21,7 @@ Volume=mnemos-vault:/vault
 Environment=MNEMOS_CONFIG=/app/config.yaml
 # TOTP master key lives outside the unit — 4.x images read MNEMOS_API__*,
 # 5.x read VESMARO_API__* (ADR-0031); keep both lines in the file.
-EnvironmentFile=%h/vesmaro.env
+EnvironmentFile=%h/.vesmaro.env
 
 # Unauthenticated /health endpoint; kept CLI-independent on purpose
 # (the CLI binary name changes in the 5.0.0 rebrand).
