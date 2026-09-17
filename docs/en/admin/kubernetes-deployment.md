@@ -133,20 +133,10 @@ consistent procedure).
 ## Image registry status
 
 Published images live at **`ghcr.io/vesmaro/vesmaro`** (org namespace,
-backfilled from the legacy user namespace in the 4.3.0 wave). The package is
-currently **private**:
-
-- if the pull fails, create a `docker-registry` secret and pass it:
-
-  ```bash
-  kubectl -n vesmaro create secret docker-registry ghcr-login \
-    --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT>
-  helm upgrade vesmaro deploy/helm/vesmaro -n vesmaro --reuse-values \
-    --set 'image.pullSecrets[0].name=ghcr-login'
-  ```
-
-- once the package is switched to **Public** (Package settings → Danger
-  Zone → Change visibility), plain pulls work everywhere with no secret.
+backfilled from the legacy user namespace in the 4.3.0 wave) and are
+**public** — plain pulls work with no credentials. `image.pullSecrets`
+remains available for private-registry setups or rate limits, but is not
+needed for this image.
 
 The release pipeline still targets the legacy `ghcr.io/korrnals/mnemos` name
 until the 5.0.0 registry migration (ADR-0031 / GWS card #331, phase g); new
@@ -168,7 +158,7 @@ ReadWriteOnce volume before the new one mounts it.
 | Symptom | Cause / fix |
 |---------|-------------|
 | Pods stuck in `CreateContainerConfigError` (or `CrashLoopBackOff` with a `ValueError` about the master key) | No TOTP key set — see [TOTP master key](#totp-master-key) |
-| `ImagePullBackOff` | Image is private — add `image.pullSecrets` (above), or wait for the registry migration |
+| `ImagePullBackOff` | Registry auth or rate limit — verify the image ref; `image.pullSecrets` for private setups or rate limits |
 | PVC `Pending` | No default StorageClass — set `persistence.*.storageClass` |
 | Ingress returns 404 | Wrong `ingress.className`, or the controller watches other namespaces only |
 | 401 on `/api/*` | Expected — all API endpoints except `/health` require the TOTP login flow ([security.md](security.md)) |

@@ -11,8 +11,8 @@ image:
   repository: ghcr.io/vesmaro/vesmaro
   tag: ""            # empty = Chart.yaml appVersion
   pullPolicy: IfNotPresent
-  pullSecrets: []    # package is private until made Public in Package settings;
-                     # until then pass a docker-registry secret here
+  pullSecrets: []    # the published image is public — pullSecrets only for
+                     # private-registry setups or rate limits
 
 nameOverride: ""
 fullnameOverride: ""

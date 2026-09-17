@@ -59,43 +59,10 @@ offline, no API keys, nothing downloaded.
 
 > ⚠️ Mind the name: `pip install mnemos` (without `-memory-server`) is an unrelated project.
 
-### 2 · Connect your harness — and teach it to use memory
+#### Or take the prebuilt image — Docker, Podman, or a Kubernetes cluster
 
-```bash
-mnemos integration setup
-```
-
-One pass: detects the agent harnesses on your machine, registers the Mnemos MCP server in each
-supported one (VS Code Copilot, Cursor, ZCode, OpenCode, pi, Hermes, and everything reading the
-`~/.agents` standard — Claude Code, Codex and friends), and deploys the **behavioral pack** —
-always-on instructions and memory skills, so the agent recalls at session start, checkpoints
-before its context gets compacted, and treats memory as a priority instead of forgetting the
-tools exist.
-
-Running a harness that reads nothing standard? One paste block per harness:
-[Connect Mnemos to any harness](integrations/mcp-presets.md).
-
-### 3 · Verify — then try it
-
-```bash
-mnemos doctor
-```
-
-PASS / WARN / FAIL per check: store, config, MCP transport, harness registration (`--fix`
-repairs the common warnings). Then give it a memory:
-
-```bash
-mnemos add "First memory — Mnemos remembers across sessions" \
-  --tags project:mnemos,agent:me,mnemos:learning
-mnemos search "remembers across sessions"
-```
-
-That is the whole loop: **write, find, never lose it — and the agent knows when to look.**
-
-### Server in a container or a cluster
-
-The same server as a prebuilt image — three more ways to run it, from a single host to any
-Kubernetes cluster. Full guides live in the admin docs.
+The same server ships as a public image (`ghcr.io/vesmaro/vesmaro`) — pull and run: no build,
+no login. Full guides live in the admin docs.
 
 <details>
 <summary><strong>☸️ Kubernetes / K3s — Helm chart with ingress</strong></summary>
@@ -143,8 +110,38 @@ Both Podman recipes (quadlet + `podman kube play`):
 **[container deployment](docs/en/admin/runbooks/container-deployment.md)**.
 </details>
 
-> ℹ️ The published image (`ghcr.io/vesmaro/vesmaro`) is currently **private** — run
-> `docker login ghcr.io` / `podman login ghcr.io` first if the pull is denied.
+### 2 · Connect your harness — and teach it to use memory
+
+```bash
+mnemos integration setup
+```
+
+One pass: detects the agent harnesses on your machine, registers the Mnemos MCP server in each
+supported one (VS Code Copilot, Cursor, ZCode, OpenCode, pi, Hermes, and everything reading the
+`~/.agents` standard — Claude Code, Codex and friends), and deploys the **behavioral pack** —
+always-on instructions and memory skills, so the agent recalls at session start, checkpoints
+before its context gets compacted, and treats memory as a priority instead of forgetting the
+tools exist.
+
+Running a harness that reads nothing standard? One paste block per harness:
+[Connect Mnemos to any harness](integrations/mcp-presets.md).
+
+### 3 · Verify — then try it
+
+```bash
+mnemos doctor
+```
+
+PASS / WARN / FAIL per check: store, config, MCP transport, harness registration (`--fix`
+repairs the common warnings). Then give it a memory:
+
+```bash
+mnemos add "First memory — Mnemos remembers across sessions" \
+  --tags project:mnemos,agent:me,mnemos:learning
+mnemos search "remembers across sessions"
+```
+
+That is the whole loop: **write, find, never lose it — and the agent knows when to look.**
 
 > 📘 **Want every detail?** The extended guide covers all install variants (`uv tool`, `pipx`,
 > CLI-only, external LLM extras, installer script, container), per-harness connection

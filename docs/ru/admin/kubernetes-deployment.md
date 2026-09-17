@@ -132,19 +132,9 @@ helm upgrade vesmaro deploy/helm/vesmaro -n vesmaro --reuse-values \
 ## Статус реестра образов
 
 Опубликованные образы живут в **`ghcr.io/vesmaro/vesmaro`** (org-неймспейс,
-перезалит из легаси-user-неймспейса в волне 4.3.0). Пакет сейчас **приватный**:
-
-- если pull падает, создайте `docker-registry`-секрет и передайте его:
-
-  ```bash
-  kubectl -n vesmaro create secret docker-registry ghcr-login \
-    --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT>
-  helm upgrade vesmaro deploy/helm/vesmaro -n vesmaro --reuse-values \
-    --set 'image.pullSecrets[0].name=ghcr-login'
-  ```
-
-- после переключения пакета в **Public** (Package settings → Danger
-  Zone → Change visibility) обычный pull работает везде без секретов.
+перезалит из легаси-user-неймспейса в волне 4.3.0) и **публичные** — обычный
+pull работает без всяких креденшелов. `image.pullSecrets` остаётся доступным
+для приватных реестров и rate-limit'ов, но для этого образа не нужен.
 
 Релизный конвейер пока таргетит легаси-имя `ghcr.io/korrnals/mnemos` до
 миграции реестра в 5.0.0 (ADR-0031 / GWS card #331, фаза g); новые релизы
@@ -166,7 +156,7 @@ ReadWriteOnce-том до того, как его примонтирует но�
 | Симптом | Причина / исправление |
 |---------|----------------------|
 | Поды в `CreateContainerConfigError` (или `CrashLoopBackOff` с `ValueError` про мастер-ключ) | Не задан TOTP-ключ — см. [Мастер-ключ TOTP](#мастер-ключ-totp) |
-| `ImagePullBackOff` | Образ приватный — добавьте `image.pullSecrets` (выше) или дождитесь миграции реестра |
+| `ImagePullBackOff` | Auth или rate-limit реестра — проверьте ссылку образа; `image.pullSecrets` для приватных сетапов и rate-limit'ов |
 | PVC в `Pending` | Нет StorageClass по умолчанию — задайте `persistence.*.storageClass` |
 | Ingress отдаёт 404 | Неверный `ingress.className`, либо контроллер смотрит только другие namespace |
 | 401 на `/api/*` | Ожидаемо — все эндпоинты, кроме `/health`, требуют TOTP-логин ([security.md](security.md)) |

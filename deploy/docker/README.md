@@ -19,8 +19,7 @@ curl -fsS http://localhost:8787/health    # → {"status":"ok"}
 
 ## Notes
 
-- The package is private on ghcr.io until made Public — run
-  `docker login ghcr.io` first if the pull fails.
+- The published image is **public** — no login required for pulls.
 - Data lives in named volumes `vesmaro-data` (SQLite + vector index) and
   `vesmaro-vault` (markdown mirror).
 - Optional local-embeddings sidecar: `docker compose --profile ollama up -d`.

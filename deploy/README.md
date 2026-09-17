@@ -22,10 +22,10 @@ Full documentation:
 - **TOTP master key** — required in any non-loopback deployment. Generate:
   `openssl rand -hex 32`. An empty key is rejected at startup.
 - **Image**: published at `ghcr.io/vesmaro/vesmaro` (tags `4.3.0`, `latest`;
-  backfilled from the legacy `ghcr.io/korrnals/mnemos` user namespace).
-  The package is **private until made Public in Package settings** — until
-  then `docker/podman login ghcr.io` is required for pulls. The release
-  pipeline targets the legacy name until 5.0.0 phase-g (GWS card #331).
+  **public** — anonymous pulls, backfilled from the legacy
+  `ghcr.io/korrnals/mnemos` user namespace). The release pipeline targets
+  the legacy name until 5.0.0 phase-g (GWS card #331); new releases are
+  backfilled manually in the meantime.
 - **Data**: two volumes — `/data` (SQLite + vector index) and `/vault`
   (Obsidian markdown mirror). Health surface: unauthenticated `GET /health`.
 
@@ -37,5 +37,5 @@ Full documentation:
 (`helm/vesmaro/`), **Docker** — docker-compose с готовым образом
 (`docker/`), **Podman** — quadlet-юнит и kube-play манифест (`podman/`).
 Полные руководства — в docs (EN/RU, ссылки выше). Обязательное для любого
-не-loopback деплоя: TOTP-ключ (`openssl rand -hex 32`); образ сейчас
-приватный на ghcr.io (см. примечание выше).
+не-loopback деплоя: TOTP-ключ (`openssl rand -hex 32`); образ публичный —
+`ghcr.io/vesmaro/vesmaro`, тянется без логина.
