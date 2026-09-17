@@ -158,7 +158,7 @@ ReadWriteOnce volume before the new one mounts it.
 | Symptom | Cause / fix |
 |---------|-------------|
 | Pods stuck in `CreateContainerConfigError` (or `CrashLoopBackOff` with a `ValueError` about the master key) | No TOTP key set — see [TOTP master key](#totp-master-key) |
-| `ImagePullBackOff` | Registry auth or rate limit — verify the image ref; `image.pullSecrets` for private setups |
+| `ImagePullBackOff` | Registry auth or rate limit — verify the image ref; `image.pullSecrets` for private setups or rate limits |
 | PVC `Pending` | No default StorageClass — set `persistence.*.storageClass` |
 | Ingress returns 404 | Wrong `ingress.className`, or the controller watches other namespaces only |
 | 401 on `/api/*` | Expected — all API endpoints except `/health` require the TOTP login flow ([security.md](security.md)) |

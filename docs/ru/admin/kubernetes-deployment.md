@@ -156,7 +156,7 @@ ReadWriteOnce-том до того, как его примонтирует но�
 | Симптом | Причина / исправление |
 |---------|----------------------|
 | Поды в `CreateContainerConfigError` (или `CrashLoopBackOff` с `ValueError` про мастер-ключ) | Не задан TOTP-ключ — см. [Мастер-ключ TOTP](#мастер-ключ-totp) |
-| `ImagePullBackOff` | Auth или rate-limit реестра — проверьте ссылку образа; `image.pullSecrets` для приватных сетапов |
+| `ImagePullBackOff` | Auth или rate-limit реестра — проверьте ссылку образа; `image.pullSecrets` для приватных сетапов и rate-limit'ов |
 | PVC в `Pending` | Нет StorageClass по умолчанию — задайте `persistence.*.storageClass` |
 | Ingress отдаёт 404 | Неверный `ingress.className`, либо контроллер смотрит только другие namespace |
 | 401 на `/api/*` | Ожидаемо — все эндпоинты, кроме `/health`, требуют TOTP-логин ([security.md](security.md)) |

@@ -34,7 +34,7 @@ and `mnemos-vault` (Obsidian markdown mirror); the compose path names them `vesm
 - **podman-compose** or **docker compose** — only for the compose path
 - Python and `git` are **not** required on the host — everything runs inside the container
 - Pulls are anonymous — the published package is **public**; `podman/docker
-  login ghcr.io` is only needed if you hit a Docker Hub-style rate limit
+  login ghcr.io` is only needed if you hit a GHCR anonymous rate limit
 
 ---
 
