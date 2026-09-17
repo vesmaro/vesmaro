@@ -92,8 +92,9 @@ docker exec vesmaro-ollama ollama pull nomic-embed-text
 To activate Ollama as the embedding provider, set `embedding.provider: ollama`
 in the container config (see [Configuration](#configuration)).
 
-> The repo-root [`compose.yaml`](../../../../compose.yaml) is the build-from-source
-> variant (used with `podman-compose up --build`) — a development tool, see
+> The repo-root [`compose.yaml`](../../../../compose.yaml) also uses the published image —
+> it keeps the historic `mnemos-*` resource names for existing podman-compose users.
+> The build-from-source flow is described in
 > [Build from source](#build-from-source-fallback).
 
 ---

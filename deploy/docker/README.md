@@ -24,5 +24,6 @@ curl -fsS http://localhost:8787/health    # → {"status":"ok"}
 - Data lives in named volumes `vesmaro-data` (SQLite + vector index) and
   `vesmaro-vault` (markdown mirror).
 - Optional local-embeddings sidecar: `docker compose --profile ollama up -d`.
-- To build the image from source instead of pulling it, use the root
-  [`compose.yaml`](../../compose.yaml) (`podman-compose up --build`).
+- Building from source is a development fallback — `podman build -f Containerfile .`
+  (see the runbook's *Build from source* section); every compose file in the
+  repo uses the published image.
