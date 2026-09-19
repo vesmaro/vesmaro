@@ -41,9 +41,13 @@ wildcard) and returns ``PERMISSION_DENIED`` when the scope is
 disallowed. Fail-closed: unknown peer or empty allow-list → refuse.
 
 Security notes:
-    * The server binds a Unix socket with filesystem permissions. The
-      operator is responsible for restricting access to the socket
-      file (``chmod 0600`` + the mnemos user owns it).
+    * The server binds a Unix socket with filesystem permissions.
+      Default modes are ``0600`` socket / ``0700`` dir (mnemos user
+      only); ``mesh.socket_group_access: true`` switches to ``0660`` /
+      ``0770`` for shared-volume deployments (fsGroup / compose
+      ``user:``) where the mesh binary dials as a different uid in the
+      same gid. The operator is responsible for the enclosing dir
+      ownership.
     * No TLS on the Unix socket — local-only transport (criterion 11).
     * The secrets scanner runs on :rpc:`WriteMemory` via the
       :class:`~vesmaro.manager.MemoryManager.add` Layer 1 path; a
@@ -666,13 +670,20 @@ class MeshServer:
 
         Removes any stale socket file at :attr:`socket_path` first
         (otherwise gRPC gets ``EADDRINUSE`` on restart). Creates the
-        parent directory with mode ``0700`` so the socket is only
-        accessible to the mnemos user (defence-in-depth: the operator is
-        still responsible for the final perms, but we avoid a world-
-        readable socket by default).
+        parent directory so the socket is only accessible to the mnemos
+        user by default (mode ``0700`` dir / ``0600`` socket), or — when
+        ``settings.mesh.socket_group_access`` is set — group-accessible
+        modes (``0770`` dir / ``0660`` socket) for shared-volume
+        deployments where the mesh binary dials from a different uid in
+        the same gid (Kubernetes fsGroup, compose ``user:``). In both
+        cases defence-in-depth: the operator is still responsible for
+        the enclosing directory ownership.
         """
         if self._server is not None:
             raise RuntimeError("MeshServer already started")
+        group_access = self._settings.mesh.socket_group_access
+        dir_mode = 0o770 if group_access else 0o700
+        sock_mode = 0o660 if group_access else 0o600
         sock_path = Path(self._socket_path)
         # Remove a stale socket file so a restart does not EADDRINUSE.
         if sock_path.exists() and sock_path.is_socket():
@@ -681,7 +692,7 @@ class MeshServer:
         parent = sock_path.parent
         parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.chmod(parent, 0o700)
+            os.chmod(parent, dir_mode)
         except PermissionError:
             # Best-effort: if we cannot chmod the parent (e.g. /run),
             # the operator is responsible for the perms. Do not fail.
@@ -701,13 +712,13 @@ class MeshServer:
         # Restrict the socket file perms (defence-in-depth: the socket
         # should only be accessible to the mnemos user + the mesh).
         try:
-            os.chmod(self._socket_path, 0o600)
+            os.chmod(self._socket_path, sock_mode)
         except (PermissionError, FileNotFoundError):
             logger.warning(
                 "mesh_server: could not chmod socket %s — operator must secure it",
                 self._socket_path,
             )
-        logger.info("mesh_server: listening on %s", self._socket_path)
+        logger.info("mesh server listening on %s", self._socket_path)
 
     def stop(self, *, grace: float = 1.0) -> None:
         """Stop the server and release the socket.
