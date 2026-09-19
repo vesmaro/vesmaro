@@ -87,10 +87,20 @@ def _setup_cors(application: FastAPI, settings: Settings) -> None:
     _logger.info("CORS enabled for %d origin(s)", len(cfg.cors_allow_origins))
 
 
-def get_manager() -> MemoryManager:
+def get_manager(config: str | None = None) -> MemoryManager:
+    """Return the process-wide :class:`MemoryManager` singleton.
+
+    ``config`` is only consulted on the FIRST call (when the singleton
+    is constructed); later calls return the cached instance and ignore
+    it — same semantics as :func:`mnemos.cli._manager.get_manager`.
+    Added for the native mesh serve wiring (W2) so ``mnemos serve
+    --config …`` can seed the singleton MeshServer shares with the
+    in-process HTTP app; callers that pass nothing keep the old
+    config-discovery behaviour.
+    """
     global _manager
     if _manager is None:
-        _manager = MemoryManager(load_settings())
+        _manager = MemoryManager(load_settings(config))
     return _manager
 
 
