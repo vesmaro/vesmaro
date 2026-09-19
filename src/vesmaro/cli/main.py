@@ -820,7 +820,7 @@ def serve(
     ] = None,
     config: str = ConfigOption,
 ) -> None:
-    """Start the Mnemos HTTP API server."""
+    """Start the Mnemos HTTP API server (+ the MnemosCore mesh gRPC server when mesh is enabled)."""
     import os
 
     import uvicorn
@@ -848,12 +848,40 @@ def serve(
     # load_settings() inside the worker - finding auth-1).
     os.environ["VESMARO_API__HOST"] = h
     os.environ["VESMARO_API__PORT"] = str(p)
-    uvicorn.run(
-        "vesmaro.api.main:app",
-        host=h,
-        port=p,
-        workers=settings.runtime.uvicorn_workers,
-    )
+
+    # Native mesh serve wiring (W2, ROADMAP-v2 go-live): when the mesh is
+    # enabled, serve the MnemosCore gRPC server on the configured Unix
+    # socket in THIS process, next to the HTTP API — the mnemos-mesh Go
+    # binary dials that socket. Mirrors the reference wiring in
+    # mnemos-mesh/test/integration/serve-with-mesh.py. Additive: with
+    # ``mesh.enabled: false`` (the default) the command behaves exactly
+    # as before (uvicorn only).
+    mesh_server = None
+    if settings.mesh.enabled:
+        from vesmaro.api.main import get_manager as get_api_manager
+        from vesmaro.mesh_server import MeshServer
+
+        # Seed the api.main singleton from serve's own --config so the
+        # MeshServer shares the manager with the in-process HTTP app
+        # (uvicorn workers=1) instead of building a second one.
+        mesh_manager = get_api_manager(config)
+        mesh_server = MeshServer(settings.mesh.socket_path, mesh_manager, settings)
+        mesh_server.start()  # logs: mesh server listening on <path>
+
+    try:
+        uvicorn.run(
+            "vesmaro.api.main:app",
+            host=h,
+            port=p,
+            workers=settings.runtime.uvicorn_workers,
+        )
+    finally:
+        # Graceful shutdown with uvicorn: uvicorn traps SIGINT/SIGTERM,
+        # drains the HTTP side, and run() returns — then the gRPC server
+        # drains (2s grace, matching the reference wiring) and removes
+        # its socket file. Also covers uvicorn startup failures.
+        if mesh_server is not None:
+            mesh_server.stop(grace=2.0)
 
 
 # ── mcp-server ─────────────────────────────────────────────────────────────────
