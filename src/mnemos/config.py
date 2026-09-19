@@ -400,11 +400,21 @@ class MeshConfig(BaseModel):
         timeout_s: Per-RPC deadline in seconds. Short enough that a dead
             mesh is noticed quickly, long enough for a local Unix-socket
             round trip. Default 2.0s.
+        socket_group_access: Grant group read/write on the Unix socket
+            (and group rwx on its parent dir) so a mesh binary running as
+            a DIFFERENT uid but the SAME gid can dial it. For deployments
+            where the socket dir is a shared volume whose group ownership
+            is already solved outside the process (Kubernetes fsGroup,
+            compose ``user: <uid>:<gid>``). When ``False`` (default) the
+            socket is ``0600`` and the dir ``0700`` — mnemos user only.
+            Additive (W2 native serve wiring backport): existing configs
+            behave exactly as before.
     """
 
     socket_path: str = "/run/mnemos/core.sock"
     enabled: bool = False
     timeout_s: float = Field(default=2.0, gt=0.0, le=60.0)
+    socket_group_access: bool = False
 
 
 class Settings(BaseSettings):
