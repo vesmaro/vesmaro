@@ -458,6 +458,23 @@ mnemos serve [OPTIONS]
 
 > **Безопасность.** Привязка по умолчанию — `127.0.0.1`. Не открывайте этот порт в публичную сеть без обратного прокси с аутентификацией. См. [security.md](../admin/security.md).
 
+### Mesh-сервер (нативный wiring)
+
+При `mesh.enabled: true` в конфиге `mnemos serve` дополнительно поднимает gRPC-сервер `MnemosCore` на настроенном Unix-сокете **в том же процессе**, рядом с HTTP API — бинарий `mnemos-mesh` диалит этот сокет. На старте пишется одна строка: `mesh server listening on <path>`. По `SIGINT`/`SIGTERM` uvicorn сначала дрейнит HTTP, затем gRPC-сервер дрейнит (grace 2 с) и удаляет файл сокета.
+
+```yaml
+mesh:
+  enabled: true
+  socket_path: /run/mnemos/core.sock
+  # Групповой доступ для shared-volume деплоев (Kubernetes fsGroup,
+  # compose `user: <uid>:<gid>`): сокет 0660 / каталог 0770 вместо
+  # owner-only 0600 / 0700 — mesh-бинарий может диалить сокет под другим
+  # uid в той же gid.
+  socket_group_access: true
+```
+
+При `mesh.enabled: false` (по умолчанию) команда ведёт себя ровно как раньше — только uvicorn.
+
 ### Примеры
 
 ```bash
