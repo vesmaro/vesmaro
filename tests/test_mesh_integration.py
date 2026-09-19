@@ -72,10 +72,7 @@ MESH_BIN_ENV = "MESH_BIN"
 
 #: Legacy fallback: sibling mnemos-mesh checkout with a built binary.
 _FALLBACK_BINARY = (
-    Path(__file__).resolve().parent.parent.parent
-    / "mnemos-mesh"
-    / "bin"
-    / "mnemos-mesh"
+    Path(__file__).resolve().parent.parent.parent / "mnemos-mesh" / "bin" / "mnemos-mesh"
 )
 
 
@@ -91,9 +88,7 @@ def _find_mesh_binary() -> Path | None:
         p = Path(env_bin)
         if p.is_file() and os.access(p, os.X_OK):
             return p
-        pytest.fail(
-            f"{MESH_BIN_ENV}={env_bin!r} is set but not an executable file"
-        )
+        pytest.fail(f"{MESH_BIN_ENV}={env_bin!r} is set but not an executable file")
     if _FALLBACK_BINARY.is_file() and os.access(_FALLBACK_BINARY, os.X_OK):
         return _FALLBACK_BINARY
     return None
@@ -296,9 +291,7 @@ def mesh_binary(tmp_path: Path, mesh_socket: str) -> Generator[str, None, None]:
             time.sleep(0.1)
         if proc.poll() is not None:
             out = proc.stdout.read() if proc.stdout else ""
-            pytest.fail(
-                f"mesh binary exited early (rc={proc.returncode}):\n{out[-2000:]}"
-            )
+            pytest.fail(f"mesh binary exited early (rc={proc.returncode}):\n{out[-2000:]}")
         yield mesh_socket
     finally:
         proc.terminate()
@@ -380,10 +373,7 @@ def test_write_memory_import_round_trip(mesh_binary: str) -> None:
         # incoming id is preserved in metadata as ``fed_id``). The
         # exported envelope is rebuilt as ``fed:<source_agent>:<memory
         # id>``, so we match on title + source_agent, not on the id.
-        assert any(
-            r.title == "test record" and r.source_agent == "test-agent"
-            for r in records
-        )
+        assert any(r.title == "test record" and r.source_agent == "test-agent" for r in records)
 
 
 def test_mesh_binary_dial_not_degraded(mesh_binary: str, tmp_path: Path) -> None:
