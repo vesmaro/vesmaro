@@ -264,6 +264,23 @@ The server uses `uvicorn[standard]` (HTTP/1.1 + WebSockets). The number of worke
 
 > **Security.** The default bind is `127.0.0.1`. Do not expose this port to a public network without putting a reverse proxy with authentication in front. See [security.md](../admin/security.md).
 
+### Mesh server (native wiring)
+
+When `mesh.enabled` is `true` in the config, `mnemos serve` additionally starts the `MnemosCore` gRPC server on the configured Unix socket **in the same process**, next to the HTTP API — the `mnemos-mesh` binary dials that socket. Startup logs one line: `mesh server listening on <path>`. On `SIGINT`/`SIGTERM` uvicorn drains the HTTP side first, then the gRPC server drains (2 s grace) and removes its socket file.
+
+```yaml
+mesh:
+  enabled: true
+  socket_path: /run/mnemos/core.sock
+  # Group access for shared-volume deployments (Kubernetes fsGroup,
+  # compose `user: <uid>:<gid>`): socket 0660 / dir 0770 instead of the
+  # owner-only 0600 / 0700, so the mesh binary can dial the socket as a
+  # different uid in the same gid.
+  socket_group_access: true
+```
+
+With `mesh.enabled: false` (the default) the command behaves exactly as before — uvicorn only.
+
 ### Examples
 
 ```bash
