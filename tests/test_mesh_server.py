@@ -21,6 +21,7 @@ so the moderation pipeline + Layer 1 secrets scanner run for real.
 
 from __future__ import annotations
 
+import stat
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
@@ -269,6 +270,47 @@ class TestServerLifecycle:
         socket_path = str(tmp_path / "noop.sock")
         srv = MeshServer(socket_path, manager, settings, max_workers=2)
         srv.stop()  # must not raise
+
+
+class TestSocketPermissions:
+    """Socket/dir modes for the two deployment profiles (W2 wiring).
+
+    Default: owner-only (0600 socket / 0700 dir) — unchanged behaviour.
+    ``mesh.socket_group_access: true``: group rw (0660/0770) so a mesh
+    binary running as a different uid in the same gid (fsGroup, compose
+    ``user:``) can dial the shared-volume socket.
+    """
+
+    def test_default_modes_are_owner_only(
+        self,
+        tmp_path: Path,
+        settings: Settings,
+        manager: MemoryManager,
+    ) -> None:
+        socket_path = str(tmp_path / "sock" / "perms_default.sock")
+        srv = MeshServer(socket_path, manager, settings, max_workers=2)
+        srv.start()
+        try:
+            assert stat.S_IMODE(Path(socket_path).stat().st_mode) == 0o600
+            assert stat.S_IMODE(Path(socket_path).parent.stat().st_mode) == 0o700
+        finally:
+            srv.stop(grace=0.1)
+
+    def test_group_access_modes(
+        self,
+        tmp_path: Path,
+        settings: Settings,
+        manager: MemoryManager,
+    ) -> None:
+        settings.mesh.socket_group_access = True
+        socket_path = str(tmp_path / "sock" / "perms_group.sock")
+        srv = MeshServer(socket_path, manager, settings, max_workers=2)
+        srv.start()
+        try:
+            assert stat.S_IMODE(Path(socket_path).stat().st_mode) == 0o660
+            assert stat.S_IMODE(Path(socket_path).parent.stat().st_mode) == 0o770
+        finally:
+            srv.stop(grace=0.1)
 
 
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
