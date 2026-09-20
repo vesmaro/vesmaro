@@ -423,6 +423,18 @@ EDGE_STATS_TOTAL_ROWS_CAP: Final[int] = 1_000_000
 #: written by ``purge_edge_stats_oldest``, read back by the CLI).
 EDGE_STATS_LAST_PURGE_META_KEY: Final[str] = "edge_stats_last_purge"
 
+#: The append-only DELETE guard for edge_stats — ONE literal shared by
+#: ``_DB_SCHEMA`` (fresh installs) and ``purge_edge_stats_oldest``
+#: (recreation inside the purge transaction). Single source of truth
+#: (review #338 round 2, minor): the purge must reinstall exactly the
+#: trigger the schema installs, not a drifting second copy.
+_EDGE_STATS_NO_DELETE_TRIGGER_DDL: Final[str] = (
+    "CREATE TRIGGER IF NOT EXISTS edge_stats_no_delete BEFORE DELETE ON edge_stats "
+    "BEGIN "
+    "SELECT RAISE(ABORT, 'edge_stats is append-only (ADR-0030 I5)'); "
+    "END"
+)
+
 #: I5 bounded counter clamp (ADR-0030, issue #323) — the maximum value
 #: any per-memory counter derived from edge_stats can reach
 #: (``get_edge_stats_counters``). Capture must not drift before APPLY
@@ -505,7 +517,8 @@ class _TTLCache:
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
-_DB_SCHEMA = """
+_DB_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS memories (
     id               TEXT PRIMARY KEY,
     content          TEXT NOT NULL,
@@ -908,11 +921,10 @@ CREATE TRIGGER IF NOT EXISTS edge_stats_no_update BEFORE UPDATE ON edge_stats
 BEGIN
     SELECT RAISE(ABORT, 'edge_stats is append-only (ADR-0030 I5)');
 END;
-CREATE TRIGGER IF NOT EXISTS edge_stats_no_delete BEFORE DELETE ON edge_stats
-BEGIN
-    SELECT RAISE(ABORT, 'edge_stats is append-only (ADR-0030 I5)');
-END;
 """
+    + _EDGE_STATS_NO_DELETE_TRIGGER_DDL
+    + ";"
+)
 
 _MIGRATIONS: list[tuple[str, str]] = [
     ("project", "ALTER TABLE memories ADD COLUMN project TEXT NOT NULL DEFAULT ''"),
@@ -3503,21 +3515,30 @@ class SQLiteStore:
         ``vesmaro edge-stats purge`` CLI wraps it, dry-run by default) —
         NEVER automatic eviction.
 
-        Mechanics (all inside ONE transaction, so an abort restores the
-        pre-purge world including the trigger):
+        Mechanics (all inside ONE explicit transaction, opened with
+        ``BEGIN IMMEDIATE`` before any DDL — the python sqlite3 driver
+        in legacy isolation mode autocommits DDL unless a transaction
+        is already open, so the explicit BEGIN is what makes an abort
+        restore the pre-purge world INCLUDING the trigger):
 
         1. count what a purge would remove (rows beyond the newest
            ``keep_last`` — i.e. everything after the newest-``keep_last``
            prefix of ``created_at DESC, rowid DESC``; among same-
            timestamp rows the later insertion survives longer);
-        2. ``DROP TRIGGER edge_stats_no_delete`` (SQLite DDL is
-           transactional — the guard is never durably absent);
-        3. ``DELETE`` those rows;
-        4. re-``CREATE`` the trigger (byte-identical to the schema DDL);
-        5. stamp the purge into ``meta`` under
+        2. ``BEGIN IMMEDIATE``;
+        3. ``DROP TRIGGER edge_stats_no_delete``;
+        4. ``DELETE`` those rows;
+        5. re-``CREATE`` the trigger from the SHARED
+           ``_EDGE_STATS_NO_DELETE_TRIGGER_DDL`` constant — the same
+           literal ``_DB_SCHEMA`` installs (single source of truth, no
+           drifting second copy);
+        6. stamp the purge into ``meta`` under
            ``EDGE_STATS_LAST_PURGE_META_KEY`` — the compensating audit
            trail: the append-only table shrank, and the record of that
-           shrink survives (read back by the CLI).
+           shrink survives (read back by the CLI);
+        7. ``COMMIT`` (any failure rolls everything back — the
+           trigger included; pinned by
+           ``test_mid_purge_failure_restores_trigger_and_rows``).
 
         Dry run (default) performs step 1 only — zero writes.
 
@@ -3552,6 +3573,18 @@ class SQLiteStore:
                 "dry_run": True,
             }
         try:
+            # Transactionality is EXPLICIT, not implicit (review #338
+            # round 2, MAJOR): the python sqlite3 driver in legacy
+            # isolation mode opens implicit transactions for DML only —
+            # DDL alone AUTOCOMMITS. Without this BEGIN the DROP TRIGGER
+            # below would commit immediately, and a later failure in the
+            # purge would leave the DELETE guard durably absent after
+            # rollback() — plain DELETEs would then succeed. BEGIN
+            # IMMEDIATE (the store's executescript-transaction
+            # precedent) makes drop+delete+recreate+stamp one atomic
+            # unit: an abort restores the pre-purge world INCLUDING the
+            # trigger.
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("DROP TRIGGER IF EXISTS edge_stats_no_delete")
             deleted = int(
                 conn.execute(
@@ -3561,12 +3594,7 @@ class SQLiteStore:
                     (keep_last,),
                 ).rowcount
             )
-            conn.execute(
-                "CREATE TRIGGER IF NOT EXISTS edge_stats_no_delete BEFORE DELETE ON edge_stats "
-                "BEGIN "
-                "SELECT RAISE(ABORT, 'edge_stats is append-only (ADR-0030 I5)'); "
-                "END"
-            )
+            conn.execute(_EDGE_STATS_NO_DELETE_TRIGGER_DDL)
             stamp = json.dumps(
                 {
                     "at": datetime.now(UTC).isoformat(),

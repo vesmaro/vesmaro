@@ -48,11 +48,16 @@ insertion order as tiebreak) survive; everything older is dropped.
 
 ## What the purge guarantees
 
-- Single maintenance transaction: the DELETE trigger is dropped and
-  recreated atomically with the row deletion — an aborted purge leaves
-  the pre-purge world fully intact, and the append-only guarantee is
-  never durably absent.
+- Single maintenance transaction, opened with an explicit
+  `BEGIN IMMEDIATE` before any DDL (the Python sqlite3 driver does not
+  itself open a transaction for DDL): the DELETE trigger is dropped and
+  recreated atomically with the row deletion — an aborted or crashed
+  purge leaves the pre-purge world fully intact, and the append-only
+  guarantee is never durably absent. Pinned by
+  `test_mid_purge_failure_restores_trigger_and_rows`.
 - The UPDATE trigger is never touched.
+- The recreated DELETE trigger comes from the same shared DDL constant
+  the schema installs (single source of truth — no drifting copy).
 - The purge itself is stamped into the `meta` table
   (`edge_stats_last_purge`: timestamp, purged count, retention) — the
   compensating audit trail. `edge-stats stats` shows it as

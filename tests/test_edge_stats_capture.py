@@ -807,6 +807,86 @@ class TestOperatorPurge:
         kept = {r[0] for r in store._get_conn().execute("SELECT event_id FROM edge_stats")}
         assert kept == {"new-a", "new-b"}
 
+    def test_mid_purge_failure_restores_trigger_and_rows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review #338 round 2 MAJOR pin — the purge must be ONE
+        transaction at the DRIVER level.
+
+        The python sqlite3 driver (legacy isolation mode) opens implicit
+        transactions for DML only; DDL alone AUTOCOMMITS. A purge that
+        dropped the DELETE trigger outside an explicit transaction and
+        then failed would leave the guard durably absent after rollback
+        — plain DELETEs would succeed and the append-only audit trail
+        would be unprotected. Simulate a crash AFTER the DROP/DELETE,
+        BEFORE the commit: on reopen the trigger MUST exist, every row
+        MUST be intact, a plain DELETE MUST still abort, and no purge
+        audit stamp may exist.
+
+        The reopen probe is a RAW sqlite3 connection, deliberately NOT
+        ``SQLiteStore``: the store's connect-time bootstrap re-runs
+        ``_DB_SCHEMA`` (all ``IF NOT EXISTS``) and would silently HEAL
+        an absent trigger — masking exactly the durability bug this
+        test pins. The raw connection observes the true on-disk state
+        (a live server keeps its long-lived connection and never
+        re-runs the schema, so until the next restart nothing would
+        reinstall the guard)."""
+        db = tmp_path / "purge-crash.db"
+        store = SQLiteStore(db)
+        _seed_direct(store, [(f"e-{i}", f"2026-09-{10 + i}T00:00:00+00:00") for i in range(4)])
+        real_conn = store._get_conn()
+
+        class _FailOnTriggerRecreate:
+            """Connection proxy simulating process death at the exact
+            mid-purge point (the trigger-recreation statement)."""
+
+            def __init__(self, inner: sqlite3.Connection) -> None:
+                self._inner = inner
+
+            def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:  # type: ignore[assignment]
+                if "CREATE TRIGGER" in sql:
+                    raise sqlite3.OperationalError("injected mid-purge failure")
+                return self._inner.execute(sql, params)
+
+            def commit(self) -> None:
+                self._inner.commit()
+
+            def rollback(self) -> None:
+                self._inner.rollback()
+
+        monkeypatch.setattr(
+            store,
+            "_get_conn",
+            lambda: _FailOnTriggerRecreate(real_conn),  # type: ignore[arg-type]
+        )
+        with pytest.raises(sqlite3.OperationalError, match="injected mid-purge failure"):
+            store.purge_edge_stats_oldest(keep_last=2, dry_run=False)
+        store.close()
+
+        # RAW reopen — durability on disk, not this connection's
+        # rollback state, and not the store's schema-healing bootstrap.
+        raw = sqlite3.connect(str(db))
+        try:
+            assert _object_exists(raw, "edge_stats_no_delete")  # the guard never left
+            assert raw.execute("SELECT COUNT(*) FROM edge_stats").fetchone()[0] == 4
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                raw.execute("DELETE FROM edge_stats WHERE event_id = 'e-0'")
+            stamp = raw.execute(
+                "SELECT value FROM meta WHERE key = ?", (EDGE_STATS_LAST_PURGE_META_KEY,)
+            ).fetchone()
+            assert stamp is None  # no false audit of a purge that did not land
+        finally:
+            raw.close()
+
+    def test_delete_trigger_ddl_is_single_source(self) -> None:
+        """Review #338 round 2 minor pin — the purge reinstalls the
+        trigger from the SAME literal the schema installs
+        (``_EDGE_STATS_NO_DELETE_TRIGGER_DDL``); no drifting second
+        copy of the DDL may appear."""
+        from vesmaro.storage import sqlite_store
+
+        assert sqlite_store._EDGE_STATS_NO_DELETE_TRIGGER_DDL in sqlite_store._DB_SCHEMA
+
 
 # ── Review #338 N3/N4: one-aggregation telemetry; public kinds constant ─────
 

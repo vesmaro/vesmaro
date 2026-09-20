@@ -48,11 +48,16 @@ vesmaro edge-stats purge --keep-last 100000 --apply
 
 ## Что гарантирует purge
 
-- Одна maintenance-транзакция: DELETE-триггер дропается и
-  пересоздается атомарно вместе с удалением строк — прерванный purge
-  оставляет мир до purge нетронутым, а guarantee append-only никогда
-  не исчезает долговременно.
+- Одна maintenance-транзакция, открытая явным `BEGIN IMMEDIATE` до
+  любого DDL (драйвер Python sqlite3 сам не открывает транзакцию под
+  DDL): DELETE-триггер дропается и пересоздается атомарно вместе с
+  удалением строк — прерванный или упавший purge оставляет мир до
+  purge нетронутым, а guarantee append-only никогда не исчезает
+  долговременно. Закреплено тестом
+  `test_mid_purge_failure_restores_trigger_and_rows`.
 - UPDATE-триггер не затрагивается вовсе.
+- Пересозданный DELETE-триггер берётся из общего DDL-константы, которую
+  ставит схема (single source of truth — нет дрейфующей копии).
 - Сам purge фиксируется в таблице `meta`
   (`edge_stats_last_purge`: время, число удалённых, retention) —
   компенсирующий audit trail. `edge-stats stats` показывает его как

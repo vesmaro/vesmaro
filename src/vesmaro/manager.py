@@ -109,6 +109,12 @@ def _derive_feedback_event_id(
     the row (``""`` for the explicit global mode) — the hash must be
     stable across processes, and the stored columns are the stable
     form.
+
+    Compat (deliberate no-migration): rows stored before this change
+    hashed the two-field preimage, so a retry of a pre-upgrade report
+    inserts one fresh row instead of deduping. Accepted — the flag is
+    default-off and the table is days old; capture-only, one inert
+    clamped row.
     """
     canonical = (
         f"{len(event_id)}:{event_id}"
