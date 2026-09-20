@@ -1165,6 +1165,8 @@ cache_aligner:
 
 Допустимые подтипы `mnemos:`: `session`, `bug-pattern`, `learning`, `decision`, `rule`, `open-question`, `checkpoint`, `legacy`.
 
+Опциональный скоуп-тег (ADR-0027 Фаза 0): `task:<slug>` (`[a-z0-9][a-z0-9\-_]{0,63}`, не более 1) сужает запись до одной task-области — см. [tag-contract.md](tag-contract.md#task--task-область-многоконтекстная-память-adr-0027-фаза-0).
+
 Полная справка: [tag-contract.md](tag-contract.md).
 
 ---

@@ -1165,6 +1165,8 @@ The `mnemos_add` and `mnemos_ingest_url` tools reject calls that violate the M2 
 
 Valid `mnemos:` subtypes: `session`, `bug-pattern`, `learning`, `decision`, `rule`, `open-question`, `checkpoint`, `legacy`.
 
+Optional scope tag (ADR-0027 Phase 0): `task:<slug>` (`[a-z0-9][a-z0-9\-_]{0,63}`, at most 1) narrows the entry to one task scope — see [tag-contract.md](tag-contract.md#task--task-scope-multi-context-memory-adr-0027-phase-0).
+
 Full reference: [tag-contract.md](tag-contract.md).
 
 ---

@@ -435,7 +435,8 @@ async def _canonical_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": (
                             "Tags. REQUIRED: project:<slug>, agent:<slug>, mnemos:<subtype>. "
-                            "Optional: severity:, stack:, applyTo:, source: prefixes."
+                            "Optional: task:<slug> (at most one — task scope, ADR-0027), "
+                            "severity:, stack:, applyTo:, source: prefixes."
                         ),
                     },
                     "memory_type": {
