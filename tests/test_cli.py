@@ -823,3 +823,39 @@ class TestWorkflowCli:
         populated = runner.invoke(app, ["workflow", "history", memory_id])
         assert populated.exit_code == 0, populated.output
         assert "in-progress" in populated.output
+
+
+# ── edge-stats maintenance (ADR-0030 A0, review #338 N2) ─────────────────────
+
+
+class TestEdgeStatsCommand:
+    def test_stats_on_empty_table(self, isolated_config: Path) -> None:
+        """`edge-stats stats` reports the zero state with the global cap."""
+        result = runner.invoke(app, ["edge-stats", "stats"])
+        assert result.exit_code == 0, result.output
+        assert "rows total: 0" in result.output
+        assert "last purge: never" in result.output
+
+    def test_purge_requires_keep_last(self, isolated_config: Path) -> None:
+        """No default retention: purge without --keep-last refuses."""
+        result = runner.invoke(app, ["edge-stats", "purge"])
+        assert result.exit_code == 1, result.output
+        assert "--keep-last" in result.output
+
+    def test_purge_negative_keep_last_refused(self, isolated_config: Path) -> None:
+        result = runner.invoke(app, ["edge-stats", "purge", "--keep-last", "-1"])
+        assert result.exit_code == 1, result.output
+        assert ">= 0" in result.output
+
+    def test_purge_dry_run_default_writes_nothing(self, isolated_config: Path) -> None:
+        """Without --apply the command only reports the projection —
+        an operator reviews, then re-runs with --apply."""
+        result = runner.invoke(app, ["edge-stats", "purge", "--keep-last", "5"])
+        assert result.exit_code == 0, result.output
+        assert "dry run" in result.output
+        assert "would purge: 0" in result.output
+
+    def test_unknown_action_exits_1(self, isolated_config: Path) -> None:
+        result = runner.invoke(app, ["edge-stats", "vacuum"])
+        assert result.exit_code == 1, result.output
+        assert "Unknown action" in result.output

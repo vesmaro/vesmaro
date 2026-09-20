@@ -388,7 +388,11 @@ _EDGE_KINDS: Final[set[str]] = {"supersedes", "relates_to"}
 # 'used' = a search citation was consumed by the caller, 'rejected' =
 # the caller dismissed it. Expanding this set requires the SQL CHECK
 # migration and this whitelist in the same change.
-_EDGE_STATS_KINDS: Final[frozenset[str]] = frozenset({"used", "rejected"})
+#
+# PUBLIC (review #338 N4): the manager wrapper and the tests consume
+# this constant — it sits alongside the cap constants below and is
+# imported cross-module under this name, never as a private symbol.
+EDGE_STATS_KINDS: Final[frozenset[str]] = frozenset({"used", "rejected"})
 
 #: I5 volume cap (ADR-0030, issue #323) — maximum captured events per
 #: principal ``(project, agent)`` bucket. A storage-DoS and APPLY
@@ -399,6 +403,37 @@ _EDGE_STATS_KINDS: Final[frozenset[str]] = frozenset({"used", "rejected"})
 #: under a concurrent-writer race is accepted: the guard bounds storage,
 #: it is not an exact quota (single-process SQLite, one connection).
 EDGE_STATS_EVENTS_PER_PRINCIPAL_CAP: Final[int] = 10_000
+
+#: I5 GLOBAL volume cap (ADR-0030, review #338 N2) — hard ceiling on
+#: TOTAL edge_stats rows across all principals. The per-bucket cap
+#: above bounds one identity; this one bounds the table itself, which
+#: the per-bucket cap alone cannot (unbounded across minted principals).
+#: Enforced in ``record_edge_stat_event`` alongside the per-bucket cap
+#: (same ``cap_dropped`` outcome, never an error). NOT automatic
+#: eviction: once the ceiling is reached, capture stays dropped until
+#: an operator reclaims rows via ``purge_edge_stats_oldest`` (the
+#: ``vesmaro edge-stats purge`` CLI path, dry-run by default). Sized so
+#: a legitimate deployment never touches it (10k x principals << 1M);
+#: revisit together with APPLY (#325) when real volume telemetry exists.
+EDGE_STATS_TOTAL_ROWS_CAP: Final[int] = 1_000_000
+
+#: ``meta`` key holding the audit stamp (JSON: at/purged/keep_last) of
+#: the last applied edge_stats purge — the compensating audit trail for
+#: the one sanctioned shrink of the append-only table (review #338 N2;
+#: written by ``purge_edge_stats_oldest``, read back by the CLI).
+EDGE_STATS_LAST_PURGE_META_KEY: Final[str] = "edge_stats_last_purge"
+
+#: The append-only DELETE guard for edge_stats — ONE literal shared by
+#: ``_DB_SCHEMA`` (fresh installs) and ``purge_edge_stats_oldest``
+#: (recreation inside the purge transaction). Single source of truth
+#: (review #338 round 2, minor): the purge must reinstall exactly the
+#: trigger the schema installs, not a drifting second copy.
+_EDGE_STATS_NO_DELETE_TRIGGER_DDL: Final[str] = (
+    "CREATE TRIGGER IF NOT EXISTS edge_stats_no_delete BEFORE DELETE ON edge_stats "
+    "BEGIN "
+    "SELECT RAISE(ABORT, 'edge_stats is append-only (ADR-0030 I5)'); "
+    "END"
+)
 
 #: I5 bounded counter clamp (ADR-0030, issue #323) — the maximum value
 #: any per-memory counter derived from edge_stats can reach
@@ -482,7 +517,8 @@ class _TTLCache:
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
-_DB_SCHEMA = """
+_DB_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS memories (
     id               TEXT PRIMARY KEY,
     content          TEXT NOT NULL,
@@ -863,8 +899,11 @@ CREATE INDEX IF NOT EXISTS idx_memory_edges_to   ON memory_edges(to_memory_id, k
 -- UPDATE and DELETE abort. ``kind``: 'used' (citation consumed) |
 -- 'rejected' (citation dismissed). Counters derived from this table
 -- are clamped at EDGE_STATS_COUNTER_CLAMP; per-principal volume is
--- capped at EDGE_STATS_EVENTS_PER_PRINCIPAL_CAP in
--- record_edge_stat_event (I5: storage-DoS + APPLY pre-poisoning).
+-- capped at EDGE_STATS_EVENTS_PER_PRINCIPAL_CAP and TOTAL table volume
+-- at EDGE_STATS_TOTAL_ROWS_CAP in record_edge_stat_event (I5:
+-- storage-DoS + APPLY pre-poisoning). Reclaiming rows past the global
+-- cap is an explicit operator path (purge_edge_stats_oldest / the
+-- `vesmaro edge-stats purge` CLI), never automatic eviction.
 -- CAPTURE ONLY — zero ranking influence in A0 (APPLY is #325).
 CREATE TABLE IF NOT EXISTS edge_stats (
     event_id    TEXT PRIMARY KEY,
@@ -882,11 +921,10 @@ CREATE TRIGGER IF NOT EXISTS edge_stats_no_update BEFORE UPDATE ON edge_stats
 BEGIN
     SELECT RAISE(ABORT, 'edge_stats is append-only (ADR-0030 I5)');
 END;
-CREATE TRIGGER IF NOT EXISTS edge_stats_no_delete BEFORE DELETE ON edge_stats
-BEGIN
-    SELECT RAISE(ABORT, 'edge_stats is append-only (ADR-0030 I5)');
-END;
 """
+    + _EDGE_STATS_NO_DELETE_TRIGGER_DDL
+    + ";"
+)
 
 _MIGRATIONS: list[tuple[str, str]] = [
     ("project", "ALTER TABLE memories ADD COLUMN project TEXT NOT NULL DEFAULT ''"),
@@ -3359,9 +3397,20 @@ class SQLiteStore:
           arriving while the bucket sits at cap reports
           ``"cap_dropped"`` rather than ``"duplicate"`` — both are
           no-op drops;
+        * GLOBAL volume cap (review #338 N2) — when the table as a whole
+          already holds ``EDGE_STATS_TOTAL_ROWS_CAP`` rows the event is
+          likewise DROPPED. The per-bucket cap bounds one identity; this
+          one bounds the table across ALL minted principals. Capture
+          stays dropped until an operator reclaims rows via
+          ``purge_edge_stats_oldest`` — there is NO automatic eviction
+          by design (the audit trail shrinks only by an explicit,
+          logged, operator action);
         * append-only — there is no UPDATE/DELETE path on edge_stats
           anywhere (the schema triggers abort both; the audit trail is a
-          database guarantee).
+          database guarantee). The ONE sanctioned exception is the
+          operator purge (``purge_edge_stats_oldest``), which drops and
+          recreates the DELETE trigger inside its own transaction and
+          stamps the purge into the ``meta`` audit trail.
 
         Args:
             event_id: Row id; the manager derives retry-stable ids from
@@ -3378,9 +3427,9 @@ class SQLiteStore:
         Raises:
             ValueError: unknown ``kind`` or empty ``event_id``.
         """
-        if kind not in _EDGE_STATS_KINDS:
+        if kind not in EDGE_STATS_KINDS:
             raise ValueError(
-                f"unknown feedback kind {kind!r}; supported kinds: {sorted(_EDGE_STATS_KINDS)}"
+                f"unknown feedback kind {kind!r}; supported kinds: {sorted(EDGE_STATS_KINDS)}"
             )
         if not event_id:
             raise ValueError("event_id must be a non-empty string (idempotency key)")
@@ -3390,6 +3439,8 @@ class SQLiteStore:
             (project, agent),
         ).fetchone()[0]
         if int(principal_rows) >= EDGE_STATS_EVENTS_PER_PRINCIPAL_CAP:
+            return "cap_dropped"
+        if self.count_edge_stats() >= EDGE_STATS_TOTAL_ROWS_CAP:
             return "cap_dropped"
         cur = conn.execute(
             "INSERT OR IGNORE INTO edge_stats "
@@ -3421,10 +3472,11 @@ class SQLiteStore:
     def count_edge_stats(self, *, kind: str | None = None) -> int:
         """Durable edge_stats row count (telemetry; optional kind filter).
 
-        ``MemoryManager.feedback_capture_stats`` reads the durable
-        captured-event totals here — the A0-review D-behavioral signal
-        must survive restarts, so it is counted from the table, not from
-        an in-memory counter.
+        The GLOBAL volume-cap check in ``record_edge_stat_event`` reads
+        the unfiltered total here (review #338 N2). The dashboard/stats
+        totals moved to ``count_edge_stats_by_kind`` (review #338 N3 —
+        one aggregation instead of three scans); this stays the
+        single-count primitive for callers that need exactly one number.
         """
         conn = self._get_conn()
         if kind is None:
@@ -3432,6 +3484,146 @@ class SQLiteStore:
         else:
             row = conn.execute("SELECT COUNT(*) FROM edge_stats WHERE kind = ?", (kind,)).fetchone()
         return int(row[0])
+
+    def count_edge_stats_by_kind(self) -> dict[str, int]:
+        """Per-kind durable row counts in ONE ``GROUP BY kind`` scan.
+
+        Review #338 N3: ``MemoryManager.feedback_capture_stats`` used to
+        read its three durable numbers with three separate full scans
+        (``count_edge_stats(kind=...)`` ×2 + ``count_edge_stats()``);
+        this method answers all of them from a single aggregation. The
+        SQL CHECK on ``kind`` guarantees no row exists outside
+        ``EDGE_STATS_KINDS``, so ``sum(values())`` IS the exact table
+        total — no second counting pass needed. Always returns every
+        kind key (0 for absent kinds), the ``get_edge_stats_counters``
+        convention.
+        """
+        conn = self._get_conn()
+        rows = conn.execute("SELECT kind, COUNT(*) AS n FROM edge_stats GROUP BY kind").fetchall()
+        counts = {k: 0 for k in EDGE_STATS_KINDS}
+        for row in rows:
+            counts[str(row["kind"])] = int(row["n"])
+        return counts
+
+    def purge_edge_stats_oldest(self, *, keep_last: int, dry_run: bool = True) -> dict[str, Any]:
+        """Operator maintenance path: drop the OLDEST edge_stats rows.
+
+        Review #338 N2 — the per-principal cap bounds one identity but
+        the table is unbounded across minted principals, and the
+        append-only triggers forbid DELETE. This is the ONE sanctioned
+        shrink path, and it is explicitly an OPERATOR action (the
+        ``vesmaro edge-stats purge`` CLI wraps it, dry-run by default) —
+        NEVER automatic eviction.
+
+        Mechanics (all inside ONE explicit transaction, opened with
+        ``BEGIN IMMEDIATE`` before any DDL — the python sqlite3 driver
+        in legacy isolation mode autocommits DDL unless a transaction
+        is already open, so the explicit BEGIN is what makes an abort
+        restore the pre-purge world INCLUDING the trigger):
+
+        1. count what a purge would remove (rows beyond the newest
+           ``keep_last`` — i.e. everything after the newest-``keep_last``
+           prefix of ``created_at DESC, rowid DESC``; among same-
+           timestamp rows the later insertion survives longer);
+        2. ``BEGIN IMMEDIATE``;
+        3. ``DROP TRIGGER edge_stats_no_delete``;
+        4. ``DELETE`` those rows;
+        5. re-``CREATE`` the trigger from the SHARED
+           ``_EDGE_STATS_NO_DELETE_TRIGGER_DDL`` constant — the same
+           literal ``_DB_SCHEMA`` installs (single source of truth, no
+           drifting second copy);
+        6. stamp the purge into ``meta`` under
+           ``EDGE_STATS_LAST_PURGE_META_KEY`` — the compensating audit
+           trail: the append-only table shrank, and the record of that
+           shrink survives (read back by the CLI);
+        7. ``COMMIT`` (any failure rolls everything back — the
+           trigger included; pinned by
+           ``test_mid_purge_failure_restores_trigger_and_rows``).
+
+        Dry run (default) performs step 1 only — zero writes.
+
+        Args:
+            keep_last: Retention target — the newest N rows survive;
+                must be ≥ 0 (0 = purge everything).
+            dry_run: Count only, write nothing (default).
+
+        Returns:
+            ``{"rows_before", "purged", "rows_after", "dry_run"}`` —
+            ``purged``/``rows_after`` are the PROJECTION in dry-run mode.
+
+        Raises:
+            ValueError: ``keep_last`` is negative.
+        """
+        if keep_last < 0:
+            raise ValueError(f"keep_last must be >= 0, got {keep_last}")
+        conn = self._get_conn()
+        rows_before = int(conn.execute("SELECT COUNT(*) FROM edge_stats").fetchone()[0])
+        doomed = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM (SELECT event_id FROM edge_stats "
+                "ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
+                (keep_last,),
+            ).fetchone()[0]
+        )
+        if dry_run:
+            return {
+                "rows_before": rows_before,
+                "purged": doomed,
+                "rows_after": rows_before - doomed,
+                "dry_run": True,
+            }
+        try:
+            # Transactionality is EXPLICIT, not implicit (review #338
+            # round 2, MAJOR): the python sqlite3 driver in legacy
+            # isolation mode opens implicit transactions for DML only —
+            # DDL alone AUTOCOMMITS. Without this BEGIN the DROP TRIGGER
+            # below would commit immediately, and a later failure in the
+            # purge would leave the DELETE guard durably absent after
+            # rollback() — plain DELETEs would then succeed. BEGIN
+            # IMMEDIATE (the store's executescript-transaction
+            # precedent) makes drop+delete+recreate+stamp one atomic
+            # unit: an abort restores the pre-purge world INCLUDING the
+            # trigger.
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DROP TRIGGER IF EXISTS edge_stats_no_delete")
+            deleted = int(
+                conn.execute(
+                    "DELETE FROM edge_stats WHERE event_id IN ("
+                    "SELECT event_id FROM edge_stats "
+                    "ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
+                    (keep_last,),
+                ).rowcount
+            )
+            conn.execute(_EDGE_STATS_NO_DELETE_TRIGGER_DDL)
+            stamp = json.dumps(
+                {
+                    "at": datetime.now(UTC).isoformat(),
+                    "purged": deleted,
+                    "keep_last": keep_last,
+                }
+            )
+            conn.execute(
+                "INSERT INTO meta (key, value, updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET "
+                "value=excluded.value, updated_at=excluded.updated_at",
+                (EDGE_STATS_LAST_PURGE_META_KEY, stamp, datetime.now(UTC).isoformat()),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        logger.info(
+            "edge_stats operator purge: keep_last=%d purged=%d rows_after=%d",
+            keep_last,
+            deleted,
+            rows_before - deleted,
+        )
+        return {
+            "rows_before": rows_before,
+            "purged": deleted,
+            "rows_after": rows_before - deleted,
+            "dry_run": False,
+        }
 
     def get_memory_id_by_rewrite_event_key(self, event_key: str) -> str | None:
         """Return the memory id carrying ``rewrite_event_key``.
