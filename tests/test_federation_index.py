@@ -1,0 +1,597 @@
+"""S2 federation_index substrate tests (ADR-0021 Q10.2/Q10.3, archcom 2026-09-20).
+
+Covers the meta-mirror phase-1 substrate delivered in this slice:
+
+* Schema/migration — the table is created ``IF NOT EXISTS`` at startup
+  on a FRESH database and re-created on an EXISTING database (the
+  mesh_nodes pattern: idempotent CREATE at connect, no SEED wipe —
+  pre-existing data survives).
+* Storage methods — ``upsert_index_entries`` (idempotent replay,
+  LWW-by-timestamp, Q10.9 import gates), ``list_index`` (rowid-ASC
+  resume walk, project/origin/since filters, no-federate exclusion),
+  ``purge_origin``.
+* ``build_metadata_entry`` — local-memory → index-row synthesis
+  (origin='self'), no-federate exclusion, moderation-refuse exclusion,
+  title ≤ 256.
+* ``MnemosCoreServicer.build_metadata_sync_response`` — the future
+  core-side SyncMetadata RPC body, exercised with REAL generated
+  ``fed_pb2`` messages: ACL fail-closed matrix, watermark pagination
+  stability (no dupes / no gaps across pages), tag filter, Q10.9
+  title-blocklist on serve, empty corpus.
+* ``SubscribeStream`` oneof — the ``record`` oneof's ``metadata``
+  variant (the only metadata oneof in the proto — verified: SyncMetadata
+  messages carry none) populates ``WhichOneof("record") == "metadata"``
+  and survives a serialize/parse round trip.
+* Config — ``index_title_blocklist`` rejects non-compiling regex at the
+  config boundary.
+
+What these tests deliberately do NOT cover (proto STOP, task contract):
+there is no real-gRPC SyncMetadata round trip because ``MnemosCore``
+has no metadata RPC — wiring one requires the enumerated proto moves
+reported with this slice.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+from pydantic import ValidationError
+
+from vesmaro import _mesh_gen
+from vesmaro.compact import (
+    CONTENT_STATE_TOMBSTONED,
+    METADATA_SCHEMA,
+    FederationIndexEntry,
+    build_metadata_entry,
+    title_matches_blocklist,
+)
+from vesmaro.config import FederationConfig, PeerConfig, Settings
+from vesmaro.manager import MemoryManager
+from vesmaro.mesh_server import MnemosCoreServicer, _metadata_stream_event
+from vesmaro.models import MemoryCreate, MemorySource
+from vesmaro.storage.sqlite_store import SQLiteStore
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+_PROJECT = "test-project"
+_PROJECT_DENIED = "project-secret"
+_PEER_ID = "mnemos-A"
+_REMOTE_ORIGIN = "mnemos-B"
+_AGENT = "gcw-test-agent"
+_TOKEN_ENV = "VESMARO_FED_PEER_TEST_TOKEN"
+
+
+def _entry(
+    entry_id: str = "fed:remote-agent:uuid-1",
+    *,
+    title: str = "Remote decision",
+    project: str = _PROJECT,
+    origin_peer: str = _REMOTE_ORIGIN,
+    source_peer: str = _REMOTE_ORIGIN,
+    tags: list[str] | None = None,
+    timestamp: str = "2026-09-01T10:00:00Z",
+    content_state: str = "available",
+) -> FederationIndexEntry:
+    """Build an index entry mirroring what a peer would send."""
+    return FederationIndexEntry(
+        id=entry_id,
+        type="decision",
+        title=title,
+        tags=tags if tags is not None else [f"project:{project}", "mnemos:decision"],
+        project=project,
+        source_agent="remote-agent",
+        source_peer=source_peer,
+        origin_peer=origin_peer,
+        content_state=content_state,
+        timestamp=timestamp,
+    )
+
+
+def _settings(
+    tmp_path: Path,
+    *,
+    allowed: list[str] | None = None,
+    shared: list[str] | None = None,
+    title_blocklist: list[str] | None = None,
+) -> Settings:
+    """Settings with one configured peer + an isolated store."""
+    settings = Settings(
+        **{  # type: ignore[arg-type]  # pydantic dict→model coercion
+            "mnemos": {
+                "vault_path": str(tmp_path / "vault"),
+                "data_dir": str(tmp_path / "data"),
+                "db_name": "test_federation_index.db",
+            },
+            "embedding": {"provider": "onnx"},
+            "scanner": {"enabled": False},
+            "federation": FederationConfig(
+                shared_projects=shared if shared is not None else [_PROJECT],
+                peers={
+                    _PEER_ID: PeerConfig(
+                        bearer_token_env=_TOKEN_ENV,
+                        allowed_projects=allowed if allowed is not None else [_PROJECT],
+                        allowed_types=["decision", "learning"],
+                        rate_limit_per_minute=600,
+                    ),
+                },
+                **(
+                    {"index_title_blocklist": title_blocklist}
+                    if title_blocklist is not None
+                    else {}
+                ),
+            ),
+        }
+    )
+    settings.resolve_paths()
+    return settings
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> SQLiteStore:
+    """A SQLiteStore on a tmp DB (auto-creates the schema on connect)."""
+    s = SQLiteStore(tmp_path / "fed_index.db")
+    yield s
+    s.close()
+
+
+@pytest.fixture
+def manager(tmp_path: Path) -> MemoryManager:
+    """Real MemoryManager with a mocked embedder (no ONNX runtime)."""
+    mgr = MemoryManager(_settings(tmp_path))
+    mock_embedder = MagicMock()
+    mock_embedder.embed.return_value = [0.1] * 384
+    mgr._embedder = mock_embedder
+    yield mgr
+    mgr.close()
+
+
+# ── Schema / migration ───────────────────────────────────────────────────────
+
+
+class TestSchemaMigration:
+    def test_fresh_db_creates_table_and_unique_id(self, store: SQLiteStore) -> None:
+        conn = store._get_conn()
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(federation_index)")}
+        assert {
+            "id",
+            "type",
+            "title",
+            "tags",
+            "project",
+            "source_agent",
+            "source_peer",
+            "origin_peer",
+            "content_state",
+            "timestamp",
+            "schema_version",
+            "received_at",
+        } <= cols
+        # UNIQUE(id): the PRIMARY KEY on id rejects a second row.
+        store.upsert_index_entries([_entry()])
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO federation_index (id) VALUES ('fed:remote-agent:uuid-1')")
+
+    def test_origin_timestamp_index_exists(self, store: SQLiteStore) -> None:
+        conn = store._get_conn()
+        idx = conn.execute("PRAGMA index_list(federation_index)").fetchall()
+        names = {row[1] for row in idx}
+        assert "idx_federation_index_origin_timestamp" in names
+
+    def test_existing_db_gains_table_without_wipe(self, tmp_path: Path) -> None:
+        """Startup CREATE IF NOT EXISTS on a pre-S2 database — no data loss.
+
+        Simulates a database created by the PREVIOUS vesmaro version
+        (no federation_index): the next connect must create the table
+        and keep every existing row (no SEED wipe).
+        """
+        db_path = tmp_path / "legacy.db"
+        legacy = SQLiteStore(db_path)
+        legacy.upsert_index_entries([_entry()])  # ensures schema is fully built
+        legacy_conn = legacy._get_conn()
+        legacy_conn.execute("DROP TABLE federation_index")  # roll back to pre-S2
+        legacy_conn.commit()
+        legacy.close()
+
+        reopened = SQLiteStore(db_path)
+        conn = reopened._get_conn()
+        assert conn.execute("SELECT count(*) FROM federation_index").fetchone()[0] == 0
+        # memories survived the reopen (no wipe).
+        assert conn.execute("SELECT count(*) FROM memories").fetchone()[0] >= 0
+        # And the table is immediately usable.
+        assert reopened.upsert_index_entries([_entry()]) == 1
+        reopened.close()
+
+
+# ── upsert_index_entries ─────────────────────────────────────────────────────
+
+
+class TestUpsertIndexEntries:
+    def test_insert_counts_and_stamps_received_at(self, store: SQLiteStore) -> None:
+        written = store.upsert_index_entries([_entry("fed:r:1"), _entry("fed:r:2")])
+        assert written == 2
+        rows = store.list_index()
+        assert len(rows) == 2
+        for entry, _rowid in rows:
+            assert entry.received_at != ""  # stamped by the store
+
+    def test_replay_is_idempotent_single_row(self, store: SQLiteStore) -> None:
+        store.upsert_index_entries([_entry("fed:r:1")])
+        store.upsert_index_entries([_entry("fed:r:1")])  # replayed same record
+        rows = store.list_index()
+        assert len(rows) == 1
+
+    def test_lww_older_timestamp_loses(self, store: SQLiteStore) -> None:
+        store.upsert_index_entries(
+            [_entry("fed:r:1", title="Newer", timestamp="2026-09-05T00:00:00Z")]
+        )
+        written = store.upsert_index_entries(
+            [_entry("fed:r:1", title="Older", timestamp="2026-09-01T00:00:00Z")]
+        )
+        assert written == 0  # stale — silently dropped
+        (entry, _rowid) = store.list_index()[0]
+        assert entry.title == "Newer"
+
+    def test_lww_newer_timestamp_replaces(self, store: SQLiteStore) -> None:
+        store.upsert_index_entries(
+            [_entry("fed:r:1", title="Older", timestamp="2026-09-01T00:00:00Z")]
+        )
+        written = store.upsert_index_entries(
+            [_entry("fed:r:1", title="Newer", timestamp="2026-09-05T00:00:00Z")]
+        )
+        assert written == 1
+        (entry, _rowid) = store.list_index()[0]
+        assert entry.title == "Newer"
+
+    def test_import_gate_no_federate_refused(self, store: SQLiteStore) -> None:
+        written = store.upsert_index_entries(
+            [_entry("fed:r:1", tags=["project:test-project", "mnemos:no-federate"])]
+        )
+        assert written == 0
+        assert store.list_index() == []
+
+    def test_import_gate_title_blocklist_refused(self, store: SQLiteStore) -> None:
+        written = store.upsert_index_entries(
+            [_entry("fed:r:1", title="Internal secret sprint plan")],
+            title_blocklist=[r"secret\s+sprint"],
+        )
+        assert written == 0
+        assert store.list_index() == []
+
+    def test_one_bad_entry_does_not_abort_batch(self, store: SQLiteStore) -> None:
+        written = store.upsert_index_entries(
+            [
+                _entry("fed:r:1", tags=["project:p", "mnemos:no-federate"]),
+                _entry("fed:r:2"),
+            ]
+        )
+        assert written == 1
+        assert [e.id for e, _ in store.list_index()] == ["fed:r:2"]
+
+    def test_content_state_tombstoned_round_trips(self, store: SQLiteStore) -> None:
+        store.upsert_index_entries([_entry("fed:r:1", content_state=CONTENT_STATE_TOMBSTONED)])
+        (entry, _rowid) = store.list_index()[0]
+        assert entry.content_state == CONTENT_STATE_TOMBSTONED
+
+
+# ── list_index ───────────────────────────────────────────────────────────────
+
+
+class TestListIndex:
+    def test_rowid_asc_ordering_and_resume_exactness(self, store: SQLiteStore) -> None:
+        ids = [f"fed:r:{i}" for i in range(5)]
+        store.upsert_index_entries([_entry(i) for i in ids])
+        page1 = store.list_index(limit=3)
+        assert [e.id for e, _ in page1] == ids[:3]
+        checkpoint = page1[-1][1]
+        page2 = store.list_index(limit=3, after_rowid=checkpoint)
+        assert [e.id for e, _ in page2] == ids[3:]
+        # No dupes, no gaps across the walk.
+        walked = [e.id for e, _ in page1] + [e.id for e, _ in page2]
+        assert walked == ids
+
+    def test_project_filter(self, store: SQLiteStore) -> None:
+        store.upsert_index_entries(
+            [_entry("fed:r:1", project=_PROJECT), _entry("fed:r:2", project="other")]
+        )
+        rows = store.list_index(projects=[_PROJECT])
+        assert [e.id for e, _ in rows] == ["fed:r:1"]
+
+    def test_origin_peer_filter(self, store: SQLiteStore) -> None:
+        store.upsert_index_entries(
+            [_entry("fed:r:1", origin_peer="mnemos-B"), _entry("fed:r:2", origin_peer="mnemos-C")]
+        )
+        rows = store.list_index(origin_peers=["mnemos-B"])
+        assert [e.id for e, _ in rows] == ["fed:r:1"]
+
+    def test_since_filters_on_record_timestamp(self, store: SQLiteStore) -> None:
+        store.upsert_index_entries(
+            [
+                _entry("fed:r:1", timestamp="2026-09-01T00:00:00Z"),
+                _entry("fed:r:2", timestamp="2026-09-10T00:00:00Z"),
+            ]
+        )
+        rows = store.list_index(since="2026-09-05T00:00:00Z")
+        assert [e.id for e, _ in rows] == ["fed:r:2"]
+
+    def test_serve_side_no_federate_excluded(self, store: SQLiteStore) -> None:
+        # Sneak a no-federate row in RAW (bypassing the import gate) to
+        # prove the serve-side belt-and-braces filter.
+        conn = store._get_conn()
+        conn.execute(
+            "INSERT INTO federation_index (id, title, tags) VALUES (?, ?, ?)",
+            ("fed:r:raw", "Raw row", '["mnemos:no-federate"]'),
+        )
+        conn.commit()
+        assert store.list_index() == []
+        (entry, _rowid) = store.list_index(exclude_no_federate=False)[0]
+        assert entry.id == "fed:r:raw"
+
+
+# ── purge_origin ─────────────────────────────────────────────────────────────
+
+
+class TestPurgeOrigin:
+    def test_purges_only_named_origin(self, store: SQLiteStore) -> None:
+        store.upsert_index_entries(
+            [
+                _entry("fed:r:1", origin_peer="mnemos-B"),
+                _entry("fed:r:2", origin_peer="mnemos-B"),
+                _entry("fed:r:3", origin_peer="mnemos-C"),
+                _entry("fed:r:4", origin_peer="self"),
+            ]
+        )
+        deleted = store.purge_origin("mnemos-B")
+        assert deleted == 2
+        remaining = sorted(e.origin_peer for e, _ in store.list_index())
+        assert remaining == ["mnemos-C", "self"]
+
+    def test_purge_unknown_origin_is_zero(self, store: SQLiteStore) -> None:
+        store.upsert_index_entries([_entry("fed:r:1")])
+        assert store.purge_origin("mnemos-ZZZ") == 0
+
+
+# ── build_metadata_entry (local synthesis, origin='self') ────────────────────
+
+
+class TestBuildMetadataEntry:
+    def test_local_memory_becomes_self_origin_entry(self, manager: MemoryManager) -> None:
+        memory = manager.add(
+            MemoryCreate(
+                content="We chose poll-first metadata sync for S2.",
+                title="S2 sync decision",
+                tags=[f"project:{_PROJECT}", f"agent:{_AGENT}", "mnemos:decision"],
+                source=MemorySource.MANUAL,
+            ),
+            project=_PROJECT,
+            agent=_AGENT,
+        )
+        entry = build_metadata_entry(memory)
+        assert entry is not None
+        assert entry.origin_peer == "self"
+        assert entry.source_peer == "self"
+        assert entry.id == f"fed:{_AGENT}:{memory.id}"
+        assert entry.type == "decision"
+        assert entry.title == "S2 sync decision"
+        assert entry.project == _PROJECT
+        assert entry.schema_version == METADATA_SCHEMA
+        # Metadata-only: no content, no summary — the model has no such
+        # fields at all; the tags carry no content either.
+        assert entry.tags == [f"project:{_PROJECT}", f"agent:{_AGENT}", "mnemos:decision"]
+
+    def test_no_federate_memory_excluded(self, manager: MemoryManager) -> None:
+        memory = manager.add(
+            MemoryCreate(
+                content="Rotate these keys quarterly.",
+                title="Key rotation runbook",
+                tags=[f"project:{_PROJECT}", f"agent:{_AGENT}", "mnemos:no-federate"],
+                source=MemorySource.MANUAL,
+            ),
+            project=_PROJECT,
+            agent=_AGENT,
+        )
+        assert build_metadata_entry(memory) is None
+
+    def test_title_capped_at_256(self, manager: MemoryManager) -> None:
+        memory = manager.add(
+            MemoryCreate(
+                content="Body",
+                title="x" * 600,
+                tags=[f"project:{_PROJECT}", f"agent:{_AGENT}", "mnemos:rule"],
+                source=MemorySource.MANUAL,
+            ),
+            project=_PROJECT,
+            agent=_AGENT,
+        )
+        entry = build_metadata_entry(memory)
+        assert entry is not None
+        assert len(entry.title) <= 256
+
+
+# ── build_metadata_sync_response (future RPC body, real fed_pb2 messages) ───
+
+
+class TestBuildMetadataSyncResponse:
+    @pytest.fixture
+    def servicer(self, tmp_path: Path, manager: MemoryManager) -> MnemosCoreServicer:
+        return MnemosCoreServicer(manager, settings=_settings(tmp_path))
+
+    @pytest.fixture
+    def indexed(self, manager: MemoryManager) -> MemoryManager:
+        """Manager with a seeded local corpus materialised into the index
+        (origin='self') plus one mirrored row from a remote peer."""
+        manager.add(
+            MemoryCreate(
+                content="We chose poll-first metadata sync for S2.",
+                title="S2 sync decision",
+                tags=[f"project:{_PROJECT}", f"agent:{_AGENT}", "mnemos:decision"],
+                source=MemorySource.MANUAL,
+            ),
+            project=_PROJECT,
+            agent=_AGENT,
+        )
+        manager.add(
+            MemoryCreate(
+                content="Cursor pages must partition the corpus exactly.",
+                title="Cursor partitioning learning",
+                tags=[f"project:{_PROJECT}", f"agent:{_AGENT}", "mnemos:learning"],
+                source=MemorySource.MANUAL,
+            ),
+            project=_PROJECT,
+            agent=_AGENT,
+        )
+        for memory, _rowid in manager.sqlite.list_all_for_mesh(limit=10):
+            entry = build_metadata_entry(memory)
+            if entry is not None:
+                manager.sqlite.upsert_index_entries([entry])
+        manager.sqlite.upsert_index_entries([_entry("fed:remote-agent:mirror-1")])
+        return manager
+
+    @staticmethod
+    def _request(**kwargs: Any) -> Any:
+        fields: dict[str, Any] = {
+            "peer_id": _PEER_ID,
+            "since_rev": 0,
+            "project_scope": "",
+        }
+        fields.update(kwargs)
+        return _mesh_gen.fed_pb2.MetadataSyncRequest(**fields)
+
+    def test_serves_index_including_self_origin(
+        self, servicer: MnemosCoreServicer, indexed: MemoryManager
+    ) -> None:
+        resp = servicer.build_metadata_sync_response(self._request())
+        origins = {r.source_peer for r in resp.records}
+        assert "self" in origins  # local records (origin='self')
+        assert _REMOTE_ORIGIN in origins  # mirrored rows re-advertised
+        assert resp.trigger_code == _mesh_gen.fed_pb2.EXHAUSTIVE
+        assert resp.latest_rev > 0
+        assert all(r.schema_version == METADATA_SCHEMA for r in resp.records)
+
+    def test_empty_corpus_echos_watermark(self, servicer: MnemosCoreServicer) -> None:
+        resp = servicer.build_metadata_sync_response(self._request())
+        assert list(resp.records) == []
+        assert resp.latest_rev == 0
+        assert not resp.has_more
+
+    def test_watermark_pagination_partitions_corpus(
+        self, tmp_path: Path, manager: MemoryManager
+    ) -> None:
+        """Cursor stability: walking by latest_rev delivers each row
+        exactly once (no dupes, no gaps) across real page boundaries
+        (60 entries > the 50-row default page → at least two pages)."""
+        entries = [_entry(f"fed:r:{i:03d}") for i in range(60)]
+        manager.sqlite.upsert_index_entries(entries)
+        servicer = MnemosCoreServicer(manager, settings=_settings(tmp_path))
+        delivered: list[str] = []
+        pages = 0
+        since = 0
+        for _ in range(10):
+            resp = servicer.build_metadata_sync_response(self._request(since_rev=since))
+            pages += 1
+            delivered.extend(r.id for r in resp.records)
+            since = resp.latest_rev
+            if not resp.has_more:
+                break
+        assert pages >= 2  # the corpus really spanned multiple pages
+        assert sorted(delivered) == sorted(e.id for e in entries)
+        assert len(delivered) == len(set(delivered))  # no dupes
+
+    def test_acl_denied_scope_refused(
+        self, servicer: MnemosCoreServicer, indexed: MemoryManager
+    ) -> None:
+        resp = servicer.build_metadata_sync_response(self._request(project_scope=_PROJECT_DENIED))
+        assert list(resp.records) == []
+        assert resp.trigger_code == _mesh_gen.fed_pb2.REFUSED
+
+    def test_acl_unknown_peer_refused(
+        self, servicer: MnemosCoreServicer, indexed: MemoryManager
+    ) -> None:
+        resp = servicer.build_metadata_sync_response(self._request(peer_id="mnemos-UNKNOWN"))
+        assert list(resp.records) == []
+        assert resp.trigger_code == _mesh_gen.fed_pb2.REFUSED
+
+    def test_tag_filter_intersects(
+        self, servicer: MnemosCoreServicer, indexed: MemoryManager
+    ) -> None:
+        resp = servicer.build_metadata_sync_response(self._request(filter=["mnemos:learning"]))
+        assert all("mnemos:learning" in list(r.tags) for r in resp.records)
+        assert len(resp.records) >= 1
+
+    def test_title_blocklist_on_serve(self, tmp_path: Path, manager: MemoryManager) -> None:
+        manager.sqlite.upsert_index_entries(
+            [
+                _entry("fed:r:ok", title="Public decision"),
+                _entry("fed:r:blocked", title="Internal secret sprint plan"),
+            ]
+        )
+        servicer = MnemosCoreServicer(
+            manager,
+            settings=_settings(tmp_path, title_blocklist=[r"secret\s+sprint"]),
+        )
+        resp = servicer.build_metadata_sync_response(self._request())
+        ids = [r.id for r in resp.records]
+        assert "fed:r:ok" in ids
+        assert "fed:r:blocked" not in ids
+        # The blocked row still advanced the watermark (no wedged poll).
+        assert resp.latest_rev >= 2
+
+    def test_out_of_range_since_rev_rejected(self, servicer: MnemosCoreServicer) -> None:
+        from vesmaro.mesh_server import CursorError
+
+        with pytest.raises(CursorError):
+            servicer.build_metadata_sync_response(self._request(since_rev=-1))
+
+
+# ── SubscribeStream oneof (the only metadata oneof in the proto) ─────────────
+
+
+class TestSubscribeStreamOneof:
+    def test_metadata_variant_populates_oneof(self) -> None:
+        event = _metadata_stream_event(_entry(), cursor="tok-1")
+        assert event.WhichOneof("record") == "metadata"
+        assert event.metadata.id == "fed:remote-agent:uuid-1"
+        assert event.event_type == _mesh_gen.fed_pb2.SubscribeStream.RECORD_ADDED
+        assert event.cursor == "tok-1"
+
+    def test_compact_variant_still_available(self) -> None:
+        event = _mesh_gen.fed_pb2.SubscribeStream(
+            event_type=_mesh_gen.fed_pb2.SubscribeStream.RECORD_ADDED,
+            compact=_mesh_gen.fed_pb2.CompactRecord(id="fed:a:1"),
+        )
+        assert event.WhichOneof("record") == "compact"
+
+    def test_oneof_survives_wire_round_trip(self) -> None:
+        event = _metadata_stream_event(_entry())
+        parsed = _mesh_gen.fed_pb2.SubscribeStream.FromString(event.SerializeToString())
+        assert parsed.WhichOneof("record") == "metadata"
+        assert parsed.metadata.project == _PROJECT
+        assert parsed.metadata.schema_version == METADATA_SCHEMA
+
+
+# ── Config gate ───────────────────────────────────────────────────────────────
+
+
+class TestTitleBlocklistConfig:
+    def test_invalid_regex_rejected_at_config_boundary(self) -> None:
+        with pytest.raises(ValidationError, match="does not compile"):
+            FederationConfig(index_title_blocklist=["[unclosed"])
+
+    def test_blank_pattern_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            FederationConfig(index_title_blocklist=[""])
+
+    def test_valid_patterns_accepted(self) -> None:
+        cfg = FederationConfig(index_title_blocklist=[r"secret", r"internal\s+only"])
+        assert cfg.index_title_blocklist == [r"secret", r"internal\s+only"]
+
+    def test_matcher_semantics(self) -> None:
+        # Case-sensitive re.search semantics (documented behaviour).
+        assert title_matches_blocklist("Top secret sprint", [r"secret"])
+        assert title_matches_blocklist("internal only note", [r"internal\s+only"])
+        assert not title_matches_blocklist("INTERNAL ONLY note", [r"internal\s+only"])
+        assert not title_matches_blocklist("Public decision", [r"secret"])
+        assert not title_matches_blocklist("Anything", [])

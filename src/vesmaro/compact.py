@@ -39,16 +39,28 @@ Public API:
   boundary with ``...``.
 * :func:`extract_key_points` — heuristic bullet/numbered list
   extraction from content.
+
+S2 meta-mirror substrate (ADR-0021 Q10.3, archcom 2026-09-20):
+
+* :data:`METADATA_SCHEMA` — metadata-record schema version.
+* :class:`FederationIndexEntry` — one ``federation_index`` row (the
+  Python-side ``MetadataRecord`` + storage-side ``origin_peer`` /
+  ``content_state`` / ``received_at``).
+* :func:`build_metadata_entry` — build an index-only entry from a local
+  memory (``None`` = excluded: no-federate tag or moderation refuse).
+* :func:`title_matches_blocklist` — Q10.9 title-regex gate, applied at
+  BOTH the serve and import gates.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from vesmaro.models import NO_FEDERATE_TAG, Memory
 from vesmaro.moderation import ModerationResult, ModerationVerdict, moderate
@@ -57,15 +69,22 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "COMPACT_SCHEMA",
+    "CONTENT_STATES",
+    "CONTENT_STATE_AVAILABLE",
+    "CONTENT_STATE_TOMBSTONED",
     "MAX_KEY_POINTS",
     "MAX_SUMMARY_LEN",
     "MAX_TITLE_LEN",
+    "METADATA_SCHEMA",
     "CompactRecord",
+    "FederationIndexEntry",
     "build_compact_payload",
     "build_compact_record",
+    "build_metadata_entry",
     "derive_record_type",
     "extract_key_points",
     "summarize_content",
+    "title_matches_blocklist",
 ]
 
 #: Compact format schema version (forward-compat marker, contract §2.3).
@@ -475,3 +494,159 @@ def build_compact_payload(
             "pii_anonymized": pii_anonymized,
         },
     }
+
+
+# ── S2 federation index entry (ADR-0021 Q10.3, archcom 2026-09-20) ───────────
+#
+# The meta-mirror substrate: an index-only row describing a record that
+# exists SOMEWHERE in the mesh — either a local memory (origin_peer="self")
+# or a record mirrored from a peer (origin_peer=<peer A2A id>). It carries
+# NO content: no summary, no key points (a record's existence is itself an
+# inference surface — position paper §4, session-2 design). Rows live in
+# the SQLite ``federation_index`` table, OUTSIDE ``mnemos_search``.
+
+#: Metadata-record schema version — mirrors
+#: ``federation.proto::MetadataRecord.schema_version`` (distinct from
+#: :data:`COMPACT_SCHEMA` so the metadata-sync protocol evolves
+#: independently from the full-record pull protocol).
+METADATA_SCHEMA: str = "mnemos.federation.metadata.v1"
+
+#: ``content_state`` vocabulary (paper §4, additive field Q10.3):
+#: mirrors age out pointers without learning why; no deletion reason
+#: crosses servers. Tombstoned rows are kept (they suppress re-import)
+#: but are not advertised as available content.
+CONTENT_STATE_AVAILABLE: str = "available"
+CONTENT_STATE_TOMBSTONED: str = "tombstoned"
+
+#: Allowed ``content_state`` values.
+CONTENT_STATES: frozenset[str] = frozenset({CONTENT_STATE_AVAILABLE, CONTENT_STATE_TOMBSTONED})
+
+
+class FederationIndexEntry(BaseModel):
+    """One ``federation_index`` row — the Python-side MetadataRecord.
+
+    Wire shape (``federation.proto::MetadataRecord``): ``id``, ``type``,
+    ``title`` ≤ :data:`MAX_TITLE_LEN`, ``tags``, ``project``,
+    ``source_agent``, ``source_peer`` (last-hop provenance for multi-hop
+    dedup), ``timestamp``, ``schema_version``.
+
+    Storage-side additions (Q10.3; NOT yet on the wire — adding them to
+    the proto is an archcom-enumerated additive move, see ADR-0021):
+
+    * ``origin_peer`` — where the content body lives. With >2 stores it
+      diverges from ``source_peer``; conflating the two breaks lazy
+      fetch. ``"self"`` = the responding core's local corpus.
+    * ``content_state`` — ``available`` / ``tombstoned``.
+    * ``received_at`` — ISO 8601 UTC, stamped by the STORE at upsert
+      time (when THIS core first/most-recently received the row); not
+      part of the wire record.
+
+    Validation at this boundary (peers are untrusted): ``id`` is
+    non-empty, ``title`` ≤ 256 chars, ``content_state`` is a known
+    value. Anything else fails the Pydantic contract and the upsert
+    skips the entry (fail-closed import gate).
+    """
+
+    id: str = Field(min_length=1, max_length=512)
+    type: str = ""
+    title: str = Field(default="", max_length=MAX_TITLE_LEN)
+    tags: list[str] = Field(default_factory=list)
+    project: str = ""
+    source_agent: str = ""
+    source_peer: str = ""
+    origin_peer: str = "self"
+    content_state: str = CONTENT_STATE_AVAILABLE
+    timestamp: str = ""
+    schema_version: str = METADATA_SCHEMA
+    received_at: str = ""
+
+    @field_validator("content_state")
+    @classmethod
+    def _content_state_known(cls, value: str) -> str:
+        """Reject unknown ``content_state`` values (forward-compat fail-closed)."""
+        if value not in CONTENT_STATES:
+            raise ValueError(f"unknown content_state {value!r} (known: {sorted(CONTENT_STATES)})")
+        return value
+
+
+def build_metadata_entry(
+    memory: Memory,
+    *,
+    origin_peer: str = "self",
+    source_peer: str = "self",
+    refuse_threshold: float = 0.8,
+    moderation_result: ModerationResult | None = None,
+) -> FederationIndexEntry | None:
+    """Build an index-only :class:`FederationIndexEntry` from a local memory.
+
+    The metadata leg of :func:`build_compact_record`: same id scheme
+    (``fed:<source_agent>:<memory.id>``), same type/title derivation,
+    same tag filtering — but NO summary, NO key points, NO content. The
+    title is derived from the moderation-processed content source so the
+    headline (itself an export surface, Q10.9) never leaks a secret that
+    moderation would have redacted.
+
+    Returns ``None`` — the record must NOT enter the index at all — when:
+
+    * the memory carries ``mnemos:no-federate`` (Q10.9: the tag filters
+      the INDEX, defence-in-depth before any fan-out), or
+    * moderation refuses the content (verdict ``REFUSE``).
+
+    Args:
+        memory: The local memory to advertise.
+        origin_peer: Where the content body lives. ``"self"`` (default)
+            for the local corpus; the value is stored in the index row.
+        source_peer: Last-hop provenance on the wire record. Defaults to
+            ``"self"`` for locally-originated rows.
+        refuse_threshold: Moderation refuse threshold (same semantics as
+            :func:`build_compact_record`).
+        moderation_result: Optional pre-computed moderation result (same
+            reuse pattern as :func:`build_compact_record` — moderate
+            once, thread through both record builders).
+    """
+    if NO_FEDERATE_TAG in memory.tags:
+        logger.info("compact: metadata entry excluded — no-federate tag (memory id=%s)", memory.id)
+        return None
+    result = moderation_result or moderate(
+        memory.content, tags=memory.tags, refuse_threshold=refuse_threshold
+    )
+    if result.verdict == ModerationVerdict.REFUSE:
+        logger.info(
+            "compact: metadata entry excluded — moderation refuse (memory id=%s)", memory.id
+        )
+        return None
+    content_source = (
+        result.sanitized_content if result.verdict == ModerationVerdict.REDACT else memory.content
+    )
+    return FederationIndexEntry(
+        id=f"fed:{memory.agent or 'unknown'}:{memory.id}",
+        type=derive_record_type(memory.tags),
+        title=_derive_title(memory, content_source=content_source),
+        tags=[t for t in memory.tags if t != NO_FEDERATE_TAG],
+        project=memory.project or "",
+        source_agent=memory.agent or "",
+        source_peer=source_peer,
+        origin_peer=origin_peer,
+        content_state=CONTENT_STATE_AVAILABLE,
+        timestamp=_memory_timestamp(memory.created_at),
+        schema_version=METADATA_SCHEMA,
+        received_at="",  # stamped by the store at upsert time
+    )
+
+
+def title_matches_blocklist(title: str, patterns: Sequence[str]) -> bool:
+    """Q10.9 title-regex gate: does ``title`` match any blocklist pattern?
+
+    Used at BOTH gates (ADR-0021 ruling 9 — metadata distribution IS
+    export): the SERVE path drops matching index rows from
+    metadata-sync answers, the IMPORT path refuses matching entries at
+    upsert. Patterns are Python ``re`` expressions matched with
+    ``re.search`` (substring semantics, case-sensitive). An empty
+    pattern list blocks nothing.
+
+    Config validation (:attr:`vesmaro.config.FederationConfig.
+    index_title_blocklist`) guarantees every pattern compiles; a pattern
+    that somehow does not raises :class:`re.error` loudly here rather
+    than being silently skipped (fail-closed on the operator's intent).
+    """
+    return any(re.search(pattern, title) for pattern in patterns)

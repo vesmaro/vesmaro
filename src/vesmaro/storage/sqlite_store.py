@@ -18,12 +18,15 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from sys import getsizeof
 from typing import Any, Final, Literal, cast
 
+from vesmaro.compact import FederationIndexEntry, title_matches_blocklist
 from vesmaro.models import (
+    NO_FEDERATE_TAG,
     Memory,
     MemorySource,
     MemoryStatus,
@@ -921,6 +924,42 @@ CREATE TRIGGER IF NOT EXISTS edge_stats_no_update BEFORE UPDATE ON edge_stats
 BEGIN
     SELECT RAISE(ABORT, 'edge_stats is append-only (ADR-0030 I5)');
 END;
+
+-- S2 meta-mirror substrate (ADR-0021 Q10.3, archcom 2026-09-20) — the
+-- federation metadata index. One row per record known to this store:
+-- locally-originated rows (origin_peer='self', synthesized from the
+-- local corpus via build_metadata_entry) and rows mirrored from peers
+-- (origin_peer=<peer A2A id>). INDEX-ONLY by design: no summary, no
+-- key points, no content — a record's existence is itself an inference
+-- surface (position paper §4), and the table is OUTSIDE mnemos_search
+-- (never served by the memory search path). ``id`` is the wire
+-- MetadataRecord id (fed:<source_agent>:<uuid>) — UNIQUE is the
+-- cross-peer dedup key. ``tags`` is a JSON array (same convention as
+-- memories.tags). received_at is stamped by the store at upsert (when
+-- THIS core received the row) — NOT the record's own timestamp. The
+-- rowid (implicit) is the ADR-0020-mechanic resume space for the
+-- rowid-ASC cursor walk in list_index.
+CREATE TABLE IF NOT EXISTS federation_index (
+    id             TEXT PRIMARY KEY,
+    type           TEXT NOT NULL DEFAULT '',
+    title          TEXT NOT NULL DEFAULT '',
+    tags           TEXT NOT NULL DEFAULT '[]',
+    project        TEXT NOT NULL DEFAULT '',
+    source_agent   TEXT NOT NULL DEFAULT '',
+    source_peer    TEXT NOT NULL DEFAULT '',
+    origin_peer    TEXT NOT NULL DEFAULT 'self',
+    content_state  TEXT NOT NULL DEFAULT 'available'
+                   CHECK (content_state IN ('available', 'tombstoned')),
+    timestamp      TEXT NOT NULL DEFAULT '',
+    schema_version TEXT NOT NULL DEFAULT 'mnemos.federation.metadata.v1',
+    received_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Named per ADR-0021 substrate spec: (origin_peer, timestamp) backs
+-- "what does peer X hold" walks (drain/purge audits, multi-hop dedup)
+-- without a table scan.
+CREATE INDEX IF NOT EXISTS idx_federation_index_origin_timestamp
+    ON federation_index(origin_peer, timestamp);
 """
     + _EDGE_STATS_NO_DELETE_TRIGGER_DDL
     + ";"
@@ -3080,6 +3119,231 @@ class SQLiteStore:
         conn.commit()
         self._invalidate_caches()
         return cur.rowcount > 0
+
+    # ── S2 federation index (ADR-0021 Q10.3, archcom 2026-09-20) ──────────
+
+    def upsert_index_entries(
+        self,
+        entries: Sequence[FederationIndexEntry],
+        *,
+        title_blocklist: Sequence[str] = (),
+    ) -> int:
+        """Import gate for the federation metadata index (S2 substrate).
+
+        Upserts entries into ``federation_index`` in one transaction,
+        keyed on ``id`` (the cross-peer dedup key). Conflict resolution
+        is LWW-by-``timestamp`` (ADR-0021 ruling Q10.6 for v1): a row
+        with an OLDER timestamp than the stored one is silently dropped
+        (its data is superseded); equal-or-newer timestamps replace the
+        stored row (equal = replayed same record, last write wins —
+        the revision-field gap that would disambiguate this is recorded
+        in the proto as ``CompactRecord.revision`` and reserved for
+        ``MetadataRecord`` as an archcom-enumerated additive move).
+
+        Import-side gates applied HERE (Q10.9 — title-regex runs at
+        export AND import; no-federate is belt-and-braces: the ORIGIN
+        already filters it, a peer that sends it anyway is misbehaving):
+
+        * ``mnemos:no-federate`` in ``tags`` → entry refused (not
+          stored) — a no-federate index row would re-advertise on serve
+          exactly what the tag forbids;
+        * ``title`` matching any ``title_blocklist`` pattern → entry
+          refused.
+
+        Args:
+            entries: Parsed, schema-validated entries
+                (:class:`vesmaro.compact.FederationIndexEntry`). Entries
+                that fail a gate are skipped — one bad entry never
+                aborts the batch (a peer's index page is not atomic).
+            title_blocklist: Q10.9 regex patterns (from
+                :attr:`vesmaro.config.FederationConfig.
+                index_title_blocklist`); empty = no title gate.
+
+        Returns:
+            The number of rows actually written (inserted or replaced)
+            — gated/refused/stale entries do not count.
+        """
+        now = datetime.now(UTC).isoformat()
+        written = 0
+        refused = 0
+        conn = self._get_conn()
+        for entry in entries:
+            if NO_FEDERATE_TAG in entry.tags:
+                refused += 1
+                logger.info(
+                    "federation_index: refused entry id=%s — no-federate tag at import",
+                    entry.id,
+                )
+                continue
+            if title_blocklist and title_matches_blocklist(entry.title, title_blocklist):
+                refused += 1
+                logger.info(
+                    "federation_index: refused entry id=%s — title blocklist at import",
+                    entry.id,
+                )
+                continue
+            cur = conn.execute(
+                """
+                INSERT INTO federation_index
+                    (id, type, title, tags, project, source_agent, source_peer,
+                     origin_peer, content_state, timestamp, schema_version, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    type = excluded.type,
+                    title = excluded.title,
+                    tags = excluded.tags,
+                    project = excluded.project,
+                    source_agent = excluded.source_agent,
+                    source_peer = excluded.source_peer,
+                    origin_peer = excluded.origin_peer,
+                    content_state = excluded.content_state,
+                    timestamp = excluded.timestamp,
+                    schema_version = excluded.schema_version,
+                    received_at = excluded.received_at
+                WHERE excluded.timestamp >= federation_index.timestamp
+                """,
+                (
+                    entry.id,
+                    entry.type,
+                    entry.title,
+                    json.dumps(entry.tags, ensure_ascii=False),
+                    entry.project,
+                    entry.source_agent,
+                    entry.source_peer,
+                    entry.origin_peer,
+                    entry.content_state,
+                    entry.timestamp,
+                    entry.schema_version,
+                    entry.received_at or now,
+                ),
+            )
+            written += cur.rowcount
+        conn.commit()
+        logger.info(
+            "federation_index: upsert batch total=%d written=%d refused=%d",
+            len(entries),
+            written,
+            refused,
+        )
+        return written
+
+    def list_index(
+        self,
+        limit: int = 50,
+        *,
+        origin_peers: Sequence[str] | None = None,
+        projects: Sequence[str] | None = None,
+        since: str | None = None,
+        after_rowid: int = 0,
+        exclude_no_federate: bool = True,
+    ) -> list[tuple[FederationIndexEntry, int]]:
+        """Export-side listing of ``federation_index`` with resume rowids.
+
+        The index twin of :meth:`list_all_for_mesh` (ADR-0020 cursor
+        mechanic): a ``rowid ASC`` forward walk over the index's own
+        rowid space, so every page boundary is a valid watermark —
+        resuming with ``rowid > checkpoint`` yields exactly the
+        undelivered remainder (no dupes, no gaps; the rowid space is
+        global to the table). The S2 wire contract maps its int64
+        watermark (``MetadataSyncRequest.since_rev`` /
+        ``MetadataSyncResponse.latest_rev``) onto this rowid space.
+
+        Args:
+            limit: Maximum rows to fetch (caller passes page_limit + 1
+                to detect ``has_more``).
+            origin_peers: Restrict to these ``origin_peer`` values (SQL
+                ``IN``). ``None`` = no filter (all origins).
+            projects: Restrict to these ``project`` values (the caller
+                has already applied the peer ACL intersection).
+            since: Legacy ISO lower bound on ``timestamp`` (the record's
+                own timestamp, NOT ``received_at``).
+            after_rowid: Only rows with ``rowid > after_rowid``
+                (watermark resume; ``0`` = full pass from the start).
+            exclude_no_federate: Drop rows whose ``tags`` still carry
+                ``mnemos:no-federate`` (they should never be in the
+                index — the upsert gate refuses them; this is the
+                serve-side belt-and-braces, Q10.9).
+
+        Scope-stability caveat: identical to :meth:`list_all_for_mesh`
+        — the caller must replay a watermark only against the scope it
+        was minted for (widening the project/origin filter after a
+        checkpoint silently skips rows the narrower walk never
+        delivered).
+        """
+        conn = self._get_conn()
+        q = "SELECT rowid AS _idx_rowid, * FROM federation_index WHERE 1=1"
+        params: list[Any] = []
+        if origin_peers:
+            placeholders = ", ".join("?" for _ in origin_peers)
+            q += f" AND origin_peer IN ({placeholders})"
+            params.extend(origin_peers)
+        if projects:
+            placeholders = ", ".join("?" for _ in projects)
+            q += f" AND project IN ({placeholders})"
+            params.extend(projects)
+        if since:
+            q += " AND timestamp >= ?"
+            params.append(since)
+        if after_rowid > 0:
+            q += " AND rowid > ?"
+            params.append(after_rowid)
+        if exclude_no_federate:
+            q += (
+                " AND NOT EXISTS (SELECT 1 FROM json_each(federation_index.tags) "
+                "WHERE json_each.value = ?)"
+            )
+            params.append(NO_FEDERATE_TAG)
+        q += " ORDER BY rowid ASC LIMIT ?"
+        params.append(limit)
+        pairs: list[tuple[FederationIndexEntry, int]] = []
+        for row in conn.execute(q, params).fetchall():
+            pairs.append(
+                (
+                    FederationIndexEntry(
+                        id=row["id"],
+                        type=row["type"],
+                        title=row["title"],
+                        tags=json.loads(row["tags"]),
+                        project=row["project"],
+                        source_agent=row["source_agent"],
+                        source_peer=row["source_peer"],
+                        origin_peer=row["origin_peer"],
+                        content_state=row["content_state"],
+                        timestamp=row["timestamp"],
+                        schema_version=row["schema_version"],
+                        received_at=row["received_at"],
+                    ),
+                    int(row["_idx_rowid"]),
+                )
+            )
+        return pairs
+
+    def purge_origin(self, origin_peer: str) -> int:
+        """Delete every index row sourced from ``origin_peer``.
+
+        The mirror-aging primitive (paper §4): when an operator
+        decommissions a peer (or an origin store leaves the mesh), its
+        mirrored pointers age out wholesale — no deletion reason crosses
+        servers, the rows simply stop being advertised by THIS store.
+        Local rows (``origin_peer='self'``) are deletable the same way
+        (operator-scope decision, e.g. rebuilding the local index
+        materialisation); nothing here touches the ``memories`` table.
+
+        Returns:
+            The number of rows deleted.
+        """
+        conn = self._get_conn()
+        cur = conn.execute(
+            "DELETE FROM federation_index WHERE origin_peer = ?",
+            (origin_peer,),
+        )
+        conn.commit()
+        logger.info(
+            "federation_index: purge_origin peer=%s deleted=%d",
+            origin_peer,
+            cur.rowcount,
+        )
+        return cur.rowcount
 
     # ── CCR cache (P1-4) ──────────────────────────────────────────────────
 

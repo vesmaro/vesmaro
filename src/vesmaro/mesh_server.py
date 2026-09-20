@@ -42,6 +42,18 @@ Reuses :mod:`vesmaro._mesh_gen` (the same shim the client uses) to
 import the generated ``mnemos_core_api_pb2_grpc`` /
 ``mnemos_core_api_pb2`` modules without touching ``sys.path`` here.
 
+S2 meta-mirror substrate (ADR-0021 Q10.2/Q10.3, archcom 2026-09-20)
+-------------------------------------------------------------------
+:meth:`MnemosCoreServicer.build_metadata_sync_response` builds the
+metadata-only poll answer (``fed_pb2.MetadataSyncResponse``) from the
+``federation_index`` table, and :func:`_metadata_stream_event` fills the
+``SubscribeStream.record`` oneof's ``metadata`` variant. NEITHER is a
+registered RPC: ``MnemosCore`` has no metadata surface in the proto
+today, so both are substrate the future core-side RPC (and the Go mesh's
+``FederationPeer.SyncMetadata`` behind it) will call — the proto moves
+needed to wire them are enumerated in the slice report, per the task
+contract.
+
 ACL model
 ---------
 The ACL reuses :class:`vesmaro.config.PeerConfig.allowed_projects` from
@@ -114,7 +126,12 @@ import grpc
 
 from vesmaro import __version__ as _mnemos_version
 from vesmaro import _mesh_gen
-from vesmaro.compact import CompactRecord, build_compact_record
+from vesmaro.compact import (
+    CompactRecord,
+    FederationIndexEntry,
+    build_compact_record,
+    title_matches_blocklist,
+)
 from vesmaro.config import MeshTCPTLSConfig, PeerConfig, Settings
 from vesmaro.federation_server import verify_mtls_fingerprint
 from vesmaro.manager import MemoryManager
@@ -332,6 +349,66 @@ def _compact_from_proto(pb_record: Any) -> CompactRecord:
         tags=list(pb_record.tags),
         source_agent=pb_record.source_agent,
         timestamp=pb_record.timestamp,
+    )
+
+
+def _metadata_to_proto(entry: FederationIndexEntry) -> Any:
+    """Marshal a :class:`FederationIndexEntry` to the protobuf
+    ``MetadataRecord`` (S2 meta-mirror, ADR-0021 Q10.3).
+
+    Wire fields exactly per ``federation.proto::MetadataRecord``: ``id``,
+    ``type``, ``title``, ``tags``, ``project``, ``source_agent``,
+    ``source_peer``, ``timestamp``, ``schema_version``.
+
+    Deliberately NOT on the wire (storage-side only until the archcom-
+    enumerated additive proto move lands): ``origin_peer`` and
+    ``content_state`` — both ruled additive by Q10.3 but not yet fields
+    of the proto ``MetadataRecord``; exporting them would require the
+    proto change this substrate explicitly stops short of.
+    """
+    return _mesh_gen.fed_pb2.MetadataRecord(
+        id=entry.id,
+        type=entry.type,
+        title=entry.title,
+        tags=list(entry.tags),
+        project=entry.project,
+        source_agent=entry.source_agent,
+        source_peer=entry.source_peer,
+        timestamp=entry.timestamp,
+        schema_version=entry.schema_version,
+    )
+
+
+def _metadata_stream_event(
+    entry: FederationIndexEntry,
+    *,
+    event_type: int | None = None,
+    cursor: str = "",
+) -> Any:
+    """Build a ``SubscribeStream`` element carrying the METADATA oneof variant.
+
+    The phase-1 oneof contract (ADR-0021 ruling 3: "metadata-oneof enters
+    S2 phase 1") lives on ``federation.proto::SubscribeStream`` —
+    ``oneof record { CompactRecord compact = 2; MetadataRecord metadata
+    = 3; }`` (verified against the proto: SyncMetadata's own messages
+    carry NO oneof — ``MetadataSyncResponse.records`` is a plain
+    ``repeated MetadataRecord``). This helper fills the ``metadata``
+    variant so the standing-subscription goal (ruling 2) has a
+    substrate-ready marshaller; the Go mesh owns the actual stream.
+
+    Args:
+        entry: The index row to advertise.
+        event_type: ``SubscribeStream.EventType`` value; default
+            ``RECORD_ADDED`` (the common metadata case — a record
+            appeared on the origin).
+        cursor: Resume token echo (empty for substrate-level events).
+    """
+    if event_type is None:
+        event_type = _mesh_gen.fed_pb2.SubscribeStream.RECORD_ADDED
+    return _mesh_gen.fed_pb2.SubscribeStream(
+        event_type=event_type,
+        metadata=_metadata_to_proto(entry),
+        cursor=cursor,
     )
 
 
@@ -980,6 +1057,146 @@ class MnemosCoreServicer:
             cursor="",
             last_rev=0,
             last_sync_timestamp="",
+        )
+
+    # ── S2 metadata sync (ADR-0021 Q10.2/Q10.3 — substrate, pre-proto) ────
+
+    def build_metadata_sync_response(self, request: Any) -> Any:
+        """Build a ``MetadataSyncResponse`` from the ``federation_index``.
+
+        SUBSTRATE METHOD (S2 phase 1, poll-first — ADR-0021 ruling 2):
+        the body of the future mesh↔mnemos metadata RPC. It is NOT
+        registered on the gRPC server because ``MnemosCore`` (the only
+        contract this server serves) has NO metadata RPC today — adding
+        one is an archcom-enumerated proto move this slice stops short
+        of. The mesh↔mesh ``FederationPeer.SyncMetadata`` (served by the
+        Go mesh) sources its pages from exactly this logic once the
+        core-side RPC lands.
+
+        Semantics (mapped onto the existing
+        ``federation.proto::MetadataSyncRequest/Response``):
+
+        * ``since_rev`` is the peer's watermark, mapped onto the index
+          rowid space — the ADR-0020 rowid-ASC cursor MECHANIC (same as
+          :meth:`ListMemories` / ``list_all_for_mesh``), expressed as a
+          plain int64 because the SyncMetadata wire contract has no
+          opaque-token field (adding one would be a proto move). Rows
+          with ``rowid > since_rev`` are served; ``latest_rev`` echoes
+          the rowid of the last row this page consumed (delivered OR
+          filtered) so a re-poll resumes exactly after it — stateless
+          pagination, no server-side cursor state (ADR-0020: core keeps
+          no cursor state at all). An empty page echoes ``since_rev``
+          (the watermark never regresses).
+        * ``project_scope`` + ``peer_id`` run the same fail-closed ACL
+          as :rpc:`ListMemories`: the effective allowed set is resolved
+          unconditionally; a scoped request must be inside it, an
+          unscoped request intersects with it. Denial → empty records +
+          ``trigger_code=REFUSED`` (a builder has no gRPC context; the
+          future RPC wrapper maps this to ``PERMISSION_DENIED`` and MUST
+          take the peer identity from the connection, not from
+          ``request.peer_id`` — the GetSubscriptionState review lesson).
+        * ``filter`` (tag set) intersects with each row's tags (proto
+          semantics: "entries whose tags intersect this set"); empty =
+          no filter.
+        * Q10.9 export gates: rows whose title matches the configured
+          ``index_title_blocklist`` are dropped from the page (their
+          rowids still advance ``latest_rev``, so a blocked row never
+          wedges a poll loop); ``mnemos:no-federate`` rows are excluded
+          in SQL (they should not exist — the upsert gate refuses them;
+          serve-side belt-and-braces).
+        * The response is metadata-ONLY: no CompactRecord bodies, no
+          summary — an index row is itself an inference surface, and
+          content stays behind :rpc:`ListMemories` / :rpc:`WriteMemory`.
+
+        Args:
+            request: A ``fed_pb2.MetadataSyncRequest`` (real generated
+                message — the same shape the wire contract defines).
+
+        Returns:
+            A ``fed_pb2.MetadataSyncResponse``.
+
+        Raises:
+            CursorError: ``since_rev`` is negative or beyond the SQLite
+                rowid ceiling — the ADR-0020 rule-3 analog (garbage
+                checkpoints are rejected loudly, never guessed); the
+                future RPC wrapper maps this to ``INVALID_ARGUMENT``.
+        """
+        since_rev = int(request.since_rev)
+        if since_rev < 0 or since_rev > _SQLITE_ROWID_MAX:
+            raise CursorError(f"since_rev out of range [0, {_SQLITE_ROWID_MAX}]: {since_rev}")
+
+        def _refused() -> Any:
+            return _mesh_gen.fed_pb2.MetadataSyncResponse(
+                records=[],
+                latest_rev=since_rev,
+                has_more=False,
+                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            )
+
+        peer_id = str(request.peer_id) or self._single_peer_id()
+        if peer_id is None:
+            logger.info("mesh_server: SyncMetadata refused — no peer identity")
+            return _refused()
+        allowed_projects = self._allowed_projects_for_peer(peer_id)
+        if not allowed_projects:
+            logger.info(
+                "mesh_server: SyncMetadata refused — empty effective allowed set for peer_id=%s",
+                peer_id,
+            )
+            return _refused()
+        project_scope = str(request.project_scope)
+        if project_scope:
+            if not self._intersect_projects([project_scope], allowed_projects):
+                logger.info(
+                    "mesh_server: SyncMetadata refused — project_scope=%s "
+                    "not allowed for peer_id=%s",
+                    project_scope,
+                    peer_id,
+                )
+                return _refused()
+            effective_projects: list[str] | None = [project_scope]
+        else:
+            effective_projects = list(allowed_projects)
+
+        tag_filter = [str(t) for t in request.filter]
+        title_blocklist = self._settings.federation.index_title_blocklist
+        # MetadataSyncRequest has NO page-size field (proto contract) —
+        # the core picks the page. Fetch one extra row to detect
+        # has_more without a second query (same pattern as
+        # :meth:`ListMemories`).
+        page_limit = _DEFAULT_PAGE_SIZE
+        rows = self._manager.sqlite.list_index(
+            limit=page_limit + 1,
+            projects=effective_projects,
+            after_rowid=since_rev,
+        )
+        has_more = len(rows) > page_limit
+        records: list[Any] = []
+        latest_rev = since_rev
+        blocked = 0
+        for entry, rowid in rows[:page_limit]:
+            latest_rev = rowid
+            if tag_filter and not any(t in entry.tags for t in tag_filter):
+                continue
+            if title_blocklist and title_matches_blocklist(entry.title, title_blocklist):
+                blocked += 1
+                continue
+            records.append(_metadata_to_proto(entry))
+        logger.info(
+            "mesh_server: SyncMetadata peer_id=%s since_rev=%d → %d records, "
+            "latest_rev=%d, has_more=%s, title_blocked=%d",
+            peer_id,
+            since_rev,
+            len(records),
+            latest_rev,
+            has_more,
+            blocked,
+        )
+        return _mesh_gen.fed_pb2.MetadataSyncResponse(
+            records=records,
+            latest_rev=latest_rev,
+            has_more=has_more,
+            trigger_code=_trigger_code_to_proto(TriggerCode.EXHAUSTIVE),
         )
 
     # ── RPC: Heartbeat ─────────────────────────────────────────────────────
