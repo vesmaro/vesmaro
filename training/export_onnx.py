@@ -372,9 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             "else the plain single-dim [384])"
         ),
     )
-    p.add_argument(
-        "--teacher", default="Qwen/Qwen3-Embedding-0.6B"
-    )
+    p.add_argument("--teacher", default="Qwen/Qwen3-Embedding-0.6B")
     p.add_argument("--license", default="Apache-2.0", help="license of the student artefact")
     p.add_argument("--student-name", default=None, help="student HF id recorded in the manifest")
     args = p.parse_args(argv)

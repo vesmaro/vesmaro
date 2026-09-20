@@ -42,7 +42,11 @@ jobs:
           cache: pip
 
       - name: Install uv
-        run: pip install --upgrade uv
+        # Floor: uv.lock carries a PEP 735 [dependency-groups] section
+        # (#337) — PEP 735 read support landed in uv 0.4.27; floor set
+        # conservatively at 0.5.21 per #337 review (lock verified with
+        # uv 0.12.10 locally). Older uv silently re-resolves the lock.
+        run: pip install --upgrade "uv>=0.5.21"
 
       - name: Create venv and install project + dev extras
         # Pin ruff in CI to match what `make verify` runs locally. The
@@ -61,7 +65,7 @@ jobs:
         run: source .venv/bin/activate && ruff check .
 
       - name: Format check (ruff format)
-        run: source .venv/bin/activate && ruff format --check src/ tests/
+        run: source .venv/bin/activate && ruff format --check .
 
       - name: Type check (mypy --strict)
         run: source .venv/bin/activate && mypy --strict src/vesmaro/ src/mnemos/

@@ -3,8 +3,11 @@
 # Read version from pyproject.toml — keeps local build targets in sync with the package version.
 VERSION := $(shell grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
 
-# Interpreter for benchmark stand targets (override: make bench-s1 PYTHON=/usr/bin/python3.12).
-PYTHON ?= python3
+# Interpreter for benchmark stand targets. Defaults to the repo venv so the
+# verify chain is self-contained (#337 review: bare python3 resolves a
+# foreign interpreter when the venv is not activated — #335 class).
+# Override stays available: make bench-s1 PYTHON=/usr/bin/python3.12
+PYTHON ?= $(VENV)/python
 
 help:
 	@echo "Mnemos development commands"
@@ -57,10 +60,10 @@ lint-shell:  ## Run shellcheck on all shell scripts
 	shellcheck scripts/*.sh
 
 format:
-	$(VENV)/ruff format src/ tests/
+	$(VENV)/ruff format .
 
 format-check:
-	$(VENV)/ruff format --check src/ tests/
+	$(VENV)/ruff format --check .
 
 typecheck:
 	$(VENV)/mypy --strict src/vesmaro/ src/mnemos/
@@ -82,7 +85,7 @@ coverage:
 	$(VENV)/pytest --cov=src/vesmaro --cov-report=term-missing --cov-fail-under=80 tests/ -q
 
 check-version:
-	@python scripts/check_version.py
+	@$(VENV)/python scripts/check_version.py
 
 # ── Benchmark stands (ADR-0020) ──────────────────────────────────────────────
 # S1 stays in the local merge gate (deterministic corridors + invariants
@@ -151,17 +154,23 @@ verify: format-check lint typecheck test security security-reminder bench-s1 doc
 # doctor gate: fail on actual failures (exit 1), allow warnings (exit 2).
 # CI environments typically lack agent harnesses, so the integration check
 # warns — that is expected and must not break the build.
+# Exit codes OUTSIDE {0,1,2} (127 tool missing, 126 not executable, ...)
+# are HARD failures (#337 review): the old ladder funneled them into the
+# else-branch and printed "all checks passed" for a doctor that never ran.
 doctor:
-	@mnemos doctor --json > /dev/null 2>&1; \
+	@$(VENV)/mnemos doctor --json > /dev/null 2>&1; \
 	code=$$?; \
 	if [ $$code -eq 1 ]; then \
 		echo "✗ mnemos doctor: one or more health checks FAILED"; \
-		mnemos doctor; \
+		$(VENV)/mnemos doctor; \
 		exit 1; \
 	elif [ $$code -eq 2 ]; then \
 		echo "⚠ mnemos doctor: warnings only (non-blocking)"; \
-	else \
+	elif [ $$code -eq 0 ]; then \
 		echo "✓ mnemos doctor: all checks passed"; \
+	else \
+		echo "✗ mnemos doctor: tool did not run (exit $$code; 127=not found in .venv, 126=not executable) — run: uv sync / make bootstrap"; \
+		exit 1; \
 	fi
 
 bootstrap:
