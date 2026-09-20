@@ -118,7 +118,7 @@ from vesmaro.lens import Lens  # noqa: E402
 from vesmaro.manager import MemoryManager  # noqa: E402
 from vesmaro.models import MemoryCreate, MemorySource, MemoryStatus  # noqa: E402
 
-RUNNER_VERSION = "f1-task-scope-runner-2"
+RUNNER_VERSION = "f1-task-scope-runner-3"
 EXPERIMENT = "f1-task-scope"
 SPEC = "docs/experiments/f1-task-scope.md §1.3, §2.8, §3, §4, §6.5, §9"
 
@@ -991,6 +991,12 @@ def build_manifest_core(
             substratum = q.substratum
             assert substratum is not None  # l_neg by the branch above
             l_neg_composition[substratum] += 1
+    # Observed lens activation over the ACTIVE analyzed set (§8 entry
+    # 16): a run-time fact of THIS code version's lens regexes, stamped
+    # into the manifest — content, not statistics. Never asserted at
+    # build time: a broadened lens must produce red corridor DATA, not
+    # a corpus-build crash.
+    lens_observed = f1_corpus.lens_activation_observed(corpus, analyzed)
     return {
         "runner_version": RUNNER_VERSION,
         "experiment": EXPERIMENT,
@@ -1024,6 +1030,7 @@ def build_manifest_core(
             "projects": dict(f1_corpus.TASK_PROJECTS),
             "agent": f1_corpus.AGENT,
             "l_neg_composition": l_neg_composition,
+            "lens_observed": lens_observed,
         },
         "ledger": {
             "artifact": "benchmarks/experiments/f1_task_scope/adjudication_ledger.json",
@@ -1161,6 +1168,18 @@ def verify_manifest(manifest: dict[str, Any]) -> None:
     ):
         raise AssertionError(
             f"l_neg_composition must cover the stratum over trap/mixed only: {composition!r}"
+        )
+    lens_observed = manifest["corpus"]["lens_observed"]
+    if (
+        not isinstance(lens_observed, dict)
+        or set(lens_observed) != {"trap_activations", "mixed_activations", "code_axis_activations"}
+        or not all(isinstance(v, int) and v >= 0 for v in lens_observed.values())
+        or lens_observed["trap_activations"] + lens_observed["mixed_activations"]
+        > f1_corpus.ANALYZED_COUNTS["l_neg"]
+    ):
+        raise AssertionError(
+            f"lens_observed must be the observed activation counts over the three "
+            f"registered families: {lens_observed!r}"
         )
     if manifest["clock"]["run_now"] != RUN_NOW.isoformat():
         raise AssertionError("scenario clock drifted from the frozen RUN_NOW")
@@ -1361,11 +1380,15 @@ def append_run_ledger(manifest: dict[str, Any], doc_path: Path = DOC_PATH) -> Pa
 
 def _print_summary(manifest: dict[str, Any], outcomes: dict[str, Any]) -> None:
     print(f"run_id: {manifest['run_id']}")
+    lens_observed = manifest["corpus"]["lens_observed"]
     print(
         f"corpus: fingerprint={manifest['corpus']['fingerprint_blake2b'][:12]}… "
         f"rows={manifest['corpus']['counts']['total']} "
         f"(generator {manifest['corpus']['generator_version']}, "
-        f"seed {manifest['corpus']['seed']})"
+        f"seed {manifest['corpus']['seed']}) | lens_observed: "
+        f"trap {lens_observed['trap_activations']}, "
+        f"mixed {lens_observed['mixed_activations']}, "
+        f"code-axis {lens_observed['code_axis_activations']} (§8/16)"
     )
     print(
         f"ledger: {manifest['ledger']['state_sha256'][:12]}… "

@@ -108,16 +108,47 @@ def test_analyzed_denominators_and_session_shape() -> None:
         assert len(t_q) == 24 and len(x_q) == 6  # the G3b session shape
 
 
-def test_lens_axis_contract_generator_pinned() -> None:
-    """Code-axis queries and L-neg MIXED queries activate the CODE lens;
-    every other query never does (the L-neg trap family stays inert) —
-    the generator pins it."""
+def test_lens_axis_contract_pinned_at_test_layer() -> None:
+    """CURRENT lens behavior, pinned at the TEST layer (§8 entry 16 —
+    the right layer): code-axis queries and L-neg MIXED queries activate
+    the CODE lens; every other query never does (the trap family stays
+    inert). A lens change that flips any activation fails HERE, at test
+    time — while a run executed under a broadened lens still PRODUCES
+    red corridor data instead of crashing the corpus build."""
     from vesmaro.lens import Lens, lens_active
 
     for q in f1_corpus.build_corpus().queries:
         active = lens_active(Lens.CODE, query=q.text)
         expected = q.axis == "code" or (q.stratum == "l_neg" and q.mixed)
         assert active == expected, q.qid
+
+
+def test_lens_observation_counts_pinned_and_manifest_stamped(
+    collected: tuple[dict, dict],
+) -> None:
+    """§8 entry 16: lens activation is OBSERVED, never build-asserted —
+    the counts helper yields the current facts (trap 0 / mixed 8 /
+    code-axis 72 over the analyzed set), the manifest stamps them per
+    run under corpus.lens_observed, and verify_manifest enforces the
+    schema. trap_activations == 0 is the current calibration; > 0 under
+    a future lens is DATA (the trap corridor's red path), not a crash."""
+    manifest, _ = collected
+    observed = f1_corpus.lens_activation_observed()
+    assert observed == {
+        "trap_activations": 0,
+        "mixed_activations": 8,
+        "code_axis_activations": 72,
+    }
+    assert manifest["corpus"]["lens_observed"] == observed
+    # negative: a lens_observed block with the wrong shape fails the
+    # manifest schema (re-finalized so the sha/run-id guards pass)
+    bad_core = {
+        **runner._core(manifest),
+        "corpus": {**manifest["corpus"], "lens_observed": {"trap_activations": 0}},
+    }
+    bad_manifest = runner.finalize_manifest(bad_core, manifest["invariants"])
+    with pytest.raises(AssertionError, match="lens_observed"):
+        runner.verify_manifest(bad_manifest)
 
 
 def test_l_neg_mixed_stratum_is_falsifiable() -> None:

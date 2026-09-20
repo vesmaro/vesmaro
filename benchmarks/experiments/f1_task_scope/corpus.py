@@ -40,13 +40,15 @@ the generator is the declarer, never an outcome consumer):
   3 X-gold pairs per task (the G3b session shape, §2.6b).
 * L-neg n = 24: cross-class prose-gold queries, MIXED composition (the
   G4b falsifiability repair): 16 trap-family queries (code-like tokens
-  in prose shapes the CODE lens must reject — generator-asserted
-  NON-activating, the registered must-not-activate majority) + 8
-  mixed-phrasing queries (4 pairs x 2 phrasings: prose-framed questions
-  carrying genuinely code-shaped call tokens such as ``retry(backoff=5)``
-  — generator-asserted ACTIVATING; the gold stays a task-less prose
-  row, so the active lens's code-only narrowing can drop it: the G4b
-  corridor measures instead of being structurally unfalsifiable).
+  in prose shapes designed for the CODE lens to reject — the registered
+  must-not-activate majority) + 8 mixed-phrasing queries (4 pairs x 2
+  phrasings: prose-framed questions carrying genuinely code-shaped call
+  tokens such as ``retry(backoff=5)`` — designed ACTIVATING; the gold
+  stays a task-less prose row, so the active lens's code-only narrowing
+  can drop it). Lens activation is DESIGNED at birth and OBSERVED at
+  run time (``lens_activation_observed`` → the manifest's
+  ``lens_observed``; §8 entries 15-16) — never build-asserted, so a
+  broadened lens produces red corridor DATA instead of a build crash.
 
 Replacement pool (§3.4): +25% surplus gold-capable records per stratum
 (3 per task T-side, 3 X-shared, 3 L-neg; the foreign half draws its
@@ -1520,6 +1522,43 @@ def segment_counts(corpus: Corpus | None = None) -> dict[str, int]:
     return counts
 
 
+# ── lens activation observation (§8 entry 16 — observed, never asserted) ──────
+
+
+def lens_activation_observed(
+    corpus: Corpus | None = None, queries: tuple[GoldQuery, ...] | None = None
+) -> dict[str, int]:
+    """Observed CODE-lens activation counts over the (active) analyzed set.
+
+    A run-time FACT of the observing code version — the lens regexes —
+    stamped into the manifest's corpus block as ``lens_observed`` and
+    pinned per run. Deliberately NOT a build assert (§8 entry 16): a
+    future broadened lens that flips a trap query to activating must
+    flow through the run as DATA (arm A drops the trap gold → the G4b
+    corridor fails in the analysis), never crash the corpus build
+    before any arm executes. Current behavior is pinned at the TEST
+    layer (``tests/test_f1_task_scope_runner.py``): trap 0 / mixed 8 /
+    code-axis 72.
+
+    Families: ``trap_activations`` / ``mixed_activations`` (the L-neg
+    substrata — the corridor's red path is trap_activations > 0) and
+    ``code_axis_activations`` (the lens-axis gold design, §3.1).
+    """
+    built = corpus if corpus is not None else build_corpus()
+    analyzed = queries if queries is not None else built.analyzed_queries()
+    counts = {"trap_activations": 0, "mixed_activations": 0, "code_axis_activations": 0}
+    for q in analyzed:
+        if not lens_active(Lens.CODE, query=q.text):
+            continue
+        if q.stratum == "l_neg":
+            substratum = q.substratum
+            assert substratum is not None  # l_neg by the branch above
+            counts[f"{substratum}_activations"] += 1
+        elif q.axis == "code":
+            counts["code_axis_activations"] += 1
+    return counts
+
+
 # ── audit subsample (§3.5, frozen pre-run) ────────────────────────────────────
 
 
@@ -1611,27 +1650,23 @@ def _assert_corpus(corpus: Corpus) -> None:
         assert len(t_q) == 24, f"{task}: {len(t_q)} T-gold queries (expected 24)"
         assert len(x_q) == 6, f"{task}: {len(x_q)} X-gold queries (expected 6)"
 
-    # Lens contract (the lens-axis design, generator-pinned): code-axis
-    # queries ACTIVATE the CODE lens; L-neg MIXED queries (the G4b
-    # falsifiability repair) ACTIVATE by their code-shaped call token;
-    # every other query NEVER does (the L-neg trap family must stay
-    # inert — the registered must-not-activate majority).
+    # L-neg composition (STRUCTURAL, §8/13): 8 mixed + 16 trap among the
+    # analyzed queries. LENS activation itself is NOT asserted here —
+    # it is an observed, code-version-dependent fact recorded per run
+    # into the manifest (``lens_activation_observed``, §8 entry 16): a
+    # broadened lens must flow through the run as DATA (the trap
+    # corridor's red path), never crash the corpus build.
     l_neg_analyzed = [q for q in analyzed if q.stratum == "l_neg"]
     l_neg_mixed = [q for q in l_neg_analyzed if q.mixed]
     assert len(l_neg_mixed) == 8, (
-        f"L-neg mixed composition drifted: {len(l_neg_mixed)} activating of "
+        f"L-neg mixed composition drifted: {len(l_neg_mixed)} mixed of "
         f"{len(l_neg_analyzed)} (registered: 8 mixed + 16 trap, §8/13)"
     )
-    for q in corpus.queries:
-        active = lens_active(Lens.CODE, query=q.text)
-        expected = q.axis == "code" or (q.stratum == "l_neg" and q.mixed)
-        assert active == expected, (
-            f"{q.qid}: lens activation {active} != birth property {expected} "
-            "(code-axis or L-neg mixed activate; everything else stays inert)"
-        )
     # The G4b falsifiable arm's gold is cross-class PROSE: the active
     # lens's code-only narrowing can drop it — that is the corridor's
     # measurement path, so the gold must never be code-classified.
+    # (detect_profile is the INGEST-side content classifier — corpus
+    # shape, not lens behavior.)
     for q in l_neg_mixed:
         gold = rows_by_slug[q.gold_slug]
         assert gold.task is None and gold.segment == "shared", (
