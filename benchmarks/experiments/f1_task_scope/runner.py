@@ -388,12 +388,22 @@ def format_search_blocks(
 
 @dataclass(frozen=True)
 class QueryOutcome:
-    """The per-(query, arm) outcome tuple (F1 §4.3 — tuples, nothing else)."""
+    """The per-(query, arm) outcome tuple (F1 §4.3 — tuples, nothing else).
+
+    Token bases (the arm-C dual basis, §8/14): ``tokens`` keeps the
+    REGISTERED basis — arm C: the top-5 formatted blocks; A0/B/A: the
+    full assembled estimate — while ``tokens_full`` additionally records
+    arm C's FULL formatted-assembly estimate (every budget-included
+    block, not just the top-5), the basis directly comparable with the
+    assembled arms' ``tokens``. On A0/B/A the two fields are equal (the
+    assembled estimate already IS the full basis).
+    """
 
     qid: str
     arm: str
     hit: bool
     tokens: int
+    tokens_full: int
     text_sha256: str
     block_slugs: tuple[str, ...]
     foreign_leak_slugs: tuple[str, ...]
@@ -405,6 +415,7 @@ class QueryOutcome:
         return {
             "hit": self.hit,
             "tokens": self.tokens,
+            "tokens_full": self.tokens_full,
             "block_slugs": list(self.block_slugs),
             "foreign_leak_slugs": list(self.foreign_leak_slugs),
             "lens_active": self.lens_active,
@@ -476,6 +487,10 @@ def execute_arm(
                 )
                 top_ids = [b["memory_id"] for b in blocks[:TOP_K]]
                 tokens = sum(b["tokens"] for b in blocks[:TOP_K])
+                # Dual basis (§8/14): the full formatted assembly — every
+                # budget-included block, comparable with the assembled
+                # arms' full estimates.
+                tokens_full = sum(b["tokens"] for b in blocks)
                 text = "\n\n".join(f"{b['provenance']}\n{b['content']}" for b in blocks[:TOP_K])
                 block_contents = [b["content"] for b in blocks[:TOP_K]]
             else:
@@ -508,6 +523,7 @@ def execute_arm(
                 issued = result["blocks"][:TOP_K]
                 top_ids = [b["memory_id"] for b in issued]
                 tokens = int(result["tokens"]["estimated"])
+                tokens_full = tokens  # the assembled estimate already IS the full basis
                 text = str(result["text"])
                 block_contents = [str(b["content"]) for b in issued]
                 if arm == "A":
@@ -574,6 +590,7 @@ def execute_arm(
                 arm=arm,
                 hit=gold_id in top_ids,
                 tokens=tokens,
+                tokens_full=tokens_full,
                 text_sha256=hashlib.sha256(text.encode()).hexdigest(),
                 block_slugs=tuple(id_to_row[mid].slug for mid in top_ids if mid in id_to_row),
                 foreign_leak_slugs=_leak_slugs(top_ids, id_to_row, q.current_task),
@@ -713,6 +730,7 @@ _ARM_TUPLE_KEYS: frozenset[str] = frozenset(
     {
         "hit",
         "tokens",
+        "tokens_full",
         "block_slugs",
         "foreign_leak_slugs",
         "lens_active",
@@ -732,10 +750,19 @@ _COMPARISONS: dict[str, tuple[tuple[str, str], ...]] = {
 #: Any key matching this pattern ANYWHERE in an artifact marks it as
 #: carrying statistics — refused. The e3 spelling ``ci\d*`` (zero-or-
 #: more digits) would false-fire on ordinary English keys containing
-#: "ci" (the committed task slug ``q3-capacity-audit``); ``ci\d+``
-#: keeps the ban's semantics (interval-shaped keys: ci95, ci…) without
-#: the prose false-positive. Registered as implemented (§8 candidate).
-_STAT_KEY_RE = re.compile(r"p.?value|ci\d+|verdict|signif|confiden")
+#: "ci" (the committed task slug ``q3-capacity-audit``); ``ci[\W_]?\d+``
+#: keeps the ban's semantics (interval-shaped keys: ci95, ci_95) without
+#: the prose false-positive ("capacity" is ci + letters, never matched).
+#: The repair-wave extension additionally bans the bare statistic
+#: spellings — a key that IS ``p`` (word-bounded, so ``top_k`` /
+#: ``hybrid_alpha`` / ``step`` stay clean), ``pval``/``pvals``, any
+#: ``p(value|values|-value|…)`` spelling, and ``power`` (right-bounded:
+#: ``statistical_power`` fires, no artifact key contains it) — so a lone
+#: ``"p": 0.03`` or ``"power": 0.82`` cannot ride along unnamed.
+#: Registered as implemented (§8 entry 14).
+_STAT_KEY_RE = re.compile(
+    r"p.?values?|\bpvals?\b|power\b|\bp\b|ci[\W_]?\d+|verdict|signif|confiden"
+)
 
 
 def _stat_key_offenders(node: Any, path: str) -> list[str]:
@@ -1032,8 +1059,14 @@ def verify_manifest(manifest: dict[str, Any]) -> None:
         "manifest_sha256",
     }
     missing = required - set(manifest)
-    if missing:
-        raise AssertionError(f"manifest missing fields: {sorted(missing)}")
+    extra = set(manifest) - required
+    if missing or extra:
+        # Exact key set (repair 2c): an unexpected top-level key is as
+        # broken as a missing one — schema, not convention (§4.3).
+        raise AssertionError(
+            f"manifest top-level keys must be exactly {sorted(required)} — "
+            f"missing={sorted(missing)}, unexpected={sorted(extra)}"
+        )
     offenders = _stat_key_offenders(manifest, "")
     if offenders:
         raise AssertionError(
@@ -1205,6 +1238,44 @@ def run_ledger_entry(manifest: dict[str, Any]) -> str:
     )
 
 
+def _ledger_append_check(text: str, run_id: str) -> None:
+    """Shared §9 appendability guard (duplicate id + §9-is-last)."""
+    if run_id in text:
+        raise FileExistsError(f"run {run_id} already present in the §9 run ledger")
+    # §9 must be the LAST section — an EOF append is then a §9 append and
+    # nothing else (sections 1-7 are untouchable; §8 precedes §9).
+    last_header = text[text.rindex("## ") :]
+    if not last_header.startswith("## 9."):
+        raise AssertionError("refusing to append to the §9 run ledger: the last section is not §9")
+
+
+def validate_ledger_appendable(manifest: dict[str, Any], doc_path: Path) -> None:
+    """Pre-validate §9 appendability BEFORE any artifact is written.
+
+    Repair 2b (§8 entry 14): ``--record`` must not reach a state where
+    the run artifacts exist but the §9 entry could not be appended. The
+    same guards ``append_run_ledger`` enforces — duplicate run id in the
+    doc, §9 not the last section — are checked up front; a failure here
+    means NOTHING was written. If the append STILL fails after the
+    artifacts exist (a race, a doc edit between the two steps), the run
+    dir is quarantined (``<run_id>.UNLEDGERED``) and the run exits loud
+    — never a silently half-recorded state.
+    """
+    _ledger_append_check(doc_path.read_text(), str(manifest["run_id"]))
+
+
+def _quarantine_run_dir(run_dir: Path) -> Path:
+    """Rename an unledgered run dir aside — artifacts without their §9
+    entry are not a recorded run."""
+    quarantine = run_dir.with_name(f"{run_dir.name}.UNLEDGERED")
+    n = 1
+    while quarantine.exists():
+        quarantine = run_dir.with_name(f"{run_dir.name}.UNLEDGERED-{n}")
+        n += 1
+    run_dir.rename(quarantine)
+    return quarantine
+
+
 def append_run_ledger(manifest: dict[str, Any], doc_path: Path = DOC_PATH) -> Path:
     """Append the §9 run-ledger entry to the E-file (append-only, §9).
 
@@ -1213,16 +1284,7 @@ def append_run_ledger(manifest: dict[str, Any], doc_path: Path = DOC_PATH) -> Pa
     refuses a duplicate run id. Sections 1-7 are never touched.
     """
     text = doc_path.read_text()
-    run_id = str(manifest["run_id"])
-    if run_id in text:
-        raise FileExistsError(f"run {run_id} already present in the §9 run ledger")
-    # §9 must be the LAST section — an EOF append is then a §9 append and
-    # nothing else (sections 1-7 are untouchable; §8 precedes §9).
-    last_header = text[text.rindex("## ") :]
-    if not last_header.startswith("## 9."):
-        raise AssertionError(
-            f"refusing to append to {doc_path}: the last section is not the §9 run ledger"
-        )
+    _ledger_append_check(text, str(manifest["run_id"]))
     doc_path.write_text(text.rstrip("\n") + "\n\n" + run_ledger_entry(manifest))
     return doc_path
 
@@ -1251,10 +1313,11 @@ def _print_summary(manifest: dict[str, Any], outcomes: dict[str, Any]) -> None:
             arm_hits[arm][stratum] = bucket + (1 if row["arms"][arm]["hit"] else 0)
     for arm in ARM_ORDER:
         hits = arm_hits[arm]
+        counts = f1_corpus.ANALYZED_COUNTS
         print(
-            f"arm {arm:>2}: t-gold hits {hits.get('t_gold', 0)}/192   "
-            f"x-gold hits {hits.get('x_gold', 0)}/48   "
-            f"l-neg hits {hits.get('l_neg', 0)}/24"
+            f"arm {arm:>2}: t-gold hits {hits.get('t_gold', 0)}/{counts['t_gold']}   "
+            f"x-gold hits {hits.get('x_gold', 0)}/{counts['x_gold']}   "
+            f"l-neg hits {hits.get('l_neg', 0)}/{counts['l_neg']}"
         )
     for stratum, comparisons in outcomes["discordance"].items():
         for comparison, tally in comparisons.items():
@@ -1317,12 +1380,38 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    # Pre-validate §9 appendability BEFORE writing artifacts (repair 2b):
+    # a non-appendable ledger means nothing gets written at all.
+    try:
+        validate_ledger_appendable(manifest, args.doc_path)
+    except (AssertionError, FileExistsError, OSError) as exc:
+        print(
+            f"f1: FAIL — §9 run ledger is not appendable, nothing recorded: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         run_dir = record_run(manifest, outcomes, args.runs_dir)
     except FileExistsError as exc:
         print(f"f1: FAIL — {exc}", file=sys.stderr)
         return 1
-    append_run_ledger(manifest, args.doc_path)
+
+    # The append was pre-validated; if it STILL fails (a doc edit or a
+    # race between validation and append), quarantine the artifacts —
+    # a half-recorded state (artifacts without the §9 entry) must never
+    # survive silently.
+    try:
+        append_run_ledger(manifest, args.doc_path)
+    except (AssertionError, FileExistsError, OSError) as exc:
+        quarantine = _quarantine_run_dir(run_dir)
+        print(
+            f"f1: FAIL — §9 append failed after artifacts were written ({exc}); "
+            f"run dir quarantined as {quarantine.name} under {quarantine.parent}. "
+            "No half-recorded state: fix the ledger, then re-run --record.",
+            file=sys.stderr,
+        )
+        return 1
     print(
         f"f1: run recorded (write-once) → {run_dir}; §9 run-ledger entry appended",
         file=sys.stderr,

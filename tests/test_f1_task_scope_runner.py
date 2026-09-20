@@ -109,13 +109,60 @@ def test_analyzed_denominators_and_session_shape() -> None:
 
 
 def test_lens_axis_contract_generator_pinned() -> None:
-    """Code-axis queries activate the CODE lens; every other axis never
-    does (the L-neg trap family stays inert) — the generator pins it."""
+    """Code-axis queries and L-neg MIXED queries activate the CODE lens;
+    every other query never does (the L-neg trap family stays inert) —
+    the generator pins it."""
     from vesmaro.lens import Lens, lens_active
 
     for q in f1_corpus.build_corpus().queries:
         active = lens_active(Lens.CODE, query=q.text)
-        assert active == (q.axis == "code"), q.qid
+        expected = q.axis == "code" or (q.stratum == "l_neg" and q.mixed)
+        assert active == expected, q.qid
+
+
+def test_l_neg_mixed_stratum_is_falsifiable() -> None:
+    """G4b falsifiability (§8 entry 13, the repair-wave core): at least
+    one (registered: exactly 8) L-neg analyzed query ACTIVATES the lens
+    AND its gold is prose-side — the active lens's code-only narrowing
+    can drop it, so the §2.7b corridor measures instead of being
+    structurally unfalsifiable (arm A ≡ A0 by the identity projection)."""
+    from vesmaro.filter.pipeline import detect_profile
+    from vesmaro.lens import Lens, lens_active
+
+    corpus = f1_corpus.build_corpus()
+    rows = corpus.rows_by_slug()
+    l_neg = [q for q in corpus.analyzed_queries() if q.stratum == "l_neg"]
+    activating = [q for q in l_neg if lens_active(Lens.CODE, query=q.text)]
+    assert len(activating) == 8  # 4 mixed pairs x 2 phrasings
+    for q in activating:
+        assert q.mixed, f"{q.qid}: activating L-neg query must carry the mixed birth flag"
+        gold = rows[q.gold_slug]
+        # prose-side, cross-class gold: what the lens can drop
+        assert gold.task is None and gold.segment == "shared"
+        assert detect_profile(gold.content) != "code"
+
+
+def test_l_neg_non_activating_majority_holds() -> None:
+    """The registered must-not-activate trap family stays the L-neg
+    majority: 16 of 24 analyzed queries never activate the lens."""
+    from vesmaro.lens import Lens, lens_active
+
+    corpus = f1_corpus.build_corpus()
+    l_neg = [q for q in corpus.analyzed_queries() if q.stratum == "l_neg"]
+    inert = [q for q in l_neg if not lens_active(Lens.CODE, query=q.text)]
+    assert len(l_neg) == 24 and len(inert) == 16
+    assert all(not q.mixed for q in inert)
+
+
+def test_corpus_is_governance_free() -> None:
+    """Repair 2d: no corpus row carries a governance-selecting tag — a
+    governance row would be re-ranked by type_boost in _recall_stage
+    but not in the raw mgr.search probes, breaking the G4a/V3
+    probe-order equivalence."""
+    from vesmaro.lanes import GOVERNANCE_TAGS
+
+    for row in f1_corpus.build_corpus().rows:
+        assert not GOVERNANCE_TAGS.intersection(row.tags), row.slug
 
 
 def test_audit_subsample_frozen_rule() -> None:
@@ -250,13 +297,13 @@ def test_invariants_v1_to_v6_executed_and_logged(collected: tuple[dict, dict]) -
     manifest, _ = collected
     inv = manifest["invariants"]
     # V1: the fixed probe set — every lens-inactive cross query byte-identical
-    assert inv["V1"]["probes"] == 48  # 24 shared/foreign prose + 24 L-neg
+    assert inv["V1"]["probes"] == 40  # 24 shared/foreign prose + 16 L-neg traps
     assert inv["V1"]["identical"] == inv["V1"]["probes"]
     assert inv["V1"]["failures"] == []
     # V3 shadow: every lens-active cross query narrows order-preservingly
-    assert inv["V3_shadow"]["probes"] == 24  # X-gold code axis
-    assert inv["V3_shadow"]["subset_ok"] == 24
-    assert inv["V3_shadow"]["code_only_ok"] == 24
+    assert inv["V3_shadow"]["probes"] == 32  # 24 X-gold code axis + 8 L-neg mixed
+    assert inv["V3_shadow"]["subset_ok"] == 32
+    assert inv["V3_shadow"]["code_only_ok"] == 32
     assert inv["V3_shadow"]["failures"] == []
     # V2/V4/V5/V6
     assert inv["V2"] == {"lanes_enabled": False, "arms": ["A0", "C", "B", "A"]}
@@ -265,6 +312,45 @@ def test_invariants_v1_to_v6_executed_and_logged(collected: tuple[dict, dict]) -
     assert inv["V6"]["manifest_verified"] is True
     assert inv["store_copy"]["digests_equal_across_arms"] is True
     assert len(inv["store_copy"]["content_digest_sha256"]) == 64
+
+
+def test_g4b_corridor_measures_at_arm_level(collected: tuple[dict, dict]) -> None:
+    """The G4b corridor has signal, not structure: on the activating
+    mixed L-neg queries arm A's lens excludes the prose gold from its
+    code-only candidates (hit(A)=0 by construction), while A0 reaches
+    it — discordance A0-only > 0 is possible, so the §2.7b corridor can
+    FAIL. Before the repair every L-neg query was lens-inactive (arm A
+    ran the identity projection, byte-identical to A0) and the corridor
+    could never fail — the reviewer's falsifiability defect."""
+    _, outcomes = collected
+    l_neg = [row for row in outcomes["queries"] if row["stratum"] == "l_neg"]
+    mixed = [row for row in l_neg if row["arms"]["A"]["lens_active"]]
+    traps = [row for row in l_neg if not row["arms"]["A"]["lens_active"]]
+    assert len(mixed) == 8 and len(traps) == 16
+    # the active lens's code-only narrowing structurally drops the prose gold
+    assert all(not row["arms"]["A"]["hit"] for row in mixed)
+    # A0 reaches at least one mixed gold — otherwise the corridor would
+    # be vacuous in the other direction (0-vs-0 everywhere)
+    assert any(row["arms"]["A0"]["hit"] for row in mixed)
+    # trap majority: the identity projection keeps A byte-equal to A0 there
+    assert all(row["arms"]["A"]["hit"] == row["arms"]["A0"]["hit"] for row in traps)
+
+
+def test_arm_c_dual_token_basis(collected: tuple[dict, dict]) -> None:
+    """Repair 2a: every arm tuple carries BOTH token bases. Arm C task
+    tuples record the full formatted assembly (all budget-included
+    blocks) alongside the registered top-5 basis — the basis comparable
+    with the assembled arms' full estimates; on A0/B/A the assembled
+    estimate already is the full basis, so the two fields are equal."""
+    _, outcomes = collected
+    for row in outcomes["queries"]:
+        for arm in ("A0", "C", "B", "A"):
+            assert row["arms"][arm]["tokens_full"] >= row["arms"][arm]["tokens"]
+    c_task = [row for row in outcomes["queries"] if row["query_class"] == "task"]
+    assert any(row["arms"]["C"]["tokens_full"] > row["arms"]["C"]["tokens"] for row in c_task)
+    for row in outcomes["queries"]:
+        for arm in ("A0", "B", "A"):
+            assert row["arms"][arm]["tokens_full"] == row["arms"][arm]["tokens"]
 
 
 def test_collect_is_deterministic_run_id_and_outcomes() -> None:
@@ -389,6 +475,121 @@ def test_run_ledger_entry_shape(collected: tuple[dict, dict], tmp_path: Path) ->
     assert manifest["run_id"] in appended
     with pytest.raises(FileExistsError, match="already present"):
         runner.append_run_ledger(manifest, doc_copy)
+
+
+# ── repair 2b: --record pre-validation + quarantine (no half-recorded state) ──
+
+
+def test_record_prevalidates_ledger_and_writes_nothing(
+    collected: tuple[dict, dict],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A non-appendable §9 (last section is not §9) fails BEFORE any
+    artifact is written: rc 1, no runs dir, doc untouched."""
+    manifest, outcomes = collected
+    doc_copy = tmp_path / "f1-task-scope.md"
+    doc_copy.write_text(runner.DOC_PATH.read_text() + "\n\n## 10. Later section\n")
+    monkeypatch.setattr(runner, "collect_run", lambda: (manifest, outcomes))
+    rc = runner.main(
+        ["--record", "--runs-dir", str(tmp_path / "runs"), "--doc-path", str(doc_copy)]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "not appendable, nothing recorded" in err
+    assert not (tmp_path / "runs").exists()  # zero writes
+    assert doc_copy.read_text().endswith("## 10. Later section\n")  # untouched
+
+
+def test_record_quarantines_run_dir_when_append_fails_after_artifacts(
+    collected: tuple[dict, dict],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """If the §9 append fails AFTER the artifacts exist (here: forced),
+    the run dir is renamed <run_id>.UNLEDGERED and the run exits loud —
+    never a silently half-recorded state."""
+    manifest, outcomes = collected
+    doc_copy = tmp_path / "f1-task-scope.md"
+    doc_copy.write_text(runner.DOC_PATH.read_text())
+    runs = tmp_path / "runs"
+    monkeypatch.setattr(runner, "collect_run", lambda: (manifest, outcomes))
+
+    def _boom(manifest: dict, doc_path: Path) -> Path:
+        raise AssertionError("forced post-artifact append failure")
+
+    monkeypatch.setattr(runner, "append_run_ledger", _boom)
+    rc = runner.main(["--record", "--runs-dir", str(runs), "--doc-path", str(doc_copy)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "quarantined" in err
+    run_id = str(manifest["run_id"])
+    assert not (runs / run_id).exists()  # the plain run dir is GONE
+    quarantine = runs / f"{run_id}.UNLEDGERED"
+    assert (quarantine / "manifest.json").exists()  # …renamed aside, intact
+    assert (quarantine / "outcomes.json").exists()
+    assert doc_copy.read_text() == runner.DOC_PATH.read_text()  # no ledger write
+
+
+# ── repair 2c: manifest schema exactness + the extended stat-key ban ──────────
+
+
+def test_verify_manifest_rejects_extra_and_missing_keys(
+    collected: tuple[dict, dict],
+) -> None:
+    """Exact key set: an unexpected top-level manifest key fails as
+    loudly as a missing one."""
+    manifest, _ = collected
+    with pytest.raises(AssertionError, match="unexpected"):
+        runner.verify_manifest({**manifest, "bogus_extra": 1})
+    stripped = {k: v for k, v in manifest.items() if k != "clock"}
+    with pytest.raises(AssertionError, match="missing"):
+        runner.verify_manifest(stripped)
+
+
+def test_stat_key_ban_catches_bare_spellings(collected: tuple[dict, dict]) -> None:
+    """The extended _STAT_KEY_RE fires on the bare statistic spellings
+    (p / pval / power / p-value / ci95 / ci_95) inside the manifest
+    scan, while sparing the artifact vocabulary (top_k, hybrid_alpha,
+    the q3-capacity-audit slug class)."""
+    manifest, _ = collected
+    for stat_key in ("p", "pval", "power", "p-value", "ci95", "ci_95"):
+        # nested (the top-level set is exact-checked first); the recursive
+        # stat scan fires before the integrity-hash comparison
+        nested = {**manifest, "runtime": {**manifest["runtime"], stat_key: 0.5}}
+        with pytest.raises(AssertionError, match="statistical"):
+            runner.verify_manifest(nested)
+
+    pattern = runner._STAT_KEY_RE
+    for key in (
+        "p",
+        "pval",
+        "pvals",
+        "pvalue",
+        "p_value",
+        "p-value",
+        "power",
+        "statistical_power",
+        "ci95",
+        "ci_95",
+        "verdict",
+        "significance",
+    ):
+        assert pattern.search(key), key
+    for key in (
+        "top_k",
+        "hybrid_alpha",
+        "q3-capacity-audit",
+        "capacity",
+        "recall_depth",
+        "tokens_full",
+        "lens_active",
+        "steps",
+        "maps",
+    ):
+        assert not pattern.search(key), key
 
 
 # ── the frozen doc is untouched by everything above ───────────────────────────
