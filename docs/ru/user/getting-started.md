@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/instal
 |-------|---------|
 | Зафиксировать версию | `pip install mnemos-memory-server==4.1.0` |
 | Контейнер одной командой | `… install.sh \| bash -s -- --container` — см. [container-deployment.md](../admin/runbooks/container-deployment.md) |
-| Из исходников (контрибьюторам) | `git clone https://github.com/vesmaro/vesmaro && cd mnemos &&&& cd mnemos && cd vesmaro && uv venv && source .venv/bin/activate && uv pip install -e ".[dev]"` — см. [CONTRIBUTING.ru.md](../../../CONTRIBUTING.ru.md) |
+| Из исходников (контрибьюторам) | `git clone https://github.com/vesmaro/vesmaro && cd vesmaro && uv venv && source .venv/bin/activate && uv pip install -e ".[dev]"` — см. [CONTRIBUTING.ru.md](../../../CONTRIBUTING.ru.md) |
 
 <details>
 <summary><strong>Готовый wheel и готовый контейнерный образ</strong> — каналы с фиксированной версией</summary>

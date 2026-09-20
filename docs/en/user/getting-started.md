@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/instal
 |--------|---------|
 | Pin a version | `pip install mnemos-memory-server==4.1.0` |
 | Container one-liner | `… install.sh \| bash -s -- --container` — see [container-deployment.md](../admin/runbooks/container-deployment.md) |
-| From source (contributors) | `git clone https://github.com/vesmaro/vesmaro && cd mnemos &&&& cd mnemos && cd vesmaro && uv venv && source .venv/bin/activate && uv pip install -e ".[dev]"` — see [CONTRIBUTING.md](../../../CONTRIBUTING.md) |
+| From source (contributors) | `git clone https://github.com/vesmaro/vesmaro && cd vesmaro && uv venv && source .venv/bin/activate && uv pip install -e ".[dev]"` — see [CONTRIBUTING.md](../../../CONTRIBUTING.md) |
 
 <details>
 <summary><strong>Released wheel and pre-built container image</strong> — version-pinned channels</summary>
