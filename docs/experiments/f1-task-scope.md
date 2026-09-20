@@ -39,7 +39,7 @@
 | Per-stratum-only reporting; all arms symmetric; no post-hoc lens picking [ADR-0027 §Phase 1] | §6.4 |
 | Exact thresholds and full decision rules incl. INDETERMINATE zones registered before data exists [ADR-0027 §Phase 1] | §5 |
 | Honest negative allowed: "task-context = tag-filter with a different label" → primitive not built [ADR-0027 §Consequences] | §5.1, §5.2 |
-| Binding invariants 1–11 hold during every run [ADR-0027] | §4.5 |
+| Binding invariants 1–11 hold during every run [ADR-0027] | §4.5 (V1–V6 operationalized; V3/V4/V5/V8 are structural — exercised by construction per §2.9 and not re-derived per run; the full #→section map lives in §2.8–§2.9) |
 
 ---
 
@@ -244,6 +244,8 @@ V1 prefix-stability probe, V4 canary scan at issuance (every block of every arm)
 
 ### 5.1 The H1 lattice (every (delta, p, guardrail) combination maps to exactly one row; no zone can be picked after seeing data)
 
+Zone priority (explicit): NOISE > NO-DATA > CEILING INDETERMINATE > the §5.1 rows — a batch classified NOISE or NO-DATA never renders an H1 verdict; CEILING is evaluated before FALSIFIER/INDETERMINATE (an A0 ≥ 0.90 batch is CEILING even if its p ≥ 0.05).
+
 | Outcome | Condition (task-recall@5, T-gold n = 192) | Consequence |
 |---|---|---|
 | **PASS — Ф2 UNLOCK** | A − A0 ≥ +15 pp AND p(A vs A0) < 0.05 AND G1–G4 all hold | Phase 2 opens; the primitive's form routed by §5.2 |
@@ -264,6 +266,7 @@ V1 prefix-stability probe, V4 canary scan at issuance (every block of every arm)
 | tie: A − C < +5 pp OR p ≥ 0.05 | B < C (p < 0.05) | "task-context = honest tag-filter with a different label" — no NEW primitive; Ф2 reduces to reinforced tag-infrastructure hardening (an owner decision, not a schema migration); recorded in ADR-0027 as the pre-accepted honest outcome |
 | tie (as above) | B ≈ C and B ≈ A | even the emulation matches: the surviving argument is ergonomics alone (no prefixing discipline) — weakest Ф2; owner arbitrates whether ergonomics justify hardening |
 | premium (as above) | B ≈ A | primitive beats manual practice AND the filter: full §5.1 routing stands |
+| any other combination (e.g. tie ∧ B > C) | — | default row: no premium claim is available — treat as the tie row's tag-infrastructure hardening; the owner arbitrates any residual disagreement before Ф2 planning |
 
 ### 5.3 Multiple-comparison rule (registered, flagged — the E0 §5.1 precedent)
 
@@ -301,7 +304,7 @@ Confirmatory and gating analyses are restricted to the registered strata: T-gold
 
 ### 6.5 Power notes (registered before any run; unconditional exact two-sided values, the E0 revision-8 convention)
 
-Method: exact binomial on discordant pairs, unconditional (discordance b ~ Bin(n, D) marginalized; the implementation reproduces the E0 revision-8 anchor quartet 0.3544 / 0.6800 / 0.5477 / 0.8794 exactly — same arithmetic, registered for traceability).
+Method: exact binomial on discordant pairs, unconditional (discordance b ~ Bin(n, D) marginalized; the runner MUST reproduce the E0 revision-8 anchor quartet 0.3544 / 0.6800 / 0.5477 / 0.8794 exactly (same arithmetic) — a pre-run requirement; the §8 amendment ledger freezes any drift).
 
 | n = 192 (T-gold) | D = 0.3 | D = 0.5 (design point) | D = 0.7 |
 |---|---|---|---|
