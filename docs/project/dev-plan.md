@@ -78,10 +78,16 @@
 | 2026-09-16 | Волна A0-1 «топливо графа» + релиз 4.3.0 + адъюдикация | (1) **A0-1 4/4 ВЛИТО** за день: [#336](https://github.com/vesmaro/vesmaro/pull/336) миграция · [#338](https://github.com/vesmaro/vesmaro/pull/338) edge_stats capture · [#340](https://github.com/vesmaro/vesmaro/pull/340) авто-минтинг (ревью поймало M1 from-side гейты + M2 инфра-мусор — закрыто до мерджа) · [#342](https://github.com/vesmaro/vesmaro/pull/342) I1–I3 walk; сьют рос 3476→3597, канонический контур. (2) **РЕЛИЗ 4.3.0** все каналы (PyPI/npm×4/GH Release+cosign+SBOM/ghcr образ — догнан позор 4.2.0); merge-back [#341](https://github.com/vesmaro/vesmaro/pull/341). (3) **Адъюдикация golden**: «красный инвариант с #315» = фантом самодельного venv (uv-run PATH-fallthrough, [#335](https://github.com/vesmaro/vesmaro/issues/335)) + устаревший инвариант против спроектированного soft-fallback — фикс [#339](https://github.com/vesmaro/vesmaro/pull/339) (untagged-only zero-tolerance + ремни), продукт реабилитирован. (4) backfill живой БД (1651 embedding_id) |
 | 2026-09-17 | (параллельные сессии) Волны деплоя + mesh W2 | [#345](https://github.com/vesmaro/vesmaro/pull/345)–[#349](https://github.com/vesmaro/vesmaro/pull/349) helm/compose/podman + image-first доки (образ ghcr.io/vesmaro/vesmaro публичен, digest=релизному); [#350](https://github.com/vesmaro/vesmaro/pull/350)/[#351](https://github.com/vesmaro/vesmaro/pull/351) mesh serve-шов. Волны чужих сессий — записано для полноты реестра |
 | 2026-09-20 | Пост-квотный кадр: CI-гигиена + Ф0 целиком + A1-упреждение + A0-измерение | (1) [#355](https://github.com/vesmaro/vesmaro/pull/355) гигиена гейтов (закрывает [#337](https://github.com/vesmaro/vesmaro/issues/337): mypy/coverage на реальный код, ruff+format repo-wide, dependency-groups — ловушка #335 убита структурно, канарейки). (2) **Ф0 мультиконтекст ЗАВЕРШЕНА**: [#356](https://github.com/vesmaro/vesmaro/pull/356) срез 1 (task-тег + doc-metadata) + [#360](https://github.com/vesmaro/vesmaro/pull/360) срез 2 (линза + task-параметр хвостовой + write-валидация); Ф1-подготовительная волна скоупирована на [#308](https://github.com/vesmaro/vesmaro/issues/308). (3) [#358](https://github.com/vesmaro/vesmaro/pull/358) A1-упреждение N1–N4 (major-урок: python-sqlite3 не транзактит DDL — BEGIN IMMEDIATE + raw-probe тест). (4) **A0-review измерение**: порог 0.92 ПОДТВЕРЖДЁН (полоса ниже = 0/37 дублей), плотность проходная, **walk-DOA** (headroom-gate никогда не срабатывает — очередь комитета, пре-рид 27.09); 7-дневное окно на кроне (день-1: 9 рёбер, органика подтверждена). (5) [#344](https://github.com/vesmaro/vesmaro/issues/344) закрыт stale (сборка+запуск доказаны), [#357](https://github.com/vesmaro/vesmaro/issues/357) осмотррик-зонтик 5.0.0. main=74ba226, сьют 3736/0 |
+| 2026-09-19/20 | (параллельные сессии) Core/mesh-волны: курсоры подписки, ACL-харднинг, W2.5 mTLS + канонизация ссылок | [#370](https://github.com/vesmaro/vesmaro/pull/370) ADR-0020 subscription cursor contract (core-minted opaque cursors + Pull-leg transport) · [#373](https://github.com/vesmaro/vesmaro/pull/373) ACL hardening (fail-closed effective-set на всех MnemosCore-путях + degenerate-config rejection) · [#375](https://github.com/vesmaro/vesmaro/pull/375) W2.5 TCP leg (mTLS-порт на grpcio-листенере MeshServer); follow-up-notes открыты: [#363](https://github.com/vesmaro/vesmaro/issues/363)/[#364](https://github.com/vesmaro/vesmaro/issues/364)/[#366](https://github.com/vesmaro/vesmaro/issues/366)/[#372](https://github.com/vesmaro/vesmaro/issues/372)/note-#375 · [#377](https://github.com/vesmaro/vesmaro/pull/377) канонизация ссылок репо после переноса орга (main=3c8f270). Волны чужих сессий — записано для полноты реестра |
 | 2026-09-15 | АрхКом: Memory Graph → «самозаправляющийся граф» (ревизия роадмапа) | Владелец обнаружил потерю инициативы «Memory Graph + Learning Loop» (очередь АрхКома с 2026-08-21, TL-рекомендация P1; при вычистке очереди 2026-08-31 не переоформлена — disposition отсутствовал, в dev-plan выжил только D2-хвост [#172](https://github.com/vesmaro/vesmaro/issues/172)). Комитет (TL chair + Product Architect + Senior System Engineer + Senior Security Engineer, все conditional → сходимость в фазе критики) принял **accept-staged**: прод-факт 1662 записи / 0 рёбер опроверг теорию топлива от харнессов ⇒ топливо прежде механики. A0 (S–M): миграция видов (`relates_to`+веса+provenance/scope, одноразовое окно пустой таблицы), детерминированный авто-минтинг `relates_to` на write (без LLM, без supersede-решений), capture used/rejected в `edge_stats` (`event_id` PK, append-only, volume-cap), I1–I3 mutation-verified ДО включения 1-hop walk — acceptance: minting-rate + `via_graph`>0, guard recall@5 ≥ 0.9409. A1 (M) за гейтом плотности edges/100 ≥ 50 (revisitable на A0-review): BFS-2 прикладной уровнями, feedback APPLY rank-only, `graph_epoch` в cache key. B/C — Later (C за отдельной threat-model сессией). Линия едет мажорным 4.4.0; 4.3.0 не тронут; D2 #172 слит в эпик. Инварианты I1–I9 + процессные анти-потеря-фиксы (рекомендация → issue ≤48ч; disposition на каждый item при вычистке; dev-plan = derived state) — ADR-0030 `docs/project/adr/0030-memory-graph-self-fueling.md`; mnemos `d11debf8`/`1d4bf66e`; план — §4c |
 
 ## 4. DAG ближайших волн
 
+> Статус-обновление 2026-09-20: OWN1/OWN2 погашены (релиз 4.3.0 сдан; Ф0 и
+> A0-1 сданы); A0-review пройден — A1 стоит в очереди headroom-redesign
+> (созыв АрхКома 27.09); Ф1-раннер — следующая волна; core/mesh-волны
+> #370/#373/#375 — параллельные сессии. Перерисовка узлов — волной
+> Ф1-раннера.
 > Регенерирован 2026-09-15 (правило derived state): предыдущий DAG
 > августа исполнен почти полностью (БФ-волны, P1-фиксы — §3-реестр);
 > ЖИВОЙ остаток — эпик NM-трека [#197](https://github.com/vesmaro/vesmaro/issues/197)
@@ -388,7 +394,7 @@ fail-closed, never-pinnable + born no-federate, федеративное иск�
 
 ### Срезы 4+ — «Корпус → прогоны → вердикт» (E2 → E3 → АрхКом)
 
-- [ ] E2: страты корпуса (по E0-спеке), распределение-согласованный профиль
+- [x] E2: страты корпуса (по E0-спеке), распределение-согласованный профиль
   (58% чекпоинтов), re-baseline по ADR-0020 в том же PR.
   **Волна 1 ✅ 2026-09-13, [PR #276](https://github.com/vesmaro/vesmaro/pull/276)**
   (analytics-ревью approve): G-gov (100 сидов, analyzed 96 = 48×2,
@@ -398,12 +404,23 @@ fail-closed, never-pinnable + born no-federate, федеративное иск�
   закреплено тестом). Остаток: страты C/D ног (мульти-сессии 80–100,
   awareness-пары/stale-claims/канары/adversarial-peer, G-poison) —
   по готовности ног; E3-runner + pre-run обязательства [#277](https://github.com/vesmaro/vesmaro/issues/277).
-- [ ] E3: прогоны A/B/B0; затем C1 (после smoke mnema-refine #223) и D
-  (после awareness v0) — по предрегистрированным воротам; факториалы B×C1
-  и B×D только после индивидуальных проходов.
-- [ ] Вердикт каждого эксперимента → обратно в АрхКом (созывает Tech Lead
-  по итогам E3); C2/C3 и «организм»-нарратив — по метрикам, отдельными
-  решениями владельца.
+  **Волна 2 ✅ 2026-09-13, [PR #286](https://github.com/vesmaro/vesmaro/pull/286)**
+  (ревью approve после ремонта P1-слепоты id-префиксов): D-страты — 80
+  конфликтных пар 40/40 ceteris-paribus + 40 stale (20/20), 200 канарок
+  false-drop 0, adversarial-peer (4 hostile moves), #224-replay 57.9% через
+  реальный движок; нейтральные ds-hash/a-shuffle/dm-hash ids.
+- [x] E3: прогоны A/B/B0 — **записаны 2026-09-14**
+  (`e3-lanes-56c568297ad6`; D-runner + type-2 40→80 —
+  [PR #294](https://github.com/vesmaro/vesmaro/pull/294), run-ledger —
+  [PR #296](https://github.com/vesmaro/vesmaro/pull/296)). Ноги C1/D НЕ
+  гонялись: C1 — за smoke mnema-refine
+  [#223](https://github.com/vesmaro/vesmaro/issues/223); D-раннер готов,
+  прогон D-ноги — за нейро-треком (D-behavioral, главный эксперимент);
+  факториалы B×C1 и B×D сняты с повестки фальсификацией lanes.
+- [x] Вердикт lanes → АрхКом **2026-09-14** (`c7db3c37`): фальсификация
+  РАТИФИЦИРОВАНА (см. §3, вердикт-волна); ADR-0025 → FALSIFIED.
+  Вердикты C/D-ног — по факту их прогонов; C2/C3 и «организм»-нарратив —
+  по метрикам, отдельными решениями владельца.
 
 ### Правила исполнения (связывают все срезы)
 
@@ -454,27 +471,41 @@ flowchart TD
 
 ### Чеклист эпика
 
-- [ ] **Ф0 — композиция без схемы** (первая пользовательская ценность:
+- [x] **Ф0 — композиция без схемы** (первая пользовательская ценность:
       один агент · несколько задач · один смешанный корпус · чистое
       переключение):
-  - [ ] семантика иерархии скоупов project×agent×session×task — доктрина
+  - [x] семантика иерархии скоупов project×agent×session×task — доктрина
         ADR-0027 (наследование = пересечение, не объединение);
-  - [ ] расширение тег-контракта префиксом `task:`
+  - [x] расширение тег-контракта префиксом `task:`
         (`^task:[a-z0-9_-]{1,64}$`; валидация + доки EN/RU синхронно) —
         контрактное расширение оформить явно, решение комитета уже есть;
-  - [ ] doc-группировка: metadata `{doc_id, chunk_idx, heading_path}`
+  - [x] doc-группировка: metadata `{doc_id, chunk_idx, heading_path}`
         поверх существующих колонок `file_path`/`source_url` (нулевая
         миграция);
-  - [ ] кодовый линза-пресет (фигура фильтр-профилей): детерминированная
+  - [x] кодовый линза-пресет (фигура фильтр-профилей): детерминированная
         query-conditioned функция корпус→проекция; только сужает
         admissibility; НЕ пинится в top-of-context;
-  - [ ] опциональный `task`-параметр `assemble_context` (только хвост;
+  - [x] опциональный `task`-параметр `assemble_context` (только хвост;
         префиксы не трогать — инвариант №1 ADR-0027).
+      **✅ СДАНО 2026-09-20**: срез 1 [PR #356](https://github.com/vesmaro/vesmaro/pull/356)
+      (`task:`-тег + doc-metadata) + срез 2 [PR #360](https://github.com/vesmaro/vesmaro/pull/360)
+      (код-линза + хвостовой `task`-параметр + write-валидация).
 - [ ] **Ф1 — предрегистрация + прогон** (гейт; канон E0/E3-runner,
       run-ledger): руки A/B/C (C — честный tag-фильтр, не чучело);
       primary = per-context recall@k на per-query-gold; коридоры:
       cross-context recall ≥ базлайна, шум чужого контекста ≤ порога,
       tokens-per-task ≤ базлайна; только per-stratum отчётность.
+      **Статус 2026-09-20:** предрегистрация ЗАМОРОЖЕНА
+      ([#365](https://github.com/vesmaro/vesmaro/pull/365) →
+      `docs/experiments/f1-task-scope.md`: 4 руки A0/A/B/C, решётка
+      вердиктов закрыта; окно порогов закроет первый `--record`);
+      код-харднинг влит [#367](https://github.com/vesmaro/vesmaro/pull/367)
+      (lens-signal hardening, `\Z`-якоря, agent-predicate guards; хвост
+      #368 = гейт перед lens default-enablement). СЛЕДУЮЩАЯ ВОЛНА:
+      Ф1-раннер (`benchmarks/experiments/f1_task_scope/`, strata по §4.3
+      канона, фиксированные параметры как §8 pre-run ревизии; якорный
+      квартет мощностей MUST-reproduce); прогон `--record` — после 27.09 /
+      команды владельца.
 - [ ] **Ф2 — примитив за флагом** (только при PASS; default-off; миграции
       последними; повторный секрет-скан кросс-контекстных сборок в том же
       PR; дефолт-он = отдельное решение владельца).
