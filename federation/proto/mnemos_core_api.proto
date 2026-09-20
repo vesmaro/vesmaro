@@ -76,11 +76,29 @@ message ListMemoriesRequest {
 
   // ISO 8601 UTC timestamp — only records created at or after this time
   // are returned. Empty = no lower bound (used for incremental refresh).
+  // LEGACY resume path (pre-ADR-0020 meshes): ignored whenever
+  // `resume_cursor` is non-empty.
   string since = 6;
 
   // Maximum number of records to return in one response. 0 = mnemos default
   // (the server caps to a sane bound). The mesh uses has_more to paginate.
   int32 limit = 7;
+
+  // Opaque resume checkpoint previously minted by mnemos-core in
+  // ListMemoriesResponse.cursor (ADR-0020). OWNER: mnemos-core — the mesh
+  // persists and replays it byte-for-byte and must NOT parse, validate, or
+  // generate it (criterion 1 — dumb transport).
+  //
+  // Semantics:
+  //   * non-empty → TAKES PRIORITY over `since` (since is ignored);
+  //     core returns records strictly AFTER the checkpoint, with the same
+  //     scope filters as the original listing.
+  //   * empty → legacy behaviour (`since`-driven incremental refresh;
+  //     pre-ADR-0020 meshes keep working unchanged).
+  //   * unknown format / malformed / not minted by this core →
+  //     INVALID_ARGUMENT. Never silently reinterpreted, never guessed:
+  //     the mesh then degrades to a fresh subscribe (empty resume_cursor).
+  string resume_cursor = 8;
 }
 
 // ListMemoriesResponse — page of CompactRecord bodies from mnemos.
@@ -94,8 +112,25 @@ message ListMemoriesResponse {
   int32 total = 2;
 
   // True if more pages are available. The mesh should re-call
-  // ListMemories with an adjusted `since`/`limit` to fetch the next page.
+  // ListMemories with `resume_cursor` set to the last minted cursor (or,
+  // on legacy meshes, an adjusted `since`/`limit`) to fetch the next page.
   bool has_more = 3;
+
+  // Opaque continuation checkpoint minted by mnemos-core (ADR-0020,
+  // archcom 2026-09-20). Semantics: "everything matching this filter up to
+  // and including this checkpoint has been delivered in this response" —
+  // replaying it in ListMemoriesRequest.resume_cursor yields exactly the
+  // not-yet-delivered remainder.
+  //
+  // OWNER: mnemos-core. The format is core-private and may change between
+  // core versions WITHOUT a wire break. The mesh echoes it byte-for-byte:
+  // persist it, replay it, never parse it (criterion 1).
+  //
+  //   * non-empty iff this response contains >= 1 record;
+  //   * empty response → empty cursor = "nothing new" (an old core without
+  //     this field also yields "" — the mesh degrades to fresh-subscribe,
+  //     already implemented in mesh v1.1.1).
+  string cursor = 4;
 }
 
 // ImportMode — mirrors the mnemos_import MCP tool modes (merge / restore).

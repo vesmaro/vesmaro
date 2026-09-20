@@ -2280,6 +2280,73 @@ class SQLiteStore:
         params.extend([limit, offset])
         return [self._row_to_memory(r) for r in conn.execute(q, params).fetchall()]
 
+    def list_all_for_mesh(
+        self,
+        limit: int = 50,
+        *,
+        projects: list[str] | None = None,
+        tags: list[str] | None = None,
+        since: str | None = None,
+        after_rowid: int = 0,
+    ) -> list[tuple[Memory, int]]:
+        """Mesh export listing with storage rowids, ordered for cursor resume.
+
+        Serves :rpc:`MnemosCore.ListMemories` (ADR-0020 cursor contract).
+        Unlike :meth:`list_all` this returns ``(memory, rowid)`` pairs and
+        orders by ``rowid ASC`` — a forward walk in storage-revision order,
+        so every page boundary is a valid opaque-cursor checkpoint: resuming
+        with ``rowid > checkpoint`` yields exactly the undelivered remainder
+        (no dupes, no gaps across projects — the rowid space is global).
+
+        Args:
+            limit: Maximum rows to fetch (caller passes page_limit + 1 to
+                detect ``has_more``).
+            projects: Project slugs to restrict to (SQL ``IN``). ``None``
+                or empty = no project filter (the caller has already
+                applied the peer ACL intersection).
+            tags: Require ALL of these tags (same ``json_each`` semantics
+                as :meth:`list_all`).
+            since: Legacy ISO lower bound on ``created_at`` (ignored by
+                the caller when a resume checkpoint is present).
+            after_rowid: Only rows with ``rowid > after_rowid`` (ADR-0020
+                resume path; ``0`` = no bound).
+
+        Scope stability on resume is the CALLER's duty: widening the
+        project/tag scope after a checkpoint silently skips rows with
+        ``rowid <= checkpoint`` that the narrower walk never delivered —
+        inherent to rowid cursors (ADR-0020), so the caller must replay a
+        cursor only against the scope it was minted for.
+
+        Known limitation (accepted for Phase 0, ADR-0020): SQLite reuses a
+        deleted max rowid for the next insert, so deleting the row a
+        cursor points at could let one new row slip past a resume. Closing
+        that needs a monotonic-sequence migration (DBA/archcom decision),
+        tracked with the ADR-0020 rollout notes.
+        """
+        conn = self._get_conn()
+        q = "SELECT rowid AS _mesh_rowid, * FROM memories WHERE 1=1"
+        params: list[Any] = []
+        if projects:
+            placeholders = ", ".join("?" for _ in projects)
+            q += f" AND project IN ({placeholders})"
+            params.extend(projects)
+        if tags:
+            for tag in tags:
+                q += " AND EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?)"
+                params.append(tag)
+        if since:
+            q += " AND created_at >= ?"
+            params.append(since)
+        if after_rowid > 0:
+            q += " AND rowid > ?"
+            params.append(after_rowid)
+        q += " ORDER BY rowid ASC LIMIT ?"
+        params.append(limit)
+        pairs: list[tuple[Memory, int]] = []
+        for row in conn.execute(q, params).fetchall():
+            pairs.append((self._row_to_memory(row), int(row["_mesh_rowid"])))
+        return pairs
+
     def list_recent_for_agent(
         self,
         agent: str,

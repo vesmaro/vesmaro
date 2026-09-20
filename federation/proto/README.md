@@ -24,8 +24,8 @@ drift, **compact.py wins** and the proto is amended.
 
 | File | Purpose |
 |---|---|
-| `federation.proto` | Peer-to-peer API (mesh A ↔ mesh B). `package mnemos.federation.v1`. Three RPCs: `Pull`, `SyncMetadata`, `Subscribe` (server streaming). Defines `CompactRecord`, `MetadataRecord`, `TriggerCodes`, and the Pull/Sync/Subscribe request/response messages. |
-| `mnemos_core_api.proto` | mesh ↔ mnemos core API over Unix socket + gRPC. `package mnemos.core.v1`. Four RPCs: `ListMemories`, `WriteMemory`, `GetSubscriptionState`, `Heartbeat`. mnemos is the source of truth for storage + moderation; mesh is transport only. |
+| `federation.proto` | Peer-to-peer API (mesh A ↔ mesh B). `package mnemos.federation.v1`. Three RPCs: `Pull`, `SyncMetadata`, `Subscribe` (server streaming). Defines `CompactRecord` (incl. `revision` = 12, ADR-0021 Q10.6 storage-revision reserve), `MetadataRecord`, `TriggerCodes`, and the Pull/Sync/Subscribe request/response messages. The Pull leg transports the ADR-0020 opaque cursor end-to-end (`PullRequest.cursor` = 6 request echo, `PullResponse.cursor` = 6 core-minted checkpoint; empty = full pass / pre-cursor peer). |
+| `mnemos_core_api.proto` | mesh ↔ mnemos core API over Unix socket + gRPC. `package mnemos.core.v1`. Four RPCs: `ListMemories`, `WriteMemory`, `GetSubscriptionState`, `Heartbeat`. mnemos is the source of truth for storage + moderation; mesh is transport only. ADR-0020 cursor contract: `ListMemoriesRequest.resume_cursor` = 8 (opaque, core-owned, priority over `since`, garbage → `INVALID_ARGUMENT`), `ListMemoriesResponse.cursor` = 4 (opaque checkpoint minted by core; mesh echoes byte-for-byte; empty = legacy fresh-subscribe). |
 
 ## SemVer policy
 
