@@ -9,6 +9,13 @@ tests cover:
 * :rpc:`ListMemories` returns seeded records (moderation-processed).
 * :rpc:`ListMemories` with a disallowed ``project_scope`` → ACL refuses
   (empty response, ``PERMISSION_DENIED``).
+* :rpc:`ListMemories` cursor contract (ADR-0020): non-empty page mints a
+  stable opaque cursor; empty page mints ""; resume by a fresh cursor
+  returns EXACTLY the new records; resume_cursor takes priority over
+  ``since``; garbage/foreign cursors → ``INVALID_ARGUMENT``; the legacy
+  ``since`` path still filters; cursor-walk pagination partitions the
+  corpus (no dupes, no gaps); records carry ``revision`` (storage rowid,
+  ADR-0021 Q10.6) monotonic across the page.
 * :rpc:`WriteMemory` writes to SQLite (verified via a direct DB query).
 * :rpc:`WriteMemory` with a disallowed scope → ``PERMISSION_DENIED``.
 * :rpc:`WriteMemory` idempotency (#359): replays return
@@ -417,6 +424,163 @@ class TestListMemories:
         )
         for rec in response.records:
             assert "mnemos:no-federate" not in list(rec.tags)
+
+
+# ── ListMemories cursor contract (ADR-0020) ──────────────────────────────────
+
+
+class TestListMemoriesCursors:
+    """ADR-0020: core mints opaque cursors, resumes exactly, rejects garbage."""
+
+    def _list(self, server: MeshServer, **kwargs: Any) -> Any:
+        """Call ListMemories on the running server with optional fields."""
+        _wait_for_server(server)
+        stub = _stub(server)
+        return stub.ListMemories(
+            _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT], **kwargs),
+            timeout=2.0,
+        )
+
+    @staticmethod
+    def _seed(servicer: Any, title: str, *, tag: str = "mnemos:decision") -> None:
+        """Add one federable memory through the servicer's manager."""
+        servicer._manager.add(
+            MemoryCreate(
+                content=f"Cursor-test content for {title}.",
+                title=title,
+                tags=[f"project:{_PROJECT}", f"agent:{_AGENT}", tag],
+                source=MemorySource.MANUAL,
+            ),
+            project=_PROJECT,
+            agent=_AGENT,
+        )
+
+    def test_mints_nonempty_stable_cursor(self, server: MeshServer) -> None:
+        """Non-empty response → non-empty cursor; a repeated call mints the
+        same cursor (deterministic mint from the same storage position)."""
+        first = self._list(server)
+        assert len(first.records) >= 2
+        assert first.cursor, "non-empty page must mint a non-empty cursor"
+        second = self._list(server)
+        assert second.cursor == first.cursor
+
+    def test_empty_page_mints_empty_cursor(self, server: MeshServer) -> None:
+        """A filter matching nothing → 0 records and an EMPTY cursor
+        (byte-identical to a pre-ADR-0020 core: old-mesh fresh-subscribe)."""
+        response = self._list(server, types=["nonexistent-type"])
+        assert len(response.records) == 0
+        assert response.cursor == ""
+        assert response.has_more is False
+
+    def test_revision_stamped_monotonic(self, server: MeshServer) -> None:
+        """Every exported record carries revision > 0 (the storage rowid,
+        ADR-0021 Q10.6) and revisions strictly increase across the page
+        (rowid-ASC forward walk)."""
+        response = self._list(server)
+        assert len(response.records) >= 2
+        revisions = [rec.revision for rec in response.records]
+        assert all(r > 0 for r in revisions)
+        assert revisions == sorted(revisions)
+        assert len(set(revisions)) == len(revisions)
+
+    def test_resume_returns_exactly_new_records(self, server: MeshServer) -> None:
+        """Resume by a fresh cursor → EXACTLY the records added after the
+        checkpoint (no dupes of the delivered set, no gaps)."""
+        baseline = self._list(server)
+        assert len(baseline.records) >= 2
+        served_ids = {rec.id for rec in baseline.records}
+        servicer = server.servicer
+        assert servicer is not None
+        for i in range(3):
+            self._seed(servicer, f"Post-checkpoint decision {i}")
+        resumed = self._list(server, resume_cursor=baseline.cursor)
+        new_ids = {rec.id for rec in resumed.records}
+        assert len(resumed.records) == 3
+        assert new_ids.isdisjoint(served_ids)
+        assert resumed.cursor and resumed.cursor != baseline.cursor
+        # Fully caught up: resuming by the newest cursor → nothing new.
+        caught_up = self._list(server, resume_cursor=resumed.cursor)
+        assert len(caught_up.records) == 0
+        assert caught_up.cursor == ""
+
+    def test_resume_priority_over_since(self, server: MeshServer) -> None:
+        """A non-empty resume_cursor IGNORES `since` (ADR-0020: checkpoint
+        takes priority) — even a since in the far future must not zero the
+        resumed page."""
+        baseline = self._list(server)
+        servicer = server.servicer
+        assert servicer is not None
+        self._seed(servicer, "Priority-over-since decision")
+        resumed = self._list(
+            server,
+            resume_cursor=baseline.cursor,
+            since="2999-01-01T00:00:00",
+        )
+        assert len(resumed.records) == 1
+
+    def test_garbage_resume_cursor_rejected(self, server: MeshServer) -> None:
+        """Malformed/foreign cursors → INVALID_ARGUMENT, never a silent
+        empty page (ADR-0020 rule 3)."""
+        import base64
+        import json as _json
+
+        wrong_version = (
+            base64.urlsafe_b64encode(_json.dumps({"v": 2, "rowid": 1}).encode())
+            .rstrip(b"=")
+            .decode()
+        )
+        not_an_int = (
+            base64.urlsafe_b64encode(_json.dumps({"v": 1, "rowid": "one"}).encode())
+            .rstrip(b"=")
+            .decode()
+        )
+        not_json = base64.urlsafe_b64encode(b"not json at all").rstrip(b"=").decode()
+        for garbage in ("garbage", not_json, wrong_version, not_an_int):
+            _wait_for_server(server)
+            stub = _stub(server)
+            with pytest.raises(grpc.RpcError) as exc_info:
+                stub.ListMemories(
+                    _mesh_gen.core_pb2.ListMemoriesRequest(
+                        projects=[_PROJECT],
+                        resume_cursor=garbage,
+                    ),
+                    timeout=2.0,
+                )
+            assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT, garbage
+
+    def test_since_path_still_filters(self, server: MeshServer) -> None:
+        """Legacy `since` behaviour is unchanged (pre-ADR-0020 meshes):
+        a far-past bound returns the full set, a far-future bound returns
+        nothing (with an empty cursor)."""
+        all_records = self._list(server, since="2000-01-01T00:00:00")
+        assert len(all_records.records) >= 2
+        none_records = self._list(server, since="2999-01-01T00:00:00")
+        assert len(none_records.records) == 0
+        assert none_records.cursor == ""
+
+    def test_cursor_pagination_round_trip(self, server: MeshServer) -> None:
+        """Full sync by walking resume cursors: pages partition the corpus
+        exactly (no dupes, no gaps) and the walk terminates."""
+        servicer = server.servicer
+        assert servicer is not None
+        for i in range(5):
+            self._seed(servicer, f"Pagination decision {i}")
+        seen: list[str] = []
+        cursor = ""
+        pages = 0
+        while True:
+            response = self._list(server, limit=2, resume_cursor=cursor)
+            seen.extend(rec.id for rec in response.records)
+            pages += 1
+            if not response.has_more:
+                break
+            assert response.cursor, "has_more page must mint a continuation cursor"
+            cursor = response.cursor
+            assert pages <= 10, "pagination did not terminate"
+        total_expected = len(self._list(server).records)
+        assert pages >= 3  # 5+2 seeded records at limit=2 must span >= 3 pages
+        assert len(seen) == total_expected
+        assert len(set(seen)) == len(seen), "pages must not overlap"
 
 
 # ── WriteMemory ──────────────────────────────────────────────────────────────

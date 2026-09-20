@@ -93,6 +93,26 @@ message CompactRecord {
   // fields land here first in compact.py, then mirror to proto).
   reserved 9, 10, 11;
   reserved "schema_version";
+
+  // Storage revision of the source record at export time (ADR-0021
+  // ruling Q10.6, archcom 2026-09-20: the `revision` field is reserved in
+  // proto BEFORE S2 starts — LWW-by-timestamp conflict resolution accrues
+  // conflict debt from the first sync, so the monotonic-per-record
+  // revision must exist on the wire before any sync mode consumes it).
+  //
+  // Semantics: monotonically increasing per record id; the value is the
+  // exporting mnemos's storage revision (SQLite rowid of the source
+  // memory row at export time). 0 = unknown / not provided (legacy
+  // exporter). Peers MUST treat 0 as "no revision information", NOT as
+  // revision zero. Consumers may compare revisions only for the SAME
+  // record id minted by the SAME source core.
+  //
+  // Proto-side-only field (deliberate exception to the "mirror
+  // compact.py 1:1" rule, recorded here): `revision` carries STORAGE
+  // provenance filled by the exporter at marshal time; it is not part of
+  // the hand-written Pydantic envelope (the mesh never parses it —
+  // criterion 1, dumb transport).
+  int64 revision = 12;
 }
 
 // MetadataRecord — lighter index-only record for metadata-sync.

@@ -13,10 +13,14 @@ Architectural role (ArchCom 2026-07-17 federation contract):
       and does NOT duplicate the ACL. The ACL GATE lives here (Q4
       decision): this server returns ``PERMISSION_DENIED`` for any
       ``project_scope`` the caller is not allowed to access.
-    * **Cursor storage is mesh-side** (Q3 decision). This server's
-      :rpc:`GetSubscriptionState` returns an empty cursor; durable
-      cursor persistence belongs to the mesh (M5). MnemosCore does NOT
-      store subscription cursors.
+    * **Cursor ownership is split mint/persist** (Q3 + ADR-0020,
+      archcom 2026-09-20). This server MINTS opaque
+      ``ListMemoriesResponse.cursor`` checkpoints and validates
+      ``resume_cursor`` (garbage → ``INVALID_ARGUMENT``); durable cursor
+      PERSISTENCE stays mesh-side — the mesh echoes the token
+      byte-for-byte and never parses it (criterion 1).
+      :rpc:`GetSubscriptionState` still returns an empty cursor (Q3;
+      ``SetSubscriptionState`` deferred by ADR-0020 rule 7).
 
 Transport:
     Unix socket + gRPC (criterion 8). The socket path comes from
@@ -57,6 +61,8 @@ Security notes:
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import time
@@ -96,6 +102,68 @@ _DEFAULT_PAGE_SIZE: int = 50
 #: hostile mesh from requesting the entire corpus in one RPC.
 _MAX_PAGE_SIZE: int = 500
 
+#: Cursor format version (ADR-0020). The wire cursor is an OPAQUE string
+#: owned by mnemos-core; the version tag inside the payload lets core
+#: evolve the format later without a wire break — a core that mints v2
+#: still rejects v1-and-older tokens only by choice, not by accident.
+_CURSOR_VERSION: int = 1
+
+
+class CursorError(ValueError):
+    """A resume cursor is malformed, foreign, or of an unknown format.
+
+    Raised by :func:`_parse_resume_cursor`; the servicer maps it to
+    ``INVALID_ARGUMENT`` (ADR-0020 rule 3: garbage is rejected loudly —
+    never silently reinterpreted, never guessed; the mesh degrades to a
+    fresh subscribe).
+    """
+
+
+def _mint_cursor(rowid: int) -> str:
+    """Mint an opaque resume checkpoint for a delivered storage position.
+
+    Format (CORE-PRIVATE — opaque to the mesh, do not change without
+    bumping :data:`_CURSOR_VERSION`):
+    ``base64url(json({"v": 1, "rowid": <int>}).encode("utf-8"))``, unpadded.
+
+    Semantics: "records up to and including this storage rowid have been
+    delivered for this filter". Resuming yields rows with ``rowid >``
+    the checkpoint (see :func:`_parse_resume_cursor` and
+    ``SQLiteStore.list_all_for_mesh``). ``rowid <= 0`` mints an EMPTY
+    cursor ("nothing delivered yet" — byte-identical to a pre-ADR-0020
+    core, so old meshes degrade to fresh-subscribe for free).
+    """
+    if rowid <= 0:
+        return ""
+    payload = json.dumps({"v": _CURSOR_VERSION, "rowid": int(rowid)}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).rstrip(b"=").decode("ascii")
+
+
+def _parse_resume_cursor(cursor: str) -> int:
+    """Validate an opaque resume cursor and return its rowid checkpoint.
+
+    Inverse of :func:`_mint_cursor`. Strict by contract (ADR-0020 rule 3):
+    anything that is not EXACTLY a cursor this core format defines —
+    non-base64, non-JSON, wrong structure, unknown ``v``, non-positive or
+    non-integer ``rowid`` — raises :class:`CursorError` → the RPC fails
+    with ``INVALID_ARGUMENT`` instead of returning a silently-empty page.
+    """
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = base64.urlsafe_b64decode(padded.encode("ascii"))
+        decoded = json.loads(payload)
+    except ValueError as exc:  # binascii.Error, UnicodeError, JSONDecodeError ⊂ ValueError
+        raise CursorError(f"malformed resume cursor: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise CursorError("malformed resume cursor: not a core cursor object")
+    version = decoded.get("v")
+    if version != _CURSOR_VERSION:
+        raise CursorError(f"unsupported resume cursor version: {version!r}")
+    rowid = decoded.get("rowid")
+    if not isinstance(rowid, int) or isinstance(rowid, bool) or rowid <= 0:
+        raise CursorError(f"invalid resume cursor checkpoint: {rowid!r}")
+    return rowid
+
 
 def _trigger_code_to_proto(code: TriggerCode) -> Any:
     """Map a :class:`TriggerCode` to the generated ``TriggerCodes`` enum.
@@ -109,12 +177,16 @@ def _trigger_code_to_proto(code: TriggerCode) -> Any:
     return getattr(_mesh_gen.fed_pb2.TriggerCodes, code.value)
 
 
-def _compact_to_proto(record: CompactRecord) -> Any:
+def _compact_to_proto(record: CompactRecord, *, revision: int = 0) -> Any:
     """Marshal a :class:`CompactRecord` to the protobuf ``CompactRecord``.
 
     Mirrors :func:`vesmaro.mesh_client._compact_to_proto` so the server
     and client agree on the wire shape. The record is already
     moderation-processed by the time it reaches this layer.
+
+    ``revision`` (ADR-0021 Q10.6) is the STORAGE revision of the source
+    memory row (SQLite rowid) at export time — proto-side-only provenance
+    the Pydantic envelope does not carry. ``0`` (default) = unknown.
     """
     return _mesh_gen.fed_pb2.CompactRecord(
         id=record.id,
@@ -125,6 +197,7 @@ def _compact_to_proto(record: CompactRecord) -> Any:
         tags=list(record.tags),
         source_agent=record.source_agent,
         timestamp=record.timestamp,
+        revision=int(revision),
     )
 
 
@@ -221,7 +294,9 @@ class MnemosCoreServicer:
     The servicer holds a reference to the :class:`MemoryManager` (for
     SQLite access + moderation) and the :class:`Settings` (for ACL +
     federation thresholds). It is stateless beyond those references —
-    no per-RPC state, no cursors (Q3: cursors are mesh-side).
+    no per-RPC state, no STORED cursors (Q3: persistence is mesh-side;
+    ADR-0020 cursors are minted per-response from storage positions, so
+    core keeps no cursor state at all).
 
     The servicer is constructed by :class:`MeshServer` and registered on
     the gRPC server via ``add_MnemosCoreServicer_to_server``. It is safe
@@ -286,16 +361,27 @@ class MnemosCoreServicer:
         """Export moderation-processed :class:`CompactRecord` bodies.
 
         The mesh calls this on startup/refresh to materialise the local
-        view of what mnemos is willing to federate. Steps (contract §3.1):
+        view of what mnemos is willing to federate. Steps (contract §3.1,
+        ADR-0020 cursor contract):
 
         1. Resolve the caller's peer. Enforce the ACL on every
            ``project`` in the request.
-        2. Query :class:`SQLiteStore.list_all` with the filter fields.
-        3. Exclude ``mnemos:no-federate`` records (defence-in-depth
+        2. Validate ``resume_cursor`` when non-empty: garbage →
+           ``INVALID_ARGUMENT`` (ADR-0020 rule 3 — never a silent empty
+           page). A valid checkpoint takes PRIORITY over ``since`` and
+           resumes strictly AFTER the checkpointed storage position.
+        3. Query :class:`SQLiteStore.list_all_for_mesh` (rowid ASC walk)
+           with the filter fields — one query over the ACL-intersected
+           project set, so a page boundary is a project-global checkpoint.
+        4. Exclude ``mnemos:no-federate`` records (defence-in-depth
            layer 3 — moderation would refuse them anyway).
-        4. Build :class:`CompactRecord` via
-           :func:`vesmaro.compact.build_compact_record` (runs moderation).
-        5. Return a page with ``total`` + ``has_more``.
+        5. Build :class:`CompactRecord` via
+           :func:`vesmaro.compact.build_compact_record` (runs moderation)
+           and stamp ``revision`` with the source rowid (ADR-0021 Q10.6).
+        6. Return a page with ``total`` + ``has_more`` + an opaque
+           ``cursor`` checkpoint minted from the last delivered rowid
+           (non-empty iff the page is non-empty; empty page → empty
+           cursor, byte-identical to a pre-ADR-0020 core).
         """
         projects = list(request.projects) if request.projects else []
         project_scope = projects[0] if projects else ""
@@ -308,9 +394,29 @@ class MnemosCoreServicer:
             logger.info("mesh_server: ListMemories refused — no peer identity")
             context.set_code(grpc.StatusCode.PERMISSION_DENIED)
             context.set_details("no peer identity and not exactly one peer configured")
-            return _mesh_gen.core_pb2.ListMemoriesResponse(records=[], total=0, has_more=False)
+            return _mesh_gen.core_pb2.ListMemoriesResponse(
+                records=[], total=0, has_more=False, cursor=""
+            )
         if project_scope and self._check_acl(peer_id, project_scope, context) is None:
-            return _mesh_gen.core_pb2.ListMemoriesResponse(records=[], total=0, has_more=False)
+            return _mesh_gen.core_pb2.ListMemoriesResponse(
+                records=[], total=0, has_more=False, cursor=""
+            )
+
+        # ADR-0020 resume path: validate the opaque checkpoint BEFORE any
+        # query. Garbage/foreign cursors are rejected loudly so the mesh
+        # degrades to a fresh subscribe (empty resume_cursor) instead of
+        # silently misinterpreting the token.
+        checkpoint_rowid = 0
+        if request.resume_cursor:
+            try:
+                checkpoint_rowid = _parse_resume_cursor(request.resume_cursor)
+            except CursorError as exc:
+                logger.info("mesh_server: ListMemories rejected resume_cursor (%s)", exc)
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details(f"invalid resume_cursor: {exc}")
+                return _mesh_gen.core_pb2.ListMemoriesResponse(
+                    records=[], total=0, has_more=False, cursor=""
+                )
 
         allowed_projects = self._allowed_projects_for_peer(peer_id)
         effective_projects = self._intersect_projects(projects, allowed_projects)
@@ -318,7 +424,10 @@ class MnemosCoreServicer:
         tags_include = list(request.tags_include) if request.tags_include else None
         tags_exclude = list(request.tags_exclude) if request.tags_exclude else None
         include_no_federate = bool(request.include_no_federate)
-        since = request.since or None
+        # Resume takes priority over `since` (ADR-0020): a resuming caller
+        # must not re-apply a stale timestamp bound on top of the
+        # checkpoint — the checkpoint already encodes the position.
+        since = None if checkpoint_rowid else (request.since or None)
         page_limit = _clamp_page_limit(int(request.limit))
         # Fetch one extra row to detect has_more without a second query.
         fetch_limit = page_limit + 1
@@ -326,52 +435,58 @@ class MnemosCoreServicer:
         records: list[Any] = []
         total_seen = 0
         has_more = False
-        # When no projects are requested (effective_projects is empty),
-        # query with no project filter (None = all projects the peer may
-        # see; the ACL already passed for the scope, and an empty request
-        # is the mesh asking for "everything this peer is allowed").
-        projects_to_query: list[str | None] = (
-            list(effective_projects) if effective_projects else [None]
+        last_delivered_rowid = 0
+        # One query over the ACL-intersected project set (empty =
+        # "everything this peer is allowed", mirroring the pre-cursor
+        # semantics) — a single rowid-ASC walk keeps every page boundary a
+        # valid project-global resume checkpoint.
+        rows = self._manager.sqlite.list_all_for_mesh(
+            limit=fetch_limit,
+            projects=list(effective_projects) if effective_projects else None,
+            tags=tags_include,
+            since=since,
+            after_rowid=checkpoint_rowid,
         )
-        for project in projects_to_query:
-            memories = self._manager.sqlite.list_all(
-                limit=fetch_limit,
-                project=project,
-                tags=tags_include,
-                since=since,
-            )
-            for memory in memories:
-                total_seen += 1
-                if len(records) >= page_limit:
-                    has_more = True
-                    break
-                # Defence-in-depth: exclude no-federate records unless the
-                # caller explicitly opted in (operator debug only).
-                if not include_no_federate and NO_FEDERATE_TAG in memory.tags:
-                    continue
-                # Apply tags_exclude filter.
-                if tags_exclude and any(t in memory.tags for t in tags_exclude):
-                    continue
-                # Apply type filter if the request specifies types.
-                if request.types:
-                    rec_type = _memory_type_for_filter(memory.tags)
-                    if rec_type not in request.types:
-                        continue
-                # Build compact record (runs moderation → may refuse).
-                rec = build_compact_record(
-                    memory,
-                    source_agent=memory.agent or "unknown",
-                    refuse_threshold=self._settings.federation.moderation_refuse_threshold,
-                )
-                if rec is None:
-                    continue
-                records.append(_compact_to_proto(rec))
-            if has_more or len(records) >= page_limit:
+        for memory, rowid in rows:
+            total_seen += 1
+            if len(records) >= page_limit:
+                has_more = True
                 break
+            # Defence-in-depth: exclude no-federate records unless the
+            # caller explicitly opted in (operator debug only).
+            if not include_no_federate and NO_FEDERATE_TAG in memory.tags:
+                continue
+            # Apply tags_exclude filter.
+            if tags_exclude and any(t in memory.tags for t in tags_exclude):
+                continue
+            # Apply type filter if the request specifies types.
+            if request.types:
+                rec_type = _memory_type_for_filter(memory.tags)
+                if rec_type not in request.types:
+                    continue
+            # Build compact record (runs moderation → may refuse).
+            rec = build_compact_record(
+                memory,
+                source_agent=memory.agent or "unknown",
+                refuse_threshold=self._settings.federation.moderation_refuse_threshold,
+            )
+            if rec is None:
+                continue
+            records.append(_compact_to_proto(rec, revision=rowid))
+            last_delivered_rowid = rowid
+        cursor = _mint_cursor(last_delivered_rowid)
+        if checkpoint_rowid:
+            logger.info(
+                "mesh_server: ListMemories resume checkpoint=%d → %d records, cursor=%s",
+                checkpoint_rowid,
+                len(records),
+                bool(cursor),
+            )
         return _mesh_gen.core_pb2.ListMemoriesResponse(
             records=records,
             total=total_seen,
             has_more=has_more,
+            cursor=cursor,
         )
 
     # ── RPC: WriteMemory ───────────────────────────────────────────────────
