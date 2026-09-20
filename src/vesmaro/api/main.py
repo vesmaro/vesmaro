@@ -1191,6 +1191,10 @@ class HooksRequest(BaseModel):
     context_hint: str | None = None
     file: str | None = None
     budget: int = Field(default=2048, ge=1, le=1_000_000)
+    # pre_llm_call (ADR-0027 Phase 0, epic #308) — the bare task slug;
+    # narrows recall to rows carrying task:<slug> (intersection
+    # doctrine, tail-only). Ignored by the other actions.
+    task: str | None = None
     # on_session_start
     limit: int = Field(default=5, ge=1, le=100)
     # post_tool_call
@@ -1230,6 +1234,7 @@ async def run_hook(action: str, req: HooksRequest) -> dict[str, Any]:
             context_hint=req.context_hint,
             file=req.file,
             budget=req.budget,
+            task=req.task,
             limit=req.limit,
             tool_name=req.tool_name,
             output_text=req.output_text,

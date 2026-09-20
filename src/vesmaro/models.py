@@ -230,8 +230,13 @@ _AGENT_RE = re.compile(r"^agent:[a-z0-9_\-]{1,64}$")
 # ADR-0027 Phase 0 (epic #308): the optional task-scope tag. Same slug
 # alphabet/length as project/agent. Zero or one per record — a record
 # belongs to at most one task scope (see validate_tag_contract docstring
-# for the intersection doctrine).
-_TASK_RE = re.compile(r"^task:[a-z0-9_\-]{1,64}$")
+# for the intersection doctrine). The bare-slug pattern is public
+# (single source): ``assemble_context(task=...)`` validates its argument
+# against exactly the alphabet the tag contract will accept when the
+# slug is threaded through as ``task:<slug>``.
+_TASK_SLUG_PATTERN = r"[a-z0-9_\-]{1,64}"
+TASK_SLUG_RE: re.Pattern[str] = re.compile(rf"^{_TASK_SLUG_PATTERN}$")
+_TASK_RE = re.compile(rf"^task:{_TASK_SLUG_PATTERN}$")
 _VESMARO_RE = re.compile(r"^mnemos:[a-z][a-z0-9\-]*$")
 
 
@@ -659,6 +664,22 @@ class MemoryCreate(BaseModel):
     # Allow override for path-scoped rules ingest (M8) and migrations (M13)
     status: MemoryStatus = MemoryStatus.RAW
 
+    @field_validator("metadata")
+    @classmethod
+    def _validate_doc_grouping(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """ADR-0027 Phase 0 (epic #308, slice-1 review item 1) — write-side
+        doc-grouping validation at the DTO boundary.
+
+        The convention is all-or-nothing: a metadata dict carrying ANY of
+        ``{doc_id, chunk_idx, heading_path}`` must carry all three
+        well-formed, or construction fails (a persisted half-triple would
+        split a document silently once the Phase-3 reader groups by
+        ``doc_id``). Dicts without any convention key pass untouched —
+        the metadata column stays free-form for everything else.
+        """
+        doc_grouping_from_metadata(v)
+        return v
+
 
 class RuleIngestRequest(BaseModel):
     """Request body for POST /rules/ingest."""
@@ -697,6 +718,17 @@ class MemoryUpdate(BaseModel):
     quality_score: float | None = None
     confidence: float | None = None
     cluster_id: str | None = None
+
+    @field_validator("metadata")
+    @classmethod
+    def _validate_doc_grouping(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        """MemoryUpdate twin of ``MemoryCreate._validate_doc_grouping`` —
+        an external ``metadata=`` REPLACES the dict wholesale (see
+        ``MemoryManager.update``), so the replacement dict validates at
+        construction exactly like a create would."""
+        if v is not None:
+            doc_grouping_from_metadata(v)
+        return v
 
 
 class SearchQuery(BaseModel):

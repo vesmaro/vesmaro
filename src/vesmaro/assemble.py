@@ -97,6 +97,27 @@ silently):
   no worker threads, no persistence.
 * contentType (addendum 1): ``code`` / ``prose`` filter recall candidates
   by stored content type (delivery defaults to sync).
+
+ADR-0027 Phase 0 multi-context parameters (epic #308, both optional,
+both TAIL-ONLY — invariant 1: the provenance format, the per-block
+CacheAligner alignment and every pinned prefix are untouched; both
+narrow the per-call assembled tail and nothing else):
+
+* ``task`` — the bare task slug. Recall narrows to rows carrying
+  ``task:<slug>`` via the search ``tags`` filter: the INTERSECTION
+  doctrine (project x agent x session x task — a task condition only
+  narrows, never widens). The narrowing binds to the RRF knowledge leg,
+  the graph edge leg (slice-1 gates) and — symmetrically — the
+  governance lanes leg. Task-scoped queries get no project soft
+  fallback (slice 1). Default ``None``: no ``task`` keys anywhere, the
+  pre-Phase-0 output.
+* ``lens`` — a code-defined preset (:mod:`vesmaro.lens`): a
+  deterministic QUERY-CONDITIONED projection over the recalled corpus
+  that only narrows admissibility (E3 banned query-blind composition as
+  a class — a lens decides from the effective query whether it is
+  active at all). Never reorders, never pins into the top-of-context
+  (#248 open). Definitions are code under review, never caller input;
+  default ``None``: identity projection, no ``lens`` keys anywhere.
 """
 
 from __future__ import annotations
@@ -120,7 +141,8 @@ from vesmaro.lanes import (
     is_governance,
     lane_sort_key,
 )
-from vesmaro.models import Memory
+from vesmaro.lens import Lens, lens_active, lens_admits, resolve_lens
+from vesmaro.models import TASK_SLUG_RE, Memory
 
 if TYPE_CHECKING:
     from vesmaro.manager import MemoryManager
@@ -308,6 +330,8 @@ def _recall_stage(
     query: str | None = None,
     lanes_enabled: bool = False,
     type_boost: bool = False,
+    task: str | None = None,
+    lens: Lens | None = None,
 ) -> tuple[list[_Candidate], dict[str, Any]]:
     """Hybrid RRF recall (status-gated) + contentType filter + applyTo pinning.
 
@@ -320,6 +344,26 @@ def _recall_stage(
     ``context_hint`` — what the upcoming model call is about) overrides
     the derived term on both legs; it is one term richer, not a
     different pipeline.
+
+    ADR-0027 Phase 0 task scoping (``task`` — the bare slug, optional):
+    the recall narrows to rows carrying ``task:<slug>`` via the search
+    ``tags`` filter — the INTERSECTION doctrine (project x agent x
+    session x task): a task tag only narrows, never widens, so rows
+    without the task tag (including task-less rows) are inadmissible in
+    a task-scoped assembly. The narrowing binds identically to the
+    RRF knowledge leg (``MemoryManager.search`` post-fusion tags gate),
+    to the graph edge leg (same gate, slice-1 pinned) and — for
+    symmetry — to the governance lanes leg below (a task-scoped
+    assembly never surfaces a row the task-less assembly would not).
+    The project soft fallback does NOT apply to task-scoped queries
+    (slice 1): zero rows in a task scope is information, not drift.
+
+    ADR-0027 Phase 0 lens preset (``lens`` — a code-defined
+    :class:`~vesmaro.lens.Lens`, optional): a deterministic
+    query-conditioned projection applied to the collected candidates
+    AFTER both legs — order-preserving, only narrowing, never pinned
+    (see ``vesmaro.lens`` for the invariant rationale). Inactive for
+    the effective query → identity projection (no filtering).
 
     A9 (ArchCom 2026-08-27): ``MemoryManager.search`` enforces the project
     predicate pre-RRF on both legs (native store filter + authoritative
@@ -351,17 +395,30 @@ def _recall_stage(
     """
     derived_query = query if query else (Path(file).stem if file else project)
 
-    results = mgr.search(query=derived_query, project=project, limit=RECALL_DEPTH)
+    # ADR-0027 task scoping rides the EXISTING tags filter — no new
+    # search surface, the intersection semantics are the tag contract's.
+    search_tags: list[str] | None = [f"task:{task}"] if task else None
+
+    results = mgr.search(query=derived_query, project=project, limit=RECALL_DEPTH, tags=search_tags)
 
     fallbacks = [0]
     candidates: list[_Candidate] = []
     type_filtered = 0
     governance_excluded = 0
     type_boosted = 0
+    task_lane_filtered = 0
 
     if lanes_enabled:
         lane_hits, lane_counts = governance_lanes_recall(mgr, project=project)
         for memory, lane in lane_hits:
+            # Task narrowing binds to the lanes leg too (intersection
+            # doctrine, symmetric with the RRF/graph tags gate): a
+            # governance row without the assembly's task tag is outside
+            # the task's admissibility set. With lanes off (default)
+            # this loop never runs; with no task it is a no-op.
+            if task and f"task:{task}" not in memory.tags:
+                task_lane_filtered += 1
+                continue
             ct = _content_type_of(memory, fallbacks=fallbacks)
             if content_type is not None and ct != content_type:
                 type_filtered += 1
@@ -411,6 +468,25 @@ def _recall_stage(
         # matching rules to the absolute top (B0 must not break M8).
         candidates.sort(key=lambda c: -c.score)
 
+    # ── ADR-0027 Phase 0 lens projection (optional) ────────────────────
+    # Pure order-preserving filter over the collected candidates (both
+    # legs): the lens decides from the EFFECTIVE query whether it is
+    # active and then keeps only its target content_type. Runs after
+    # candidate collection and before the applyTo partition so it never
+    # reorders (invariant: a lens may only narrow — no re-ranking, no
+    # pinning; #248 stays open). ``lens=None`` (default) skips the whole
+    # block — byte-identical to the pre-Phase-0 output.
+    lens_filtered = 0
+    lens_active_for_query = lens_active(lens, query=derived_query) if lens is not None else False
+    if lens is not None and lens_active_for_query:
+        kept: list[_Candidate] = []
+        for cand in candidates:
+            if lens_admits(lens, query=derived_query, content_type=cand.content_type):
+                kept.append(cand)
+            else:
+                lens_filtered += 1
+        candidates = kept
+
     pinned = 0
     if file:
         if lanes_enabled:
@@ -453,10 +529,27 @@ def _recall_stage(
             "knowledge": sum(1 for c in candidates if c.lane == Lane.KNOWLEDGE.value),
             "governance_excluded_from_knowledge": governance_excluded,
         }
+        if task:
+            # Additive only when BOTH flags/params are in play — the
+            # lanes-off default never sees this key.
+            stats["lanes"]["task_filtered"] = task_lane_filtered
     if type_boost:
         # B0 telemetry — additive only when on, same discipline as the
         # lanes stats key (flag-off stats dicts stay byte-identical).
         stats["type_boost"] = {"boosted": type_boosted, "factor": B0_TYPE_BOOST_FACTOR}
+    if task:
+        # ADR-0027 task telemetry — additive only when the task scope is
+        # active; the default (no task) result dict carries no task keys.
+        stats["task_scoped"] = True
+    if lens is not None:
+        # Lens telemetry — additive only when a lens was selected;
+        # ``active`` records whether the effective query activated it
+        # (an inactive lens is the identity projection: filtered == 0).
+        stats["lens"] = {
+            "name": lens.value,
+            "active": lens_active_for_query,
+            "filtered": lens_filtered,
+        }
     return candidates, stats
 
 
@@ -768,6 +861,8 @@ def assemble_context(
     async_handle: str | None = None,
     agent: str | None = None,
     query: str | None = None,
+    task: str | None = None,
+    lens: str | Lens | None = None,
 ) -> dict[str, Any]:
     """Assemble the model-facing context block (ADR-0017 D1 contract).
 
@@ -801,23 +896,56 @@ def assemble_context(
             entries instead of guessing from the slug. Blank strings are
             rejected at the boundary (pass ``None`` for the derived
             fallback).
+        task: ADR-0027 Phase 0 — optional task scope (the BARE slug, the
+            ``task:`` prefix is added internally; ``[a-z0-9_-]{1,64}``).
+            Narrows recall to rows carrying ``task:<slug>`` (intersection
+            doctrine — a task condition only narrows, never widens) and
+            composes the per-call assembled tail only: the provenance
+            format, the CacheAligner prefix-stability contract and every
+            pinned prefix are untouched (ADR-0027 invariant 1). Rows
+            without the task tag (including task-less rows) are
+            inadmissible in a task-scoped assembly; the project soft
+            fallback is suppressed for task-scoped queries (slice 1).
+        lens: ADR-0027 Phase 0 — optional code-defined lens preset
+            (:class:`~vesmaro.lens.Lens` member or its value string; any
+            other name raises). A deterministic query-conditioned
+            projection over the recalled corpus that only narrows
+            admissibility — never reorders, never pins into the
+            top-of-context (#248), never widens. Default ``None`` = no
+            lens, byte-identical pipeline.
 
     Returns:
         The ContextBlock dict: ``text`` (provenance-wrapped blocks joined
         by blank lines), per-``blocks`` detail with provenance + redaction
         counts + expanded CCR origin hashes (``ccr_hashes``), ``tokens``
-        stats, and per-``stats`` stage telemetry. For ``mode="async"``
-        only a handle envelope is returned; the full result comes back on
-        the next call with ``async_handle``.
+        stats, and per-``stats`` stage telemetry. ``task`` / ``lens``
+        keys are ECHOED only when the respective parameter was given
+        (additive-only: the default result dict shape is unchanged). For
+        ``mode="async"`` only a handle envelope is returned; the full
+        result comes back on the next call with ``async_handle``.
 
     Raises:
         ValueError: Invalid ``session`` / ``project`` / ``mode`` / ``budget``
-        / ``query``, an unknown ``async_handle``, or an ``async_handle``
-        owned by a different session (boundary validation).
+        / ``query`` / ``task`` / ``lens``, an unknown ``async_handle``, or
+        an ``async_handle`` owned by a different session (boundary
+        validation).
     """
     _validate(session, project, budget, mode)
     if query is not None and not query.strip():
         raise ValueError("query must be a non-empty string when provided (None = derived)")
+    resolved_lens = resolve_lens(lens)
+    if task is not None:
+        # Bare-slug boundary validation against the SAME alphabet the
+        # tag contract accepts (``TASK_SLUG_RE`` shares its pattern with
+        # the ``task:`` tag regex in models.py). A value already carrying
+        # the ``task:`` prefix is rejected with an actionable message —
+        # the prefix is this boundary's job, not the caller's.
+        if task.startswith("task:"):
+            raise ValueError(
+                f"task must be the bare slug (got {task!r} — pass {task[len('task:') :]!r})"
+            )
+        if not TASK_SLUG_RE.match(task):
+            raise ValueError(f"task must match [a-z0-9_-]{{1,64}} when provided (got {task!r})")
 
     if async_handle is not None:
         fetched = _fetch_async_result(mgr, async_handle, session)
@@ -865,6 +993,8 @@ def assemble_context(
         query=query,
         lanes_enabled=lanes_enabled,
         type_boost=type_boost,
+        task=task,
+        lens=resolved_lens,
     )
     ccr_stats = _ccr_stage(
         mgr,
@@ -905,10 +1035,18 @@ def assemble_context(
             "budget": budget_stats,
         },
     }
+    # ADR-0027 Phase 0 echoes — ADDITIVE ONLY when the respective
+    # parameter was given: the default (no task, no lens) result dict
+    # shape is byte-identical to the pre-Phase-0 output (pinned by
+    # tests; same discipline as the ``lanes`` / ``type_boost`` keys).
+    if task is not None:
+        result["task"] = task
+    if resolved_lens is not None:
+        result["lens"] = resolved_lens.value
 
     logger.info(
         "assemble_context: session=%s project=%s file=%s mode=%s content_type=%s "
-        "candidates=%d blocks=%d refused=%d tokens=%d/%d redactions=%d",
+        "candidates=%d blocks=%d refused=%d tokens=%d/%d redactions=%d task=%s lens=%s",
         session,
         project,
         file,
@@ -920,6 +1058,8 @@ def assemble_context(
         budget_stats["estimated_tokens"],
         budget,
         sum(b["redactions"] for b in blocks),
+        task,
+        resolved_lens.value if resolved_lens is not None else None,
     )
 
     if delivery == "async":

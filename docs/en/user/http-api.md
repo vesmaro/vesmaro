@@ -242,7 +242,7 @@ M2 tag contract is enforced server-side. The endpoint derives `project` and `age
 | `memory_type` | string | no | `note` | One of `note`, `fact`, `snippet`, `bookmark`, `conversation`, `session_context`. |
 | `status` | string | no | `raw` | One of `raw`, `processing`, `processed`, `published`, `archived`. |
 | `filter_profile` | string | no | — | One of `log`, `terminal`, `code`, `docs`, `web`, `default`. |
-| `metadata` | object | no | `{}` | Free-form key / value store. |
+| `metadata` | object | no | `{}` | Free-form key / value store. One reserved convention (ADR-0027 Phase 0): the doc-grouping triple `{doc_id, chunk_idx, heading_path}` is **all-or-nothing** — a metadata dict carrying any of the three keys must carry all three well-formed, otherwise the request is rejected 422 (write-side validation; a persisted half-triple would split a document once the docs-as-memory reader groups by `doc_id`). |
 | `category` | string | no | — | Free-form category label. |
 
 **Response 201** — full [`Memory`](#memory-schema) object.
@@ -679,7 +679,7 @@ validation can later prove provenance.
 
 `action` ∈ `pre_llm_call` | `on_session_start` | `post_tool_call` (unknown →
 404). Per-action fields are validated by the hooks boundary (`ValueError` →
-422): `context_hint`/`file`/`budget` for `pre_llm_call`, `limit` for
+422): `context_hint`/`file`/`budget`/`task` for `pre_llm_call`, `limit` for
 `on_session_start`, `tool_name`/`output_text`/`auto_compress`/`profile` for
 `post_tool_call`. `output_text` is capped at `hooks.max_output_chars`
 (default 1,048,576 chars, the context-rewrite caps convention; `0` disables)
@@ -694,6 +694,7 @@ validation can later prove provenance.
 | `agent` | string | **yes** | — | Caller agent slug (issuer identity). |
 | `context_hint` | string | no | — | `pre_llm_call`: explicit recall query (what the model call is about). FTS5 whole-phrase semantics: the hint is matched as ONE quoted phrase (adjacent tokens in order), not a keyword set. |
 | `file` | string | no | — | `pre_llm_call`: optional file path. |
+| `task` | string | no | — | `pre_llm_call` (ADR-0027 Phase 0): optional task scope — the bare task slug (`[a-z0-9_-]{1,64}`, no `task:` prefix). Narrows recall to entries tagged `task:<slug>` (intersection doctrine; tail-only — pinned prefixes and the provenance format are untouched). |
 | `budget` | integer | no | `2048` | `pre_llm_call`: token budget. |
 | `limit` | integer | no | `5` | `on_session_start`: checkpoint count. |
 | `tool_name` | string | `post_tool_call` | — | The tool that produced the output. |

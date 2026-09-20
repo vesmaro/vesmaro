@@ -83,6 +83,22 @@ mode): an entry belongs to at most one task — two task tags would make
 the record visible in two task scopes (a union), which the intersection
 doctrine forbids.
 
+**Task-scoped assembly (ADR-0027 Phase 0, slice 2).** The assembly side
+of the contract is the optional `task` parameter of
+`assemble_context(..., task=<slug>)` (the `pre_llm_call` hook and the
+REST/MCP hook twins thread it; SDK callers pass it through
+`MnemosSDK.assemble_context`). It takes the **bare slug** —
+`[a-z0-9_-]{1,64}`, no `task:` prefix (the prefix is added internally).
+The parameter narrows recall to entries carrying `task:<slug>` — through
+the whole six-stage pipeline (knowledge leg, graph edge leg and, when
+lanes are enabled, the governance lanes: a task-scoped assembly never
+surfaces a row the task-less assembly would not) — and composes the
+**per-call assembled tail only**: pinned prefixes, the provenance format
+and the CacheAligner prefix-stability contract are untouched (ADR-0027
+invariant 1). The result echoes `task` (and `stats.recall.task_scoped`)
+only when the parameter was given; without it the output is
+byte-identical to the pre-Phase-0 shape.
+
 ---
 ## `mnemos:no-federate` — federation exclusion marker
 

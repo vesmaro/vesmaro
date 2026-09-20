@@ -242,7 +242,7 @@ curl -s http://127.0.0.1:8000/tags
 | `memory_type` | string | нет | `note` | Одно из `note`, `fact`, `snippet`, `bookmark`, `conversation`, `session_context`. |
 | `status` | string | нет | `raw` | Одно из `raw`, `processing`, `processed`, `published`, `archived`. |
 | `filter_profile` | string | нет | — | Одно из `log`, `terminal`, `code`, `docs`, `web`, `default`. |
-| `metadata` | object | нет | `{}` | Произвольное хранилище ключей/значений. |
+| `metadata` | object | нет | `{}` | Произвольное хранилище ключей/значений. Одна зарезервированная конвенция (ADR-0027 Фаза 0): doc-группировочная тройка `{doc_id, chunk_idx, heading_path}` — **всё-или-ничего**: словарь metadata с любым из трёх ключей обязан содержать все три в корректной форме, иначе запрос отклоняется 422 (валидация на записи; неполная тройка разорвала бы документ при группировке по `doc_id` в docs-as-memory-ридере Фазы 3). |
 | `category` | string | нет | — | Произвольная метка категории. |
 
 **Ответ 201** — полный объект [`Memory`](#схема-memory-memory-schema).
@@ -682,7 +682,7 @@ curl -s -X POST http://127.0.0.1:8000/context/rewrite \
 
 `action` ∈ `pre_llm_call` | `on_session_start` | `post_tool_call` (неизвестное →
 404). Поля конкретного действия валидируются границей хуков (`ValueError` →
-422): `context_hint`/`file`/`budget` для `pre_llm_call`, `limit` для
+422): `context_hint`/`file`/`budget`/`task` для `pre_llm_call`, `limit` для
 `on_session_start`, `tool_name`/`output_text`/`auto_compress`/`profile` для
 `post_tool_call`. `output_text` ограничен капом `hooks.max_output_chars`
 (по умолчанию 1 048 576 символов, конвенция капов context-rewrite; `0`
@@ -697,6 +697,7 @@ curl -s -X POST http://127.0.0.1:8000/context/rewrite \
 | `agent` | string | **да** | — | Slug агента вызывающего (идентичность эмитента). |
 | `context_hint` | string | нет | — | `pre_llm_call`: явный recall-запрос (о чём вызов модели). Семантика FTS5 — вся подсказка матчится как ОДНА цитированная фраза (токены подряд, в порядке), а не набор ключевых слов. |
 | `file` | string | нет | — | `pre_llm_call`: опциональный путь к файлу. |
+| `task` | string | нет | — | `pre_llm_call` (ADR-0027 Фаза 0): опциональная task-область — «голый» slug задачи (`[a-z0-9_-]{1,64}`, без префикса `task:`). Сужает recall до записей с тегом `task:<slug>` (доктрина пересечения; только хвост — закреплённые префиксы и формат провенанса не тронуты). |
 | `budget` | integer | нет | `2048` | `pre_llm_call`: бюджет токенов. |
 | `limit` | integer | нет | `5` | `on_session_start`: количество чекпоинтов. |
 | `tool_name` | string | `post_tool_call` | — | Инструмент, породивший вывод. |

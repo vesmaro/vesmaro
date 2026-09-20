@@ -242,7 +242,11 @@ class MnemosSDK:
         D1 fixed pipeline (recall → optional CCR → filter → MANDATORY
         secret scan → CacheAligner → budget) with provenance on every
         injected block. ``kw`` passes through (``file``, ``budget``,
-        ``mode``, ``expand_ccr``, ``agent``, ``query``, …).
+        ``mode``, ``expand_ccr``, ``agent``, ``query``, ``task``,
+        ``lens``, …): ``task`` (ADR-0027 Phase 0) is the bare task slug
+        narrowing recall to ``task:<slug>`` rows; ``lens`` selects a
+        code-defined preset (``vesmaro.lens.Lens`` value) — both
+        optional, tail-only, absent from the result unless given.
         """
         return self._manager.assemble_context(session=session, project=project, **kw)
 
