@@ -28,6 +28,14 @@ Transport:
     the socket (unlike :class:`~vesmaro.mesh_client.MeshClient`, which
     connects to it); it is the listener for the mesh↔mnemos channel.
 
+    W2.5 dual-mode (ADR-0019 option 1, ratified archcom 2026-09-20):
+    when :attr:`vesmaro.config.MeshConfig.tcp` is enabled, the SAME
+    grpcio server additionally listens on TCP with mesh-CA mTLS —
+    :meth:`MeshServer.start` calls ``add_secure_port`` with
+    ``RequireAndVerifyClientCert`` — for the standalone mesh Deployment.
+    Default OFF; explicit opt-in only, no auto-fallback between
+    transports (ADR-0019 rejects option 2).
+
 Import strategy for generated stubs
 -----------------------------------
 Reuses :mod:`vesmaro._mesh_gen` (the same shim the client uses) to
@@ -69,6 +77,17 @@ Security notes:
       same gid. The operator is responsible for the enclosing dir
       ownership.
     * No TLS on the Unix socket — local-only transport (criterion 11).
+    * TCP leg (W2.5, ADR-0019): mTLS with the COMMON mesh CA. The server
+      presents the mnemos-core identity leaf
+      (:attr:`vesmaro.config.MeshTCPTLSConfig.cert_file`) and REQUIRES a
+      client certificate chained to the mesh CA
+      (:attr:`vesmaro.config.MeshTCPTLSConfig.ca_file`) — anonymous TLS
+      is rejected at the handshake. When the peer's
+      :attr:`vesmaro.config.PeerConfig.mtls_cert_fingerprint` is set,
+      the presented client-cert fingerprint is additionally PINNED
+      (``sha256:<hex>`` of the DER leaf, symmetric to the mesh's peer
+      leg, ``mnemos-mesh/internal/mtls``) — enforced in the servicer on
+      every data RPC over TLS connections.
     * The secrets scanner runs on :rpc:`WriteMemory` via the
       :class:`~vesmaro.manager.MemoryManager.add` Layer 1 path; a
       detected secret auto-tags ``mnemos:no-federate`` so the record is
@@ -78,9 +97,12 @@ Security notes:
 from __future__ import annotations
 
 import base64
+import contextlib
+import hashlib
 import json
 import logging
 import os
+import ssl
 import time
 from collections.abc import Sequence
 from concurrent import futures
@@ -93,7 +115,8 @@ import grpc
 from vesmaro import __version__ as _mnemos_version
 from vesmaro import _mesh_gen
 from vesmaro.compact import CompactRecord, build_compact_record
-from vesmaro.config import PeerConfig, Settings
+from vesmaro.config import MeshTCPTLSConfig, PeerConfig, Settings
+from vesmaro.federation_server import verify_mtls_fingerprint
 from vesmaro.manager import MemoryManager
 from vesmaro.models import NO_FEDERATE_TAG, MemoryCreate, MemorySource
 from vesmaro.moderation import ModerationVerdict, moderate
@@ -104,7 +127,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MeshServer", "MnemosCoreServicer"]
+__all__ = ["MeshServer", "MeshTCPLegError", "MnemosCoreServicer"]
 
 #: Default page size for :rpc:`ListMemories` when the request omits ``limit``.
 #:
@@ -144,6 +167,62 @@ class CursorError(ValueError):
     never silently reinterpreted, never guessed; the mesh degrades to a
     fresh subscribe).
     """
+
+
+class MeshTCPLegError(RuntimeError):
+    """The mesh TCP leg failed to come up (ADR-0019 amendment 3c).
+
+    Raised by :meth:`MeshServer.start` when ``add_secure_port`` fails
+    (port in use, bad address) — STARTUP FAIL-FAST: silent degradation
+    is forbidden. There is deliberately no k8s probe on 8790
+    (amendment 3c); a CrashLoop is the visibility mechanism. The
+    message names the bind address so the operator can tell port
+    collision from misconfiguration at a glance.
+    """
+
+
+#: Prefix on pinned fingerprint strings — the same convention as the
+#: mesh's peer leg (``mnemos-mesh/internal/mtls.FingerprintPrefix``):
+#: ``sha256:<hex-of-DER-leaf>``. Bare hex (no prefix) is accepted for
+#: operator convenience and normalised before the constant-time compare.
+_FINGERPRINT_PREFIX: str = "sha256:"
+
+
+def _tcp_server_credentials(tls: MeshTCPTLSConfig) -> grpc.ServerCredentials:
+    """Build the mTLS server credentials for the TCP leg (ADR-0019).
+
+    Reads the PEM material from the configured paths (NEVER hardcoded —
+    the paths are the chart's mount contract): the core-identity leaf +
+    key for the server side, and the mesh-CA bundle as the client trust
+    root with ``require_client_auth=True`` — i.e. gRPC's
+    ``RequireAndVerifyClientCert``: every caller must present a
+    certificate chaining to the mesh CA; anonymous TLS connections are
+    rejected at the handshake.
+
+    Raises:
+        MeshTCPLegError: A file is unreadable or the PEM is invalid —
+            startup fail-fast with the offending path in the message.
+    """
+    try:
+        cert = Path(tls.cert_file).read_bytes()
+        key = Path(tls.key_file).read_bytes()
+        ca = Path(tls.ca_file).read_bytes()
+    except OSError as exc:
+        raise MeshTCPLegError(
+            f"mesh tcp leg: cannot read TLS material "
+            f"(cert={tls.cert_file!r} key={tls.key_file!r} ca={tls.ca_file!r}): {exc}"
+        ) from exc
+    try:
+        return grpc.ssl_server_credentials(
+            [(key, cert)],
+            root_certificates=ca,
+            require_client_auth=True,
+        )
+    except RuntimeError as exc:
+        raise MeshTCPLegError(
+            f"mesh tcp leg: invalid TLS material in "
+            f"cert={tls.cert_file!r} / key={tls.key_file!r} / ca={tls.ca_file!r}: {exc}"
+        ) from exc
 
 
 def _mint_cursor(rowid: int) -> str:
@@ -387,6 +466,71 @@ class MnemosCoreServicer:
             return None
         return peer
 
+    # ── TLS fingerprint pin (W2.5 TCP leg) ─────────────────────────────────
+
+    def _enforce_tls_client_pin(
+        self,
+        peer: PeerConfig,
+        context: grpc.ServicerContext[Any, Any],
+    ) -> bool:
+        """Enforce the pinned client-cert fingerprint on TLS connections.
+
+        ADR-0019 auth model: the TLS layer (``RequireAndVerifyClientCert``)
+        guarantees every TCP caller holds a mesh-CA certificate; this pin
+        narrows it to THE pinned mesh node, symmetric to the mesh's peer
+        leg (``sha256:<hex>`` of the DER leaf). Reuses the per-peer
+        :attr:`vesmaro.config.PeerConfig.mtls_cert_fingerprint` (ADR-0016
+        semantics) and the constant-time compare from
+        :func:`vesmaro.federation_server.verify_mtls_fingerprint`.
+
+        Scope:
+
+        * Unix-socket connections (no TLS): skipped — the UDS leg is
+          guarded by filesystem permissions (criterion 11), not certs.
+        * ``mtls_cert_fingerprint is None``: skipped — the operator
+          opted out of pinning (mesh-CA chain verification at the
+          handshake still applies; the client cert is still mandatory).
+        * TLS connection, pin set, fingerprint mismatch (or no peer
+          cert visible): ``False`` — the caller has already set
+          ``PERMISSION_DENIED``. Fail-closed.
+        """
+        pin = peer.mtls_cert_fingerprint
+        if pin is None:
+            return True
+        auth = context.auth_context()
+        if not auth or not auth.get("transport_security_type"):
+            return True  # not a TLS connection (UDS leg) — pin is TCP-only
+        pem_entries = auth.get("x509_pem_cert") or []
+        if not pem_entries:
+            logger.warning(
+                "mesh_server: TLS connection without a client cert in auth_context "
+                "for pinned peer_id — refusing (fail-closed)"
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("mTLS pinning configured but no client cert on the connection")
+            return False
+        try:
+            der = ssl.PEM_cert_to_DER_cert(pem_entries[0].decode("ascii"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            logger.warning("mesh_server: unparsable client cert on TLS leg (%s)", exc)
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("client certificate could not be parsed")
+            return False
+        presented = hashlib.sha256(der).hexdigest()
+        expected = pin.strip().lower()
+        if expected.startswith(_FINGERPRINT_PREFIX):
+            expected = expected[len(_FINGERPRINT_PREFIX) :]
+        if not verify_mtls_fingerprint(presented, expected):
+            logger.warning(
+                "mesh_server: client-cert fingerprint PIN MISMATCH — refusing (fail-closed)"
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(
+                "client certificate fingerprint does not match the pinned fingerprint"
+            )
+            return False
+        return True
+
     # ── RPC: ListMemories ──────────────────────────────────────────────────
 
     def ListMemories(  # noqa: N802 -- gRPC servicer override; name dictated by generated core_pb2_grpc.MnemosCoreServicer
@@ -434,6 +578,13 @@ class MnemosCoreServicer:
             logger.info("mesh_server: ListMemories refused — no peer identity")
             context.set_code(grpc.StatusCode.PERMISSION_DENIED)
             context.set_details("no peer identity and not exactly one peer configured")
+            return _mesh_gen.core_pb2.ListMemoriesResponse(
+                records=[], total=0, has_more=False, cursor=""
+            )
+        # W2.5 TCP leg: on TLS connections, pin the caller's client-cert
+        # fingerprint to the configured peer (UDS calls skip this).
+        pin_peer = _resolve_peer(self._settings, peer_id)
+        if pin_peer is not None and not self._enforce_tls_client_pin(pin_peer, context):
             return _mesh_gen.core_pb2.ListMemoriesResponse(
                 records=[], total=0, has_more=False, cursor=""
             )
@@ -642,6 +793,15 @@ class MnemosCoreServicer:
                 mode_applied=mode_applied,
                 trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
             )
+        # W2.5 TCP leg: on TLS connections, pin the caller's client-cert
+        # fingerprint to the configured peer (UDS calls skip this).
+        pin_peer = _resolve_peer(self._settings, peer_id)
+        if pin_peer is not None and not self._enforce_tls_client_pin(pin_peer, context):
+            return _mesh_gen.core_pb2.WriteMemoryResponse(
+                written_id="",
+                mode_applied=mode_applied,
+                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            )
         # ACL GATE — fail-closed on the write path too (vesmaro#371/#369
         # family), enforced BEFORE the duplicate gate, moderation, and any
         # storage mutation:
@@ -804,6 +964,13 @@ class MnemosCoreServicer:
             return _mesh_gen.core_pb2.GetSubscriptionStateResponse(
                 cursor="", last_rev=0, last_sync_timestamp=""
             )
+        # W2.5 TCP leg: on TLS connections, pin the caller's client-cert
+        # fingerprint to the configured peer (UDS calls skip this).
+        pin_peer = _resolve_peer(self._settings, peer_id)
+        if pin_peer is not None and not self._enforce_tls_client_pin(pin_peer, context):
+            return _mesh_gen.core_pb2.GetSubscriptionStateResponse(
+                cursor="", last_rev=0, last_sync_timestamp=""
+            )
         if self._check_acl(peer_id, request.project_scope, context) is None:
             return _mesh_gen.core_pb2.GetSubscriptionStateResponse(
                 cursor="", last_rev=0, last_sync_timestamp=""
@@ -912,10 +1079,16 @@ class MnemosCoreServicer:
 class MeshServer:
     """Lifecycle wrapper around the gRPC ``MnemosCore`` server.
 
-    Binds a Unix socket, registers the :class:`MnemosCoreServicer`, and
-    exposes :meth:`start` / :meth:`stop` for clean lifecycle control.
+    Binds a Unix socket (always) and — when ``settings.mesh.tcp.enabled``
+    is set — an additional mTLS TCP port on the SAME grpcio server
+    (W2.5, ADR-0019 option 1). Registers the :class:`MnemosCoreServicer`
+    and exposes :meth:`start` / :meth:`stop` for clean lifecycle control.
     Designed to be owned by the mnemos process (or a test fixture) and
     stopped on shutdown.
+
+    A failed TCP bind raises :class:`MeshTCPLegError` from :meth:`start`
+    (fail-fast, ADR-0019 amendment 3c) — the server never comes up
+    half-alive.
 
     Args:
         socket_path: Filesystem path for the Unix socket. The server
@@ -955,11 +1128,22 @@ class MeshServer:
         self._max_workers: int = max_workers
         self._server: grpc.Server | None = None
         self._servicer: MnemosCoreServicer | None = None
+        self._tcp_bound_port: int | None = None
 
     @property
     def socket_path(self) -> str:
         """The configured Unix socket path."""
         return self._socket_path
+
+    @property
+    def tcp_bound_port(self) -> int | None:
+        """The actually-bound TCP port when the TCP leg is on, else ``None``.
+
+        Differs from the configured ``mesh.tcp.port`` only for the
+        ephemeral ``port: 0`` form (tests/diagnostics): gRPC returns the
+        OS-assigned port and it is exposed here so a client can dial it.
+        """
+        return self._tcp_bound_port
 
     @property
     def is_running(self) -> bool:
@@ -984,6 +1168,14 @@ class MeshServer:
         the same gid (Kubernetes fsGroup, compose ``user:``). In both
         cases defence-in-depth: the operator is still responsible for
         the enclosing directory ownership.
+
+        When ``settings.mesh.tcp.enabled`` is set, additionally opens the
+        mTLS TCP leg (``add_secure_port`` with mesh-CA
+        ``RequireAndVerifyClientCert`` — see
+        :func:`_tcp_server_credentials`). A failed bind raises
+        :class:`MeshTCPLegError` AFTER rolling the half-built server
+        back — startup fail-fast, no silent degradation (ADR-0019
+        amendment 3c).
         """
         if self._server is not None:
             raise RuntimeError("MeshServer already started")
@@ -1014,6 +1206,28 @@ class MeshServer:
         _mesh_gen.core_pb2_grpc.add_MnemosCoreServicer_to_server(self._servicer, self._server)
         # gRPC Unix-socket addressing: "unix:///path/to/sock".
         self._server.add_insecure_port(f"unix://{self._socket_path}")
+        # W2.5 TCP leg (ADR-0019 option 1): optional mTLS port on the SAME
+        # grpcio server. Default OFF — with mesh.tcp.enabled false this
+        # block is skipped entirely and the process opens NO TCP port.
+        tcp = self._settings.mesh.tcp
+        if tcp.enabled:
+            creds = _tcp_server_credentials(tcp.tls)
+            addr = f"{tcp.bind}:{tcp.port}"
+            try:
+                # Recent grpcio raises on a failed bind; the >=1.62 floor
+                # only returns 0 — BOTH paths must fail fast (3c).
+                bound = self._server.add_secure_port(addr, creds)
+            except RuntimeError as exc:
+                self._abort_failed_start()
+                raise MeshTCPLegError(f"mesh tcp leg: failed to bind {addr}: {exc}") from exc
+            if bound == 0:
+                self._abort_failed_start()
+                raise MeshTCPLegError(
+                    f"mesh tcp leg: add_secure_port({addr}) returned 0 — refusing to "
+                    "start with a missing TCP leg (fail-fast, ADR-0019 amendment 3c)"
+                )
+            self._tcp_bound_port = int(bound)
+            logger.info("mesh tcp leg listening on %s:%d", tcp.bind, self._tcp_bound_port)
         self._server.start()
         # Restrict the socket file perms (defence-in-depth: the socket
         # should only be accessible to the mnemos user + the mesh).
@@ -1025,6 +1239,23 @@ class MeshServer:
                 self._socket_path,
             )
         logger.info("mesh server listening on %s", self._socket_path)
+
+    def _abort_failed_start(self) -> None:
+        """Roll back a half-built server after a failed TCP-leg bind.
+
+        Crash-path cleanup only: the original :class:`MeshTCPLegError` is
+        re-raised by the caller — nothing is swallowed, the process dies
+        visibly (amendment 3c: CrashLoop = visible).
+        """
+        if self._server is not None:
+            # best-effort teardown next to a fatal error
+            with contextlib.suppress(RuntimeError):
+                self._server.stop(grace=0)
+            self._server = None
+            self._servicer = None
+        self._tcp_bound_port = None
+        with contextlib.suppress(PermissionError, FileNotFoundError):
+            Path(self._socket_path).unlink(missing_ok=True)
 
     def stop(self, *, grace: float = 1.0) -> None:
         """Stop the server and release the socket.
@@ -1039,6 +1270,7 @@ class MeshServer:
         self._server.stop(grace=grace)
         self._server = None
         self._servicer = None
+        self._tcp_bound_port = None
         # Best-effort socket cleanup. The OS reaps it when the process
         # exits, but removing it avoids a stale-file EADDRINUSE on the
         # next start (idempotent — no error if already gone).

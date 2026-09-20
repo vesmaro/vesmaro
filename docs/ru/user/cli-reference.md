@@ -475,6 +475,30 @@ mesh:
 
 При `mesh.enabled: false` (по умолчанию) команда ведёт себя ровно как раньше — только uvicorn.
 
+#### TCP-нога mesh (опционально, W2.5 dual-mode)
+
+При `mesh.tcp.enabled: true` (требует `mesh.enabled: true`) **тот же** gRPC-сервер дополнительно слушает TCP с mesh-CA mTLS (ADR-0019): каждый вызывающий обязан предъявить клиентский сертификат, цепляющийся к mesh CA (`RequireAndVerifyClientCert`) — анонимный TLS отбивается на handshake. На старте пишется одна строка: `mesh tcp leg listening on <bind>:<port>`. Неудавшийся bind роняет процесс (fail-fast, ADR-0019 поправка 3c — k8s-probe на 8790 намеренно нет). По умолчанию `bind: 127.0.0.1` — Phase 1 (сайдкар); Phase 2 (standalone mesh) открывает `0.0.0.0` + ingress-правило NetworkPolicy как явное действие оператора.
+
+```yaml
+mesh:
+  enabled: true
+  tcp:
+    enabled: true          # по умолчанию false — TCP-порта нет вовсе
+    port: 8790             # 0 = эфемерный (только тесты/диагностика)
+    bind: 127.0.0.1
+    tls:
+      # Ключ для чарта (ADR-0019 поправки 3d/3e): имя k8s Secret с листом
+      # идентичности mnemos-core (mnemos-core-grpc-tls, общий mesh CA).
+      # Для самого процесса информационное — читаются только файлы ниже.
+      existing_secret: mnemos-core-grpc-tls
+      # Смонтированные PEM-пути (из этого Secret) — контракт деплоя:
+      cert_file: /etc/mnemos/mesh-tls/tls.crt   # лист идентичности mnemos-core
+      key_file: /etc/mnemos/mesh-tls/tls.key
+      ca_file: /etc/mnemos/mesh-tls/ca.crt      # mesh CA — trust root клиентских серт
+```
+
+Опционально пинится fingerprint клиентского серта mesh-ноды на пира (`federation.peers.<id>.mtls_cert_fingerprint`, формат `sha256:<hex>` от DER-листа) — симметрично peer-ноге mesh; валидный mesh-CA серт от другой ноды тогда отклоняется с `PERMISSION_DENIED`.
+
 ### Примеры
 
 ```bash

@@ -475,6 +475,31 @@ mesh:
 
 With `mesh.enabled: false` (the default) the command behaves exactly as before — uvicorn only.
 
+#### Mesh TCP leg (optional, W2.5 dual-mode)
+
+When `mesh.tcp.enabled` is `true` (requires `mesh.enabled: true`), the **same** gRPC server additionally listens on TCP with mesh-CA mTLS (ADR-0019): every caller must present a client certificate chaining to the mesh CA (`RequireAndVerifyClientCert`) — anonymous TLS is rejected at the handshake. Startup logs one line: `mesh tcp leg listening on <bind>:<port>`. A failed bind crashes the process (fail-fast, ADR-0019 amendment 3c — there is deliberately no k8s probe on 8790). The default `bind: 127.0.0.1` is Phase 1 (sidecar); Phase 2 (standalone mesh) opens `0.0.0.0` plus a NetworkPolicy ingress rule as an explicit operator action.
+
+```yaml
+mesh:
+  enabled: true
+  tcp:
+    enabled: true          # default false — no TCP port at all when off
+    port: 8790             # 0 = ephemeral (tests/diagnostics only)
+    bind: 127.0.0.1
+    tls:
+      # Chart-facing key (ADR-0019 amendment 3d/3e): the name of the
+      # k8s Secret holding the mnemos-core identity leaf
+      # (mnemos-core-grpc-tls, common mesh CA). Informational for the
+      # process itself — it only reads the mounted files below.
+      existing_secret: mnemos-core-grpc-tls
+      # Mounted PEM paths (from that Secret) — deployment contract:
+      cert_file: /etc/mnemos/mesh-tls/tls.crt   # mnemos-core identity leaf
+      key_file: /etc/mnemos/mesh-tls/tls.key
+      ca_file: /etc/mnemos/mesh-tls/ca.crt      # mesh CA — client-cert trust root
+```
+
+Optionally pin the mesh node's client-cert fingerprint per peer (`federation.peers.<id>.mtls_cert_fingerprint`, format `sha256:<hex>` of the DER leaf) — symmetric to the mesh's peer leg; a valid mesh-CA certificate from a different node is then refused with `PERMISSION_DENIED`.
+
 ### Examples
 
 ```bash

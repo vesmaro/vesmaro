@@ -618,6 +618,107 @@ class ScannerConfig(BaseModel):
     incremental: bool = True
 
 
+class MeshTCPTLSConfig(BaseModel):
+    """TLS material for the optional mesh TCP leg (ADR-0019 option 1).
+
+    Chart-facing key alignment (ADR-0019 amendment 3d): the helm values
+    are ``mesh.tcp.tls.existingSecret`` — the app-side snake_case name
+    is :attr:`existing_secret`. The chart mounts that Secret
+    (``mnemos-core-grpc-tls``, amendment 3e: the third server-identity
+    leaf under the COMMON mesh CA) and renders the three file paths
+    below; the app itself only ever reads files, never the cluster API.
+
+    Fields:
+        existing_secret: NAME of the Kubernetes Secret holding the
+            core-identity leaf (chart-facing, amendment 3d/3e).
+            Informational for core — the process consumes only the
+            mounted file paths below. Kept so the app config mirrors
+            the chart values 1:1 and operators can cross-check the
+            render. Empty = not deployed via the chart (compose/bare).
+        cert_file: PEM file with the mnemos-core server-identity leaf
+            (from the mesh CA). Mounted from the Secret above — the
+            path is a deployment concern, never hardcoded.
+        key_file: PEM private key matching :attr:`cert_file`.
+        ca_file: PEM bundle with the mesh CA — the trust root for
+            CLIENT-certificate verification on the TCP leg
+            (``RequireAndVerifyClientCert``: every caller must present
+            a mesh-CA certificate; anonymous TLS is rejected at the
+            handshake).
+    """
+
+    existing_secret: str = Field(default="", max_length=253)
+    cert_file: str = Field(default="", max_length=4096)
+    key_file: str = Field(default="", max_length=4096)
+    ca_file: str = Field(default="", max_length=4096)
+
+
+class MeshTCPConfig(BaseModel):
+    """Optional networked TCP leg for the MnemosCore gRPC server (ADR-0019).
+
+    W2.5 dual-mode mesh: alongside the Unix-socket leg (sidecar default,
+    unchanged) the same grpcio server can expose ``MnemosCore`` over TCP
+    with mesh-CA mTLS — for the standalone mesh Deployment (Phase 2).
+    Default OFF (amendment 3d): with ``enabled: false`` (the default)
+    no TCP port is opened at all and the process behaves exactly as
+    before — byte-identical render when disabled.
+
+    Explicit choice only — no auto-fallback (ADR-0019 rejects option 2):
+    the mesh binary takes an explicit ``mnemos.transport``; a config
+    error on either side must surface, never be papered over by
+    silently switching transports. Startup fail-fast (amendment 3c):
+    a failed ``add_secure_port`` raises and crashes the process —
+    silent degradation is forbidden (there is deliberately no k8s probe
+    on 8790; CrashLoop is the visibility mechanism).
+
+    Fields:
+        enabled: Master switch for the TCP leg. Default ``False``.
+            Requires the parent ``mesh.enabled: true`` (the gRPC server
+            itself is only constructed then — validated here, at the
+            config boundary, so a ``tcp.enabled`` without ``mesh.enabled``
+            is an immediate config error, not a silently missing leg).
+        port: TCP port to listen on. Default ``8790`` (confirmed free at
+            every layer, amendment 3a). ``0`` = bind an ephemeral port
+            (tests/local diagnostics only — the actual bound port is
+            logged at startup and exposed on the running server).
+        bind: Bind address. Default ``127.0.0.1`` — Phase 1 (sidecar
+            form) per amendment 3b: loopback is not policed by
+            NetworkPolicy. Phase 2 (standalone mesh) opens
+            ``0.0.0.0`` plus an ingress rule in the mesh-owned
+            ``mnemos-mesh-peer-allow`` — an operator action, never a
+            default.
+        tls: TLS material (see :class:`MeshTCPTLSConfig`). Required in
+            full (leaf cert + key + mesh-CA bundle) when ``enabled`` —
+            there is no plaintext TCP mode on this leg.
+    """
+
+    enabled: bool = False
+    port: int = Field(default=8790, ge=0, le=65535)
+    bind: str = Field(default="127.0.0.1", max_length=253)
+    tls: MeshTCPTLSConfig = Field(default_factory=MeshTCPTLSConfig)
+
+    @model_validator(mode="after")
+    def _enabled_requires_tls_material(self) -> MeshTCPConfig:
+        """Fail-fast at the config boundary: no TLS material, no TCP leg.
+
+        ``tcp.enabled: true`` without all three TLS file paths is a
+        config error, not a runtime surprise at server start (and
+        certainly not a fallback to plaintext — that mode does not
+        exist on this leg).
+        """
+        if self.enabled:
+            missing = [
+                name for name in ("cert_file", "key_file", "ca_file") if not getattr(self.tls, name)
+            ]
+            if missing:
+                raise ValueError(
+                    "mesh.tcp.tls: "
+                    + ", ".join(missing)
+                    + " required when mesh.tcp.enabled is true "
+                    "(no plaintext TCP on this leg — ADR-0019)"
+                )
+        return self
+
+
 class MeshConfig(BaseModel):
     """mnemos-mesh gRPC client configuration (Phase 3, issue #105 M3).
 
@@ -648,12 +749,34 @@ class MeshConfig(BaseModel):
             socket is ``0600`` and the dir ``0700`` — mnemos user only.
             Additive (W2 native serve wiring): existing configs behave
             exactly as before.
+        tcp: Optional networked TCP leg on the SAME grpcio server
+            (ADR-0019 option 1, W2.5). Default OFF — see
+            :class:`MeshTCPConfig`. Additive: existing configs (no
+            ``tcp:`` section) parse unchanged and open no TCP port.
     """
 
     socket_path: str = "/run/mnemos/core.sock"
     enabled: bool = False
     timeout_s: float = Field(default=2.0, gt=0.0, le=60.0)
     socket_group_access: bool = False
+    tcp: MeshTCPConfig = Field(default_factory=MeshTCPConfig)
+
+    @model_validator(mode="after")
+    def _tcp_requires_master_switch(self) -> MeshConfig:
+        """``mesh.tcp.enabled`` without ``mesh.enabled`` is a config error.
+
+        The MnemosCore gRPC server (both legs) is only constructed when
+        ``mesh.enabled`` is true; a TCP-only opt-in would therefore be a
+        silently missing leg. Reject it at the config boundary with a
+        message that names the fix.
+        """
+        if self.tcp.enabled and not self.enabled:
+            raise ValueError(
+                "mesh.tcp.enabled requires mesh.enabled: true — the gRPC server "
+                "(both the Unix-socket and the TCP leg) only starts under the "
+                "mesh master switch"
+            )
+        return self
 
 
 # ── Issue #139: legacy short env-name compatibility ──────────────────────────
