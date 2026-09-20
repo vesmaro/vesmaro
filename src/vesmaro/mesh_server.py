@@ -108,6 +108,17 @@ _MAX_PAGE_SIZE: int = 500
 #: still rejects v1-and-older tokens only by choice, not by accident.
 _CURSOR_VERSION: int = 1
 
+#: Hard cap on the wire length of a resume cursor. A minted v1 token is
+#: ~40 chars; anything longer than this is not one of ours (padding bomb,
+#: foreign token) → :class:`CursorError` before any decode work.
+_CURSOR_MAX_LEN: int = 128
+
+#: SQLite rowid ceiling (``2**63 - 1``): passing a larger int as a bound
+#: parameter raises ``sqlite3.OverflowError`` (an UNCAUGHT error would
+#: kill the RPC with ``UNKNOWN``) — reject at the contract boundary with
+#: ``INVALID_ARGUMENT`` instead (ADR-0020 rule 3).
+_SQLITE_ROWID_MAX: int = 9223372036854775807
+
 
 class CursorError(ValueError):
     """A resume cursor is malformed, foreign, or of an unknown format.
@@ -144,10 +155,15 @@ def _parse_resume_cursor(cursor: str) -> int:
 
     Inverse of :func:`_mint_cursor`. Strict by contract (ADR-0020 rule 3):
     anything that is not EXACTLY a cursor this core format defines —
-    non-base64, non-JSON, wrong structure, unknown ``v``, non-positive or
-    non-integer ``rowid`` — raises :class:`CursorError` → the RPC fails
-    with ``INVALID_ARGUMENT`` instead of returning a silently-empty page.
+    non-base64, non-JSON, wrong structure, unknown ``v``, non-integer
+    ``rowid``, ``rowid`` outside ``[1, 2**63 - 1]`` (SQLite cannot bind a
+    larger value — an uncaught ``OverflowError`` would surface as
+    ``UNKNOWN``), or a token longer than :data:`_CURSOR_MAX_LEN` —
+    raises :class:`CursorError` → the RPC fails with ``INVALID_ARGUMENT``
+    instead of returning a silently-empty page.
     """
+    if len(cursor) > _CURSOR_MAX_LEN:
+        raise CursorError(f"resume cursor too long ({len(cursor)} > {_CURSOR_MAX_LEN})")
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
         payload = base64.urlsafe_b64decode(padded.encode("ascii"))
@@ -160,7 +176,11 @@ def _parse_resume_cursor(cursor: str) -> int:
     if version != _CURSOR_VERSION:
         raise CursorError(f"unsupported resume cursor version: {version!r}")
     rowid = decoded.get("rowid")
-    if not isinstance(rowid, int) or isinstance(rowid, bool) or rowid <= 0:
+    if (
+        not isinstance(rowid, int)
+        or isinstance(rowid, bool)
+        or not (1 <= rowid <= _SQLITE_ROWID_MAX)
+    ):
         raise CursorError(f"invalid resume cursor checkpoint: {rowid!r}")
     return rowid
 

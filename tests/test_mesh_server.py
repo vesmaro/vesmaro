@@ -520,22 +520,33 @@ class TestListMemoriesCursors:
 
     def test_garbage_resume_cursor_rejected(self, server: MeshServer) -> None:
         """Malformed/foreign cursors → INVALID_ARGUMENT, never a silent
-        empty page (ADR-0020 rule 3)."""
+        empty page (ADR-0020 rule 3).
+
+        Shapes covered: non-base64 garbage; base64 of non-JSON; a valid
+        token with an unknown format version; a non-integer rowid; a
+        rowid ABOVE the SQLite 2^63-1 ceiling (uncaught it would raise
+        OverflowError and kill the RPC with UNKNOWN — review E1); and an
+        oversized token (> 128 chars) rejected before any decode work.
+        """
         import base64
         import json as _json
 
-        wrong_version = (
-            base64.urlsafe_b64encode(_json.dumps({"v": 2, "rowid": 1}).encode())
-            .rstrip(b"=")
-            .decode()
-        )
-        not_an_int = (
-            base64.urlsafe_b64encode(_json.dumps({"v": 1, "rowid": "one"}).encode())
-            .rstrip(b"=")
-            .decode()
-        )
-        not_json = base64.urlsafe_b64encode(b"not json at all").rstrip(b"=").decode()
-        for garbage in ("garbage", not_json, wrong_version, not_an_int):
+        def _token(payload: bytes) -> str:
+            return base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+
+        wrong_version = _token(_json.dumps({"v": 2, "rowid": 1}).encode())
+        not_an_int = _token(_json.dumps({"v": 1, "rowid": "one"}).encode())
+        not_json = _token(b"not json at all")
+        rowid_overflow = _token(_json.dumps({"v": 1, "rowid": 2**63}).encode())
+        oversized = "A" * 129
+        for garbage in (
+            "garbage",
+            not_json,
+            wrong_version,
+            not_an_int,
+            rowid_overflow,
+            oversized,
+        ):
             _wait_for_server(server)
             stub = _stub(server)
             with pytest.raises(grpc.RpcError) as exc_info:

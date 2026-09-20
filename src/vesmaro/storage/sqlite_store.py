@@ -2311,6 +2311,12 @@ class SQLiteStore:
             after_rowid: Only rows with ``rowid > after_rowid`` (ADR-0020
                 resume path; ``0`` = no bound).
 
+        Scope stability on resume is the CALLER's duty: widening the
+        project/tag scope after a checkpoint silently skips rows with
+        ``rowid <= checkpoint`` that the narrower walk never delivered —
+        inherent to rowid cursors (ADR-0020), so the caller must replay a
+        cursor only against the scope it was minted for.
+
         Known limitation (accepted for Phase 0, ADR-0020): SQLite reuses a
         deleted max rowid for the next insert, so deleting the row a
         cursor points at could let one new row slip past a resume. Closing

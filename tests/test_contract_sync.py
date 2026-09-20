@@ -62,6 +62,17 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 #: Path to the federation proto contract.
 _PROTO_FILE = _REPO_ROOT / "federation" / "proto" / "federation.proto"
 
+#: Proto-side-only CompactRecord fields — live wire fields with NO Pydantic
+#: counterpart BY DESIGN (allow-listed here so the drift tests stay green).
+#:
+#:   * ``revision`` (ADR-0021 ruling Q10.6, archcom 2026-09-20): reserved
+#:     in proto BEFORE S2 starts; carries STORAGE provenance (SQLite rowid
+#:     at export) filled by the exporter at proto-marshal time, so it is
+#:     deliberately absent from the hand-written Pydantic envelope — the
+#:     mesh never parses it (criterion 1, dumb transport). See the
+#:     ``CompactRecord.revision`` field comment in federation.proto.
+_PROTO_ONLY_FIELDS: frozenset[str] = frozenset({"revision"})
+
 # ── Proto parsing ────────────────────────────────────────────────────────────
 
 #: Matches a single proto field declaration inside a message body.
@@ -298,9 +309,12 @@ def test_compact_record_field_names_match(
 
     Field names use snake_case on both sides (proto convention + Pydantic
     convention), so no name transformation is applied — a direct set
-    comparison catches drift in either direction.
+    comparison catches drift in either direction. Fields listed in
+    :data:`_PROTO_ONLY_FIELDS` are excluded from the proto side (live
+    wire fields with no Pydantic counterpart by design, e.g. the ADR-0021
+    Q10.6 ``revision`` reserve).
     """
-    proto_names = set(proto_compact_fields)
+    proto_names = set(proto_compact_fields) - _PROTO_ONLY_FIELDS
     py_names = set(pydantic_compact_fields)
 
     missing_in_pydantic = proto_names - py_names
@@ -367,9 +381,11 @@ def test_compact_record_field_order_matches(
     in field-name, type semantics, and field order"*. Field order matters
     for proto wire compatibility (tag numbers) and for human readability
     of the contract — a reordered field set is a contract drift even when
-    names and types still agree.
+    names and types still agree. Proto-side-only fields
+    (:data:`_PROTO_ONLY_FIELDS`) are appended after the mirrored block
+    and are filtered out before the comparison.
     """
-    proto_order = list(proto_compact_fields)
+    proto_order = [f for f in proto_compact_fields if f not in _PROTO_ONLY_FIELDS]
     py_order = list(pydantic_compact_fields)
     if proto_order != py_order:
         pytest.fail(

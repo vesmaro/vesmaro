@@ -230,6 +230,17 @@ message PullRequest {
   // Trigger code of the response this request expects/extends. Used by
   // the receiver to detect ALREADY_EXHAUSTED repeats (contract §9/§10).
   TriggerCodes trigger_code = 5;
+
+  // Opaque resume token originally minted by mnemos-core
+  // (ListMemoriesResponse.cursor, ADR-0020, archcom 2026-09-20). The
+  // peer leg transports it byte-for-byte — never parses, validates, or
+  // generates it (criterion 1 — dumb transport). Empty = full pass
+  // (fresh pull): the #34 disaster-recovery one-shot semantics are
+  // preserved. Incremental pull replays the last token the responding
+  // core minted; a token the receiving core rejects as garbage surfaces
+  // as that core's INVALID_ARGUMENT — the caller then degrades to a
+  // full pass, same as an empty cursor.
+  string cursor = 6;
 }
 
 // PullResponse — B's answer to a PullRequest.
@@ -258,6 +269,16 @@ message PullResponse {
   // response was recorded under (contract §10). A may surface this in its
   // own audit trail for cross-peer forensics.
   string access_log_entry_id = 5;
+
+  // Opaque continuation checkpoint minted by the RESPONDING mnemos-core
+  // (ADR-0020, archcom 2026-09-20) — the pull-leg echo of the core's
+  // ListMemories cursor. The client persists it and replays it in
+  // PullRequest.cursor for incremental pulls; the mesh transports it
+  // byte-for-byte and never parses it (criterion 1). Empty = the
+  // responding peer runs a pre-cursor core (or minted nothing for this
+  // page) → the client degrades to a full pass, the same degradation an
+  // old core produces on the mesh↔mnemos leg.
+  string cursor = 6;
 }
 
 // MetadataSyncRequest — poll-based metadata sync (watermark-driven).
