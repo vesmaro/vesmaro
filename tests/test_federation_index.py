@@ -7,12 +7,26 @@ Covers the meta-mirror phase-1 substrate + the two registered RPCs:
   mesh_nodes pattern: idempotent CREATE at connect, no SEED wipe —
   pre-existing data survives).
 * Storage methods — ``upsert_index_entries`` (idempotent replay,
-  LWW-by-timestamp, Q10.9 import gates), ``list_index`` (rowid-ASC
-  resume walk, project/origin/since filters, no-federate exclusion),
-  ``purge_origin``.
+  LWW-by-timestamp, Q10.9 import gates, origin-mutation guard — review
+  blocker 1/CWE-284: conflict-path mutations only from the stored
+  origin, transit of NEW ids allowed, stored origin never rewritten),
+  ``list_index`` (rowid-ASC resume walk, project/origin/since filters,
+  no-federate exclusion), ``purge_origin``.
+* Timestamp anti-poisoning — review blocker 2:
+  ``canonical_metadata_timestamp`` unit coverage (ISO-8601 → canonical
+  fixed-width UTC, future-slack gate, unparseable reject) plus RPC
+  legs (far-future/unparseable → ``rejected_by_gate``; ``+03:00``
+  canonicalised; same-instant-different-tz LWW-neutral; a lexically
+  bigger but chronologically older offset LOSES).
+* Cross-origin security matrix over real gRPC with three ACL'd senders
+  (attacker A / origin B / relay C): reviewer probes T1 (cross-origin
+  tombstone censorship) and T2 (self-claim attribution capture) are
+  rejected with the row untouched; transit INSERT accepted while a
+  non-origin replay with edits is rejected; the origin's own mutation
+  still lands.
 * ``build_metadata_entry`` — local-memory → index-row synthesis
   (origin='self'), no-federate exclusion, moderation-refuse exclusion,
-  title ≤ 256.
+  project-less exclusion (review nit 2), title ≤ 256.
 * ``MnemosCoreServicer.build_metadata_sync_response`` — the
   SyncMetadata RPC body, exercised with REAL generated ``fed_pb2``
   messages: ACL fail-closed matrix, watermark pagination stability
@@ -37,6 +51,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -49,8 +64,10 @@ from vesmaro import _mesh_gen
 from vesmaro.compact import (
     CONTENT_STATE_TOMBSTONED,
     METADATA_SCHEMA,
+    TIMESTAMP_FUTURE_SLACK,
     FederationIndexEntry,
     build_metadata_entry,
+    canonical_metadata_timestamp,
     title_matches_blocklist,
 )
 from vesmaro.config import FederationConfig, PeerConfig, Settings
@@ -69,8 +86,19 @@ _PROJECT = "test-project"
 _PROJECT_DENIED = "project-secret"
 _PEER_ID = "mnemos-A"
 _REMOTE_ORIGIN = "mnemos-B"
+_PEER_ID_C = "mnemos-C"
 _AGENT = "gcw-test-agent"
 _TOKEN_ENV = "VESMARO_FED_PEER_TEST_TOKEN"
+
+
+def _peer_cfg(allowed: list[str] | None = None) -> PeerConfig:
+    """A PeerConfig with the test token and the given project ACL."""
+    return PeerConfig(
+        bearer_token_env=_TOKEN_ENV,
+        allowed_projects=allowed if allowed is not None else [_PROJECT],
+        allowed_types=["decision", "learning"],
+        rate_limit_per_minute=600,
+    )
 
 
 def _entry(
@@ -105,6 +133,7 @@ def _settings(
     allowed: list[str] | None = None,
     shared: list[str] | None = None,
     title_blocklist: list[str] | None = None,
+    peers: dict[str, PeerConfig] | None = None,
 ) -> Settings:
     """Settings with one configured peer + an isolated store."""
     settings = Settings(
@@ -118,14 +147,7 @@ def _settings(
             "scanner": {"enabled": False},
             "federation": FederationConfig(
                 shared_projects=shared if shared is not None else [_PROJECT],
-                peers={
-                    _PEER_ID: PeerConfig(
-                        bearer_token_env=_TOKEN_ENV,
-                        allowed_projects=allowed if allowed is not None else [_PROJECT],
-                        allowed_types=["decision", "learning"],
-                        rate_limit_per_minute=600,
-                    ),
-                },
+                peers=peers if peers is not None else {_PEER_ID: _peer_cfg(allowed)},
                 **(
                     {"index_title_blocklist": title_blocklist}
                     if title_blocklist is not None
@@ -210,7 +232,7 @@ class TestSchemaMigration:
         # memories survived the reopen (no wipe).
         assert conn.execute("SELECT count(*) FROM memories").fetchone()[0] >= 0
         # And the table is immediately usable.
-        assert reopened.upsert_index_entries([_entry()]) == 1
+        assert reopened.upsert_index_entries([_entry()]).written == 1
         reopened.close()
 
 
@@ -219,8 +241,10 @@ class TestSchemaMigration:
 
 class TestUpsertIndexEntries:
     def test_insert_counts_and_stamps_received_at(self, store: SQLiteStore) -> None:
-        written = store.upsert_index_entries([_entry("fed:r:1"), _entry("fed:r:2")])
-        assert written == 2
+        stats = store.upsert_index_entries([_entry("fed:r:1"), _entry("fed:r:2")])
+        assert stats.written == 2
+        assert stats.refused == 0
+        assert stats.stale == 0
         rows = store.list_index()
         assert len(rows) == 2
         for entry, _rowid in rows:
@@ -236,10 +260,11 @@ class TestUpsertIndexEntries:
         store.upsert_index_entries(
             [_entry("fed:r:1", title="Newer", timestamp="2026-09-05T00:00:00Z")]
         )
-        written = store.upsert_index_entries(
+        stats = store.upsert_index_entries(
             [_entry("fed:r:1", title="Older", timestamp="2026-09-01T00:00:00Z")]
         )
-        assert written == 0  # stale — silently dropped
+        assert stats.written == 0  # stale — silently dropped
+        assert stats.stale == 1
         (entry, _rowid) = store.list_index()[0]
         assert entry.title == "Newer"
 
@@ -247,42 +272,223 @@ class TestUpsertIndexEntries:
         store.upsert_index_entries(
             [_entry("fed:r:1", title="Older", timestamp="2026-09-01T00:00:00Z")]
         )
-        written = store.upsert_index_entries(
+        stats = store.upsert_index_entries(
             [_entry("fed:r:1", title="Newer", timestamp="2026-09-05T00:00:00Z")]
         )
-        assert written == 1
+        assert stats.written == 1
         (entry, _rowid) = store.list_index()[0]
         assert entry.title == "Newer"
 
     def test_import_gate_no_federate_refused(self, store: SQLiteStore) -> None:
-        written = store.upsert_index_entries(
+        stats = store.upsert_index_entries(
             [_entry("fed:r:1", tags=["project:test-project", "mnemos:no-federate"])]
         )
-        assert written == 0
+        assert stats.written == 0
+        assert stats.refused == 1
         assert store.list_index() == []
 
     def test_import_gate_title_blocklist_refused(self, store: SQLiteStore) -> None:
-        written = store.upsert_index_entries(
+        stats = store.upsert_index_entries(
             [_entry("fed:r:1", title="Internal secret sprint plan")],
             title_blocklist=[r"secret\s+sprint"],
         )
-        assert written == 0
+        assert stats.written == 0
+        assert stats.refused == 1
         assert store.list_index() == []
 
     def test_one_bad_entry_does_not_abort_batch(self, store: SQLiteStore) -> None:
-        written = store.upsert_index_entries(
+        stats = store.upsert_index_entries(
             [
                 _entry("fed:r:1", tags=["project:p", "mnemos:no-federate"]),
                 _entry("fed:r:2"),
             ]
         )
-        assert written == 1
+        assert stats.written == 1
+        assert stats.refused == 1
         assert [e.id for e, _ in store.list_index()] == ["fed:r:2"]
 
     def test_content_state_tombstoned_round_trips(self, store: SQLiteStore) -> None:
         store.upsert_index_entries([_entry("fed:r:1", content_state=CONTENT_STATE_TOMBSTONED)])
         (entry, _rowid) = store.list_index()[0]
         assert entry.content_state == CONTENT_STATE_TOMBSTONED
+
+
+# ── origin-mutation guard (review blocker 1, CWE-284) ────────────────────────
+
+
+class TestOriginMutationGuard:
+    """Archcom ruling «index mutations come from the origin only;
+    available transit is allowed»: on the CONFLICT path the sender must
+    BE the stored origin; on the INSERT path transit stays allowed."""
+
+    def test_t1_cross_origin_tombstone_rejected(self, store: SQLiteStore) -> None:
+        """Reviewer probe T1: an ACL-authenticated peer A re-sends a
+        foreign id claiming origin=B with a tombstone and a newer
+        timestamp — the censorship vector. Must be refused, row intact."""
+        store.upsert_index_entries([_entry("fed:r:v1", timestamp="2021-06-01T10:00:00Z")])
+        stats = store.upsert_index_entries(
+            [
+                _entry(
+                    "fed:r:v1",
+                    content_state=CONTENT_STATE_TOMBSTONED,
+                    timestamp="2021-06-02T10:00:00Z",
+                )
+            ],
+            sender_peer_id=_PEER_ID,
+        )
+        assert stats.written == 0
+        assert stats.refused == 1
+        (entry, _rowid) = store.list_index()[0]
+        assert entry.content_state == "available"  # NOT tombstoned
+        assert entry.title == "Remote decision"  # untouched
+        assert entry.origin_peer == _REMOTE_ORIGIN  # attribution intact
+
+    def test_t2_self_claim_on_foreign_row_rejected(self, store: SQLiteStore) -> None:
+        """Reviewer probe T2: peer A claims origin='self' (re-stamped to
+        A) on B's id to capture attribution and retitle the row."""
+        store.upsert_index_entries([_entry("fed:r:v1", timestamp="2021-06-01T10:00:00Z")])
+        stats = store.upsert_index_entries(
+            [
+                _entry(
+                    "fed:r:v1",
+                    origin_peer="self",
+                    title="Hijacked title",
+                    timestamp="2021-06-02T10:00:00Z",
+                )
+            ],
+            sender_peer_id=_PEER_ID,
+        )
+        assert stats.written == 0
+        assert stats.refused == 1
+        (entry, _rowid) = store.list_index()[0]
+        assert entry.title == "Remote decision"  # row not touched
+        assert entry.origin_peer == _REMOTE_ORIGIN  # never re-stamped
+
+    def test_origin_sender_may_mutate_own_row(self, store: SQLiteStore) -> None:
+        """The legitimate leg still works: B's own update arrives as a
+        self-claim re-stamped to the sender B → mutation lands, origin
+        is preserved (never rewritten)."""
+        store.upsert_index_entries(
+            [_entry("fed:r:v1", timestamp="2021-06-01T10:00:00Z")],
+            sender_peer_id=_REMOTE_ORIGIN,
+        )
+        stats = store.upsert_index_entries(
+            [
+                _entry(
+                    "fed:r:v1",
+                    origin_peer="self",
+                    content_state=CONTENT_STATE_TOMBSTONED,
+                    timestamp="2021-06-02T10:00:00Z",
+                )
+            ],
+            sender_peer_id=_REMOTE_ORIGIN,
+        )
+        assert stats.written == 1
+        assert stats.refused == 0
+        (entry, _rowid) = store.list_index()[0]
+        assert entry.content_state == CONTENT_STATE_TOMBSTONED
+        assert entry.origin_peer == _REMOTE_ORIGIN  # origin never rewritten
+
+    def test_transit_available_conflict_rejected(self, store: SQLiteStore) -> None:
+        """No exceptions on the conflict path: even an AVAILABLE transit
+        re-send (no tombstone, no title change) from a non-origin sender
+        is refused."""
+        store.upsert_index_entries([_entry("fed:r:v1", timestamp="2021-06-01T10:00:00Z")])
+        stats = store.upsert_index_entries(
+            [_entry("fed:r:v1", timestamp="2021-06-02T10:00:00Z")],
+            sender_peer_id=_PEER_ID,
+        )
+        assert stats.written == 0
+        assert stats.refused == 1
+
+    def test_transit_insert_new_id_allowed(self, store: SQLiteStore) -> None:
+        """INSERT path: a NEW id with an explicit foreign origin from a
+        non-origin sender is transit — allowed, origin stored verbatim."""
+        stats = store.upsert_index_entries(
+            [_entry("fed:r:new", timestamp="2021-06-01T10:00:00Z")],
+            sender_peer_id=_PEER_ID,
+        )
+        assert stats.written == 1
+        (entry, _rowid) = store.list_index()[0]
+        assert entry.origin_peer == _REMOTE_ORIGIN
+
+    def test_local_leg_origin_mismatch_refused(self, store: SQLiteStore) -> None:
+        """Trusted local leg (no sender): the entry origin must still
+        match the stored one — a local self-row cannot be overwritten by
+        a B-originated claim."""
+        store.upsert_index_entries([_entry("fed:r:local", origin_peer="self")])
+        stats = store.upsert_index_entries(
+            [_entry("fed:r:local", timestamp="2021-06-02T10:00:00Z")]
+        )
+        assert stats.written == 0
+        assert stats.refused == 1
+        (entry, _rowid) = store.list_index()[0]
+        assert entry.origin_peer == "self"
+
+
+# ── canonical_metadata_timestamp (review blocker 2) ──────────────────────────
+
+
+class TestCanonicalMetadataTimestamp:
+    """Unit coverage of the import-boundary ISO-8601 → canonical-UTC
+    normaliser (LWW anti-poisoning)."""
+
+    _NOW = datetime(2026, 9, 21, 12, 0, 0, tzinfo=UTC)
+
+    def test_z_suffix_canonical_form(self) -> None:
+        assert (
+            canonical_metadata_timestamp("2026-09-01T10:00:00Z", now=self._NOW)
+            == "2026-09-01T10:00:00.000000Z"
+        )
+
+    def test_offset_converted_to_utc(self) -> None:
+        assert (
+            canonical_metadata_timestamp("2026-09-01T10:00:00+03:00", now=self._NOW)
+            == "2026-09-01T07:00:00.000000Z"
+        )
+
+    def test_naive_assumed_utc(self) -> None:
+        assert (
+            canonical_metadata_timestamp("2026-09-01T10:00:00", now=self._NOW)
+            == "2026-09-01T10:00:00.000000Z"
+        )
+
+    def test_same_instant_different_tz_canonicalize_equal(self) -> None:
+        canonical = {
+            canonical_metadata_timestamp(raw, now=self._NOW)
+            for raw in (
+                "2026-09-01T10:00:00Z",
+                "2026-09-01T13:00:00+03:00",
+                "2026-09-01T07:00:00-03:00",
+                "2026-09-01T10:00:00.500Z",
+            )
+        }
+        # The first three are the same instant → one canonical form
+        # (the sub-second variant is a different instant, excluded).
+        assert canonical == {
+            "2026-09-01T10:00:00.000000Z",
+            "2026-09-01T10:00:00.500000Z",
+        }
+
+    def test_far_future_rejected(self) -> None:
+        with pytest.raises(ValueError, match="future"):
+            canonical_metadata_timestamp("9999-12-31T23:59:59Z", now=self._NOW)
+
+    def test_just_beyond_slack_rejected(self) -> None:
+        with pytest.raises(ValueError, match="future"):
+            canonical_metadata_timestamp(
+                (self._NOW + TIMESTAMP_FUTURE_SLACK + timedelta(seconds=1)).isoformat(),
+                now=self._NOW,
+            )
+
+    def test_within_slack_accepted(self) -> None:
+        raw = (self._NOW + TIMESTAMP_FUTURE_SLACK - timedelta(seconds=1)).isoformat()
+        assert canonical_metadata_timestamp(raw, now=self._NOW).endswith("Z")
+
+    def test_unparseable_and_empty_rejected(self) -> None:
+        for raw in ("", "   ", "not-a-timestamp", "2026-13-45T99:99:99Z"):
+            with pytest.raises(ValueError):
+                canonical_metadata_timestamp(raw, now=self._NOW)
 
 
 # ── list_index ───────────────────────────────────────────────────────────────
@@ -399,6 +605,23 @@ class TestBuildMetadataEntry:
                 source=MemorySource.MANUAL,
             ),
             project=_PROJECT,
+            agent=_AGENT,
+        )
+        assert build_metadata_entry(memory) is None
+
+    def test_projectless_memory_excluded(self, manager: MemoryManager) -> None:
+        """Review nit 2: a memory without a project must not enter the
+        index — the row would be dead locally and would abort a remote
+        importer's whole RPC (an entry without a project cannot be
+        ACL'd)."""
+        memory = manager.add(
+            MemoryCreate(
+                content="Scratch note outside any project scope.",
+                title="Projectless note",
+                tags=[f"agent:{_AGENT}", "mnemos:learning"],
+                source=MemorySource.MANUAL,
+            ),
+            project="",
             agent=_AGENT,
         )
         assert build_metadata_entry(memory) is None
@@ -641,11 +864,12 @@ def _grpc_server(
     *,
     allowed: list[str] | None = None,
     title_blocklist: list[str] | None = None,
+    peers: dict[str, PeerConfig] | None = None,
 ) -> Generator[tuple[Any, MemoryManager], None, None]:
     """Run a real MeshServer on a tmp Unix socket; yield (stub, manager)."""
     import grpc as _grpc
 
-    settings = _settings(tmp_path, allowed=allowed, title_blocklist=title_blocklist)
+    settings = _settings(tmp_path, allowed=allowed, title_blocklist=title_blocklist, peers=peers)
     mgr = MemoryManager(settings)
     mock_embedder = MagicMock()
     mock_embedder.embed.return_value = [0.1] * 384
@@ -783,21 +1007,55 @@ class TestUpsertIndexEntriesRPC:
 
     def test_replay_is_idempotent_single_row(self, tmp_path: Path) -> None:
         with _grpc_server(tmp_path) as (stub, mgr):
-            request = _mesh_gen.core_pb2.UpsertIndexEntriesRequest(entries=[_pb_entry("fed:r:1")])
+            # Sender IS the origin (self-claim re-stamped to the sender):
+            # a replayed record hits the conflict path with equal
+            # canonical timestamps → LWW equal-ts replace, accepted.
+            request = _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                entries=[_pb_entry("fed:r:1", origin_peer="self")]
+            )
             assert stub.UpsertIndexEntries(request).accepted == 1
             assert stub.UpsertIndexEntries(request).accepted == 1  # LWW equal-ts replace
             assert len(mgr.sqlite.list_index()) == 1
+
+    def test_transit_replay_from_non_origin_rejected(self, tmp_path: Path) -> None:
+        """Blocker 1 ruling: on the conflict path a transit re-send from
+        a sender that is NOT the stored origin is refused — even an
+        unchanged available replay (no exceptions)."""
+        with _grpc_server(tmp_path) as (stub, mgr):
+            first = _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                entries=[_pb_entry("fed:r:1")]  # explicit origin=B from sender A
+            )
+            assert stub.UpsertIndexEntries(first).accepted == 1  # INSERT: transit allowed
+            replay = stub.UpsertIndexEntries(first)
+            assert replay.accepted == 0
+            assert replay.rejected_by_gate == 1  # conflict path: sender A ≠ stored origin B
+            (entry, _rowid) = mgr.sqlite.list_index()[0]
+            assert entry.origin_peer == _REMOTE_ORIGIN  # row untouched
 
     def test_stale_timestamp_lww_silently_superseded(self, tmp_path: Path) -> None:
         with _grpc_server(tmp_path) as (stub, mgr):
             stub.UpsertIndexEntries(
                 _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
-                    entries=[_pb_entry("fed:r:1", title="Newer", timestamp="2026-09-10T00:00:00Z")]
+                    entries=[
+                        _pb_entry(
+                            "fed:r:1",
+                            title="Newer",
+                            timestamp="2026-09-10T00:00:00Z",
+                            origin_peer="self",
+                        )
+                    ]
                 )
             )
             resp = stub.UpsertIndexEntries(
                 _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
-                    entries=[_pb_entry("fed:r:1", title="Older", timestamp="2026-09-01T00:00:00Z")]
+                    entries=[
+                        _pb_entry(
+                            "fed:r:1",
+                            title="Older",
+                            timestamp="2026-09-01T00:00:00Z",
+                            origin_peer="self",
+                        )
+                    ]
                 )
             )
             assert resp.accepted == 0  # stale: neither accepted nor gate-rejected
@@ -841,3 +1099,254 @@ class TestUpsertIndexEntriesRPC:
                     _mesh_gen.core_pb2.UpsertIndexEntriesRequest(entries=[_pb_entry()])
                 )
             assert excinfo.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+
+# ── cross-origin security matrix (review blocker 1, real gRPC) ───────────────
+
+
+class TestUpsertCrossOriginSecurity:
+    """Reviewer probes T1/T2 + the transit ruling over the real RPC, with
+    three ACL-configured senders: A (attacker/relay), B (the origin),
+    C (a second relay). Identity comes from the gRPC metadata header."""
+
+    @staticmethod
+    def _as(peer_id: str) -> tuple[tuple[str, str], ...]:
+        return (("x-mnemos-peer-id", peer_id),)
+
+    def _three_peers(self) -> dict[str, PeerConfig]:
+        return {
+            _PEER_ID: _peer_cfg(),
+            _REMOTE_ORIGIN: _peer_cfg(),
+            _PEER_ID_C: _peer_cfg(),
+        }
+
+    def test_t1_cross_origin_tombstone_censorship_rejected(self, tmp_path: Path) -> None:
+        """T1: authenticated peer A sends a FOREIGN id with origin=B,
+        content_state=tombstoned and a newer timestamp → must land in
+        rejected_by_gate, the victim row untouched."""
+        with _grpc_server(tmp_path, peers=self._three_peers()) as (stub, mgr):
+            seed = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[_pb_entry("fed:r:victim", timestamp="2021-06-01T10:00:00Z")]
+                ),
+                metadata=self._as(_PEER_ID),
+            )
+            assert seed.accepted == 1  # transit INSERT of B's row via A
+            attack = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[
+                        _pb_entry(
+                            "fed:r:victim",
+                            content_state="tombstoned",
+                            timestamp="2021-06-02T10:00:00Z",
+                        )
+                    ]
+                ),
+                metadata=self._as(_PEER_ID),
+            )
+            assert attack.accepted == 0
+            assert attack.rejected_by_gate == 1
+            (entry, _rowid) = mgr.sqlite.list_index()[0]
+            assert entry.content_state == "available"  # censorship failed
+            assert entry.title == "Remote decision"
+            assert entry.origin_peer == _REMOTE_ORIGIN
+
+    def test_t2_self_claim_attribution_capture_rejected(self, tmp_path: Path) -> None:
+        """T2: peer A claims origin='self' (re-stamped to A) on B's id to
+        capture attribution and retitle the export surface."""
+        with _grpc_server(tmp_path, peers=self._three_peers()) as (stub, mgr):
+            stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[_pb_entry("fed:r:victim", timestamp="2021-06-01T10:00:00Z")]
+                ),
+                metadata=self._as(_PEER_ID),
+            )
+            attack = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[
+                        _pb_entry(
+                            "fed:r:victim",
+                            origin_peer="self",
+                            title="Hijacked title",
+                            timestamp="2021-06-02T10:00:00Z",
+                        )
+                    ]
+                ),
+                metadata=self._as(_PEER_ID),
+            )
+            assert attack.accepted == 0
+            assert attack.rejected_by_gate == 1
+            (entry, _rowid) = mgr.sqlite.list_index()[0]
+            assert entry.title == "Remote decision"  # row not touched
+            assert entry.origin_peer == _REMOTE_ORIGIN  # attribution kept
+
+    def test_transit_insert_accepted_but_peer_c_edit_rejected(self, tmp_path: Path) -> None:
+        """The ruling's positive leg: transit available of a NEW id with
+        an explicit origin=B from peer A → accepted (INSERT); a replay
+        from peer C with edits → rejected (conflict path, non-origin)."""
+        with _grpc_server(tmp_path, peers=self._three_peers()) as (stub, mgr):
+            transit = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[_pb_entry("fed:r:transit", timestamp="2021-06-01T10:00:00Z")]
+                ),
+                metadata=self._as(_PEER_ID),
+            )
+            assert transit.accepted == 1
+            assert transit.rejected_by_gate == 0
+            replay = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[
+                        _pb_entry(
+                            "fed:r:transit",
+                            title="Retitled by C",
+                            timestamp="2021-06-02T10:00:00Z",
+                        )
+                    ]
+                ),
+                metadata=self._as(_PEER_ID_C),
+            )
+            assert replay.accepted == 0
+            assert replay.rejected_by_gate == 1
+            (entry, _rowid) = mgr.sqlite.list_index()[0]
+            assert entry.title == "Remote decision"
+            assert entry.origin_peer == _REMOTE_ORIGIN
+
+    def test_origin_b_direct_mutation_still_works(self, tmp_path: Path) -> None:
+        """The guard must not break the legitimate leg: B itself (the
+        stored origin) sends a self-claim update with a newer timestamp
+        → tombstone lands, origin preserved."""
+        with _grpc_server(tmp_path, peers=self._three_peers()) as (stub, mgr):
+            stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[_pb_entry("fed:r:victim", timestamp="2021-06-01T10:00:00Z")]
+                ),
+                metadata=self._as(_PEER_ID),
+            )
+            update = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[
+                        _pb_entry(
+                            "fed:r:victim",
+                            origin_peer="self",
+                            content_state="tombstoned",
+                            timestamp="2021-06-02T10:00:00Z",
+                        )
+                    ]
+                ),
+                metadata=self._as(_REMOTE_ORIGIN),
+            )
+            assert update.accepted == 1
+            assert update.rejected_by_gate == 0
+            (entry, _rowid) = mgr.sqlite.list_index()[0]
+            assert entry.content_state == "tombstoned"
+            assert entry.origin_peer == _REMOTE_ORIGIN  # never re-stamped
+
+
+# ── timestamp import gates (review blocker 2, real gRPC) ─────────────────────
+
+
+class TestTimestampImportGates:
+    """LWW anti-poisoning over the real RPC: canonicalisation to UTC and
+    the future-slack gate are enforced at the import boundary."""
+
+    def test_far_future_timestamp_rejected(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, mgr):
+            resp = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[_pb_entry("fed:r:poison", timestamp="9999-12-31T23:59:59Z")]
+                )
+            )
+            assert resp.accepted == 0
+            assert resp.rejected_by_gate == 1
+            assert mgr.sqlite.list_index() == []
+
+    def test_unparseable_timestamp_rejected(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, mgr):
+            resp = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[_pb_entry("fed:r:garbage", timestamp="not-a-timestamp")]
+                )
+            )
+            assert resp.accepted == 0
+            assert resp.rejected_by_gate == 1
+            assert mgr.sqlite.list_index() == []
+
+    def test_offset_timestamp_canonicalised_to_utc(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, mgr):
+            resp = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[
+                        _pb_entry(
+                            "fed:r:tz", origin_peer="self", timestamp="2021-06-01T10:00:00+03:00"
+                        )
+                    ]
+                )
+            )
+            assert resp.accepted == 1
+            (entry, _rowid) = mgr.sqlite.list_index()[0]
+            assert entry.timestamp == "2021-06-01T07:00:00.000000Z"  # canonical UTC
+
+    def test_same_instant_different_tz_lww_neutral(self, tmp_path: Path) -> None:
+        """Two records for the same id expressing the SAME instant in
+        different offsets: both canonicalise to one form, so LWW is
+        neutral — the outcome is order-independent (one row, identical
+        stored timestamp; last arrival wins the payload, not the tz)."""
+        with _grpc_server(tmp_path) as (stub, mgr):
+            zulu = _pb_entry("fed:r:same", origin_peer="self", timestamp="2021-06-01T12:00:00Z")
+            offset = _pb_entry(
+                "fed:r:same",
+                origin_peer="self",
+                title="Same instant, other tz",
+                timestamp="2021-06-01T15:00:00+03:00",
+            )
+            resp1 = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(entries=[zulu, offset])
+            )
+            assert resp1.accepted == 2  # equal canonical ts → replace on equal
+            (entry, _rowid) = mgr.sqlite.list_index()[0]
+            assert entry.timestamp == "2021-06-01T12:00:00.000000Z"
+            assert entry.title == "Same instant, other tz"
+            # Reverse arrival order: same one row, same canonical stamp.
+            mgr.sqlite.purge_origin(_PEER_ID)
+            resp2 = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(entries=[offset, zulu])
+            )
+            assert resp2.accepted == 2
+            (entry2, _rowid) = mgr.sqlite.list_index()[0]
+            assert entry2.timestamp == "2021-06-01T12:00:00.000000Z"  # stable watermark
+            assert entry2.title == "Remote decision"  # zulu arrived last
+
+    def test_tz_older_instant_loses_lww(self, tmp_path: Path) -> None:
+        """The old bug: '2021-02-01T10:00:00+03:00' (07:00Z — OLDER
+        instant) compared lexically GREATER than the stored
+        '2021-02-01T08:00:00Z' and wrongly won LWW. Canonicalised, the
+        older instant is stale — silently superseded, not a rejection."""
+        with _grpc_server(tmp_path) as (stub, mgr):
+            stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[
+                        _pb_entry(
+                            "fed:r:lww",
+                            origin_peer="self",
+                            title="Newer",
+                            timestamp="2021-02-01T08:00:00Z",
+                        )
+                    ]
+                )
+            )
+            resp = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[
+                        _pb_entry(
+                            "fed:r:lww",
+                            origin_peer="self",
+                            title="Older but lexically bigger",
+                            timestamp="2021-02-01T10:00:00+03:00",
+                        )
+                    ]
+                )
+            )
+            assert resp.accepted == 0  # stale — neither accepted nor rejected
+            assert resp.rejected_by_gate == 0
+            (entry, _rowid) = mgr.sqlite.list_index()[0]
+            assert entry.title == "Newer"

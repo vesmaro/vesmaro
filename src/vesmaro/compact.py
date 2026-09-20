@@ -47,7 +47,10 @@ S2 meta-mirror substrate (ADR-0021 Q10.3, archcom 2026-09-20):
   Python-side ``MetadataRecord`` + storage-side ``origin_peer`` /
   ``content_state`` / ``received_at``).
 * :func:`build_metadata_entry` — build an index-only entry from a local
-  memory (``None`` = excluded: no-federate tag or moderation refuse).
+  memory (``None`` = excluded: no-federate tag, moderation refuse, or
+  no project).
+* :func:`canonical_metadata_timestamp` — import-boundary ISO-8601 →
+  canonical-UTC normaliser (LWW anti-poisoning, review blocker 2).
 * :func:`title_matches_blocklist` — Q10.9 title-regex gate, applied at
   BOTH the serve and import gates.
 """
@@ -57,7 +60,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -76,11 +79,13 @@ __all__ = [
     "MAX_SUMMARY_LEN",
     "MAX_TITLE_LEN",
     "METADATA_SCHEMA",
+    "TIMESTAMP_FUTURE_SLACK",
     "CompactRecord",
     "FederationIndexEntry",
     "build_compact_payload",
     "build_compact_record",
     "build_metadata_entry",
+    "canonical_metadata_timestamp",
     "derive_record_type",
     "extract_key_points",
     "summarize_content",
@@ -521,6 +526,60 @@ CONTENT_STATE_TOMBSTONED: str = "tombstoned"
 #: Allowed ``content_state`` values.
 CONTENT_STATES: frozenset[str] = frozenset({CONTENT_STATE_AVAILABLE, CONTENT_STATE_TOMBSTONED})
 
+#: Canonical storage form for index timestamps: fixed-width UTC with a
+#: ``Z`` suffix. Fixed width (always 6 microsecond digits) makes the
+#: LEXICOGRAPHIC string order equal the chronological order, which is
+#: what the store's LWW comparison and the ``since`` watermark rely on
+#: (review blocker 2: raw wire forms like ``+03:00`` offsets or a
+#: missing fraction made lexicographic compare lie).
+METADATA_TS_FORMAT: str = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+#: How far ahead of local ``now`` an imported timestamp may sit before
+#: it is rejected as future-dated (clock-skew slack between peers; a
+#: record stamped beyond it would win LWW forever — review blocker 2).
+TIMESTAMP_FUTURE_SLACK: timedelta = timedelta(minutes=5)
+
+
+def canonical_metadata_timestamp(raw: str, *, now: datetime | None = None) -> str:
+    """Parse an untrusted ISO-8601 timestamp into the canonical index form.
+
+    Import-boundary normaliser (the wire is untrusted): parses ISO-8601
+    with :meth:`datetime.datetime.fromisoformat` (after normalising a
+    trailing ``Z``/``z`` to ``+00:00``), converts to UTC and formats as
+    :data:`METADATA_TS_FORMAT` so that every stored timestamp compares
+    correctly as a plain string. A naive (offset-less) timestamp is
+    assumed UTC — the same defensive posture as
+    :func:`_memory_timestamp`.
+
+    Args:
+        raw: The wire ``timestamp`` field, verbatim.
+        now: Reference ``now`` for the future-slack gate (injectable for
+            tests); defaults to ``datetime.now(UTC)``.
+
+    Returns:
+        The canonical UTC string, e.g. ``2026-09-01T07:00:00.000000Z``.
+
+    Raises:
+        ValueError: ``raw`` is empty or unparseable, or it sits further
+            than :data:`TIMESTAMP_FUTURE_SLACK` in the future. The RPC
+            layer counts these in ``rejected_by_gate``.
+    """
+    text = raw.strip()
+    if not text:
+        raise ValueError("empty timestamp")
+    if text[-1] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"unparseable timestamp {raw!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    reference = now if now is not None else datetime.now(UTC)
+    if parsed > reference + TIMESTAMP_FUTURE_SLACK:
+        raise ValueError(f"future timestamp {raw!r} beyond {TIMESTAMP_FUTURE_SLACK} slack")
+    return parsed.astimezone(UTC).strftime(METADATA_TS_FORMAT)
+
 
 class FederationIndexEntry(BaseModel):
     """One ``federation_index`` row — the Python-side MetadataRecord.
@@ -590,7 +649,11 @@ def build_metadata_entry(
 
     * the memory carries ``mnemos:no-federate`` (Q10.9: the tag filters
       the INDEX, defence-in-depth before any fan-out), or
-    * moderation refuses the content (verdict ``REFUSE``).
+    * moderation refuses the content (verdict ``REFUSE``), or
+    * the memory carries no ``project`` — a project-less row is dead
+      weight locally and POISONS the import leg remotely (the importer
+      cannot ACL an entry without a project and aborts the whole RPC,
+      review nit 2).
 
     Args:
         memory: The local memory to advertise.
@@ -606,6 +669,9 @@ def build_metadata_entry(
     """
     if NO_FEDERATE_TAG in memory.tags:
         logger.info("compact: metadata entry excluded — no-federate tag (memory id=%s)", memory.id)
+        return None
+    if not memory.project:
+        logger.info("compact: metadata entry excluded — no project (memory id=%s)", memory.id)
         return None
     result = moderation_result or moderate(
         memory.content, tags=memory.tags, refuse_threshold=refuse_threshold

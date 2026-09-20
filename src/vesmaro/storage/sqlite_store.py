@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from sys import getsizeof
@@ -37,6 +38,22 @@ from vesmaro.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class IndexUpsertStats:
+    """Per-batch outcome of :meth:`SQLiteStore.upsert_index_entries`.
+
+    The RPC layer maps these onto the ``UpsertIndexEntriesResponse``
+    counters: ``written`` → ``accepted``, ``refused`` → adds to
+    ``rejected_by_gate``, ``stale`` → LWW-superseded (neither accepted
+    nor rejected).
+    """
+
+    written: int
+    refused: int
+    stale: int
+
 
 # ADR-0018 P1-b (m2) — FTS5 snippet highlight markers used by
 # ``ccr_search``. Module-level so the issuance-side scanner
@@ -3126,8 +3143,9 @@ class SQLiteStore:
         self,
         entries: Sequence[FederationIndexEntry],
         *,
+        sender_peer_id: str | None = None,
         title_blocklist: Sequence[str] = (),
-    ) -> int:
+    ) -> IndexUpsertStats:
         """Import gate for the federation metadata index (S2 substrate).
 
         Upserts entries into ``federation_index`` in one transaction,
@@ -3139,6 +3157,27 @@ class SQLiteStore:
         the revision-field gap that would disambiguate this is recorded
         in the proto as ``CompactRecord.revision`` and reserved for
         ``MetadataRecord`` as an archcom-enumerated additive move).
+
+        Origin-mutation guard (review blocker 1, CWE-284 — archcom
+        ruling «index mutations come from the origin only; available
+        transit is allowed»):
+
+        * INSERT path: transit stays allowed — a NEW id with an
+          explicit foreign ``origin_peer`` is exactly how a peer
+          re-advertises another origin's row.
+        * CONFLICT path: the stored row may only be mutated by its
+          ORIGIN. On the import leg (``sender_peer_id`` set) that means
+          the authenticated sender MUST equal the stored
+          ``origin_peer`` — a transit re-send or a foreign ``self``
+          claim from a non-origin sender is refused into
+          ``rejected_by_gate`` (NO exception, not even available
+          transit: a sender that is not the origin must never be able
+          to tombstone, retitle or otherwise censor another origin's
+          row). On the trusted local leg (``sender_peer_id=None``) the
+          entry's ``origin_peer`` must simply match the stored one.
+        * The stored ``origin_peer`` is NEVER rewritten: the ON
+          CONFLICT UPDATE clause does not touch it (attribution
+          capture is structurally impossible, not just gate-checked).
 
         Import-side gates applied HERE (Q10.9 — title-regex runs at
         export AND import; no-federate is belt-and-braces: the ORIGIN
@@ -3155,13 +3194,20 @@ class SQLiteStore:
                 (:class:`vesmaro.compact.FederationIndexEntry`). Entries
                 that fail a gate are skipped — one bad entry never
                 aborts the batch (a peer's index page is not atomic).
+            sender_peer_id: The AUTHENTICATED sender id on the RPC
+                import leg (re-stamps ``""``/``"self"`` origins to the
+                sender as defence-in-depth — the RPC layer already did
+                — and enables the origin-mutation guard). ``None`` =
+                trusted local-materialisation leg (local rows are
+                minted with ``origin_peer='self'``).
             title_blocklist: Q10.9 regex patterns (from
                 :attr:`vesmaro.config.FederationConfig.
                 index_title_blocklist`); empty = no title gate.
 
         Returns:
-            The number of rows actually written (inserted or replaced)
-            — gated/refused/stale entries do not count.
+            :class:`IndexUpsertStats` — rows written (inserted or
+            replaced), refused by a gate, and stale (silently
+            superseded by LWW).
         """
         now = datetime.now(UTC).isoformat()
         written = 0
@@ -3182,6 +3228,45 @@ class SQLiteStore:
                     entry.id,
                 )
                 continue
+            incoming_origin = entry.origin_peer
+            if sender_peer_id is not None and incoming_origin in ("", "self"):
+                # Defence-in-depth re-stamp: the RPC layer already
+                # re-stamped; a foreign ""/"self" claim must never enter
+                # the local origin namespace.
+                incoming_origin = sender_peer_id
+            stored = conn.execute(
+                "SELECT origin_peer FROM federation_index WHERE id = ?",
+                (entry.id,),
+            ).fetchone()
+            if stored is not None:
+                if sender_peer_id is not None:
+                    # Import leg, conflict path: mutations only from the
+                    # origin. The origin's own updates arrive as
+                    # ""/"self" → re-stamped to the sender, so sender ==
+                    # stored origin is the only legitimate match; an
+                    # explicit foreign origin (transit) from any sender
+                    # is refused — no exceptions (blocker 1).
+                    if stored[0] != sender_peer_id:
+                        refused += 1
+                        logger.info(
+                            "federation_index: refused entry id=%s — cross-origin mutation "
+                            "(sender=%s stored_origin=%s)",
+                            entry.id,
+                            sender_peer_id,
+                            stored[0],
+                        )
+                        continue
+                    incoming_origin = stored[0]
+                elif stored[0] != incoming_origin:
+                    refused += 1
+                    logger.info(
+                        "federation_index: refused entry id=%s — origin mismatch "
+                        "(incoming=%s stored_origin=%s)",
+                        entry.id,
+                        incoming_origin,
+                        stored[0],
+                    )
+                    continue
             cur = conn.execute(
                 """
                 INSERT INTO federation_index
@@ -3195,7 +3280,6 @@ class SQLiteStore:
                     project = excluded.project,
                     source_agent = excluded.source_agent,
                     source_peer = excluded.source_peer,
-                    origin_peer = excluded.origin_peer,
                     content_state = excluded.content_state,
                     timestamp = excluded.timestamp,
                     schema_version = excluded.schema_version,
@@ -3210,7 +3294,7 @@ class SQLiteStore:
                     entry.project,
                     entry.source_agent,
                     entry.source_peer,
-                    entry.origin_peer,
+                    incoming_origin,
                     entry.content_state,
                     entry.timestamp,
                     entry.schema_version,
@@ -3219,13 +3303,15 @@ class SQLiteStore:
             )
             written += cur.rowcount
         conn.commit()
+        stale = len(entries) - written - refused
         logger.info(
-            "federation_index: upsert batch total=%d written=%d refused=%d",
+            "federation_index: upsert batch total=%d written=%d refused=%d stale=%d",
             len(entries),
             written,
             refused,
+            stale,
         )
-        return written
+        return IndexUpsertStats(written=written, refused=refused, stale=stale)
 
     def list_index(
         self,

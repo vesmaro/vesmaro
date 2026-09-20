@@ -132,6 +132,7 @@ from vesmaro.compact import (
     CompactRecord,
     FederationIndexEntry,
     build_compact_record,
+    canonical_metadata_timestamp,
     title_matches_blocklist,
 )
 from vesmaro.config import MeshTCPTLSConfig, PeerConfig, Settings
@@ -384,7 +385,7 @@ def _metadata_to_proto(entry: FederationIndexEntry) -> Any:
 def _metadata_entry_from_proto(pb_record: Any, *, sender_peer_id: str) -> FederationIndexEntry:
     """Unmarshal a protobuf ``MetadataRecord`` for import (S2 import leg).
 
-    Inverse of :func:`_metadata_to_proto`, with two import-side
+    Inverse of :func:`_metadata_to_proto`, with three import-side
     normalisations (the wire is untrusted):
 
     * ``origin_peer`` empty or ``"self"`` → the AUTHENTICATED sender's
@@ -395,12 +396,22 @@ def _metadata_entry_from_proto(pb_record: Any, *, sender_peer_id: str) -> Federa
       corrupt ``purge_origin('self')`` and local/remote attribution).
     * ``content_state`` empty → ``available`` (proto3 default; the proto
       documents empty-as-available for older senders).
+    * ``timestamp`` → the canonical UTC form via
+      :func:`vesmaro.compact.canonical_metadata_timestamp` (review
+      blocker 2): ISO-8601 is parsed, converted to UTC and stored in the
+      fixed-width ``%Y-%m-%dT%H:%M:%S.%fZ`` form so the store's
+      LWW-by-string comparison is chronologically honest — a ``+03:00``
+      offset or a missing fraction must not make an older instant win,
+      and a far-future stamp must not win forever.
 
     Raises:
         ValueError: the record violates the entry contract — a foreign
             ``schema_version`` pin (explicit only; empty defaults to the
-            pinned version). Construction of the entry may additionally
-            raise :class:`pydantic.ValidationError` (unknown
+            pinned version), or an unparseable / future-dated
+            ``timestamp`` (beyond
+            :data:`vesmaro.compact.TIMESTAMP_FUTURE_SLACK`). Construction
+            of the entry may additionally raise
+            :class:`pydantic.ValidationError` (unknown
             ``content_state``, empty ``id``, title > 256 chars). The RPC
             layer counts both in ``rejected_by_gate``; one bad entry
             never aborts a batch.
@@ -421,7 +432,7 @@ def _metadata_entry_from_proto(pb_record: Any, *, sender_peer_id: str) -> Federa
         source_peer=str(pb_record.source_peer),
         origin_peer=origin_peer,
         content_state=str(pb_record.content_state) or CONTENT_STATE_AVAILABLE,
-        timestamp=str(pb_record.timestamp),
+        timestamp=canonical_metadata_timestamp(str(pb_record.timestamp)),
         schema_version=METADATA_SCHEMA,
         received_at="",  # stamped by the store at upsert time
     )
@@ -1343,12 +1354,21 @@ class MnemosCoreServicer:
         3. Boundary validation + Q10.9 gates (per entry, COUNTED — one
            bad entry never aborts the batch): schema validation
            (unknown ``content_state``, oversized title, foreign
-           ``schema_version``, empty id), ``mnemos:no-federate`` tag,
-           title blocklist → ``rejected_by_gate``.
+           ``schema_version``, empty id, unparseable or future-dated
+           ``timestamp`` — canonicalised to UTC on the way in, review
+           blocker 2), ``mnemos:no-federate`` tag, title blocklist →
+           ``rejected_by_gate``.
         4. Origin hygiene: ``origin_peer`` empty/``"self"`` on the wire
            is re-stamped to the AUTHENTICATED sender id.
         5. Upsert via ``upsert_index_entries`` (LWW-by-timestamp, Q10.6;
-           the storage gates re-apply as defence-in-depth). Entries that
+           the storage gates re-apply as defence-in-depth). The store
+           enforces the origin-mutation ruling (review blocker 1,
+           CWE-284): an EXISTING row is only mutable by its origin —
+           the authenticated sender must equal the stored
+           ``origin_peer`` (a transit re-send or a foreign ``self``
+           claim against another origin's id is refused into
+           ``rejected_by_gate``; NEW ids with an explicit foreign
+           origin remain importable — that is transit). Entries that
            lose LWW to a newer stored row are neither accepted nor
            rejected (silently superseded; counted in the log line).
         """
@@ -1429,19 +1449,21 @@ class MnemosCoreServicer:
                 continue
             clean.append(entry)
 
-        written = self._manager.sqlite.upsert_index_entries(clean, title_blocklist=title_blocklist)
-        stale = len(clean) - written
+        stats = self._manager.sqlite.upsert_index_entries(
+            clean, sender_peer_id=peer_id, title_blocklist=title_blocklist
+        )
+        rejected_by_gate = rejected + stats.refused
         logger.info(
             "mesh_server: index upsert accepted=%d rejected_by_gate=%d stale=%d total=%d peer=%s",
-            written,
-            rejected,
-            stale,
+            stats.written,
+            rejected_by_gate,
+            stats.stale,
             len(request.entries),
             peer_id,
         )
         return _mesh_gen.core_pb2.UpsertIndexEntriesResponse(
-            accepted=written,
-            rejected_by_gate=rejected,
+            accepted=stats.written,
+            rejected_by_gate=rejected_by_gate,
             trigger_code=_trigger_code_to_proto(TriggerCode.EXHAUSTIVE),
         )
 
