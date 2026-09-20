@@ -42,6 +42,17 @@ Reuses :mod:`vesmaro._mesh_gen` (the same shim the client uses) to
 import the generated ``mnemos_core_api_pb2_grpc`` /
 ``mnemos_core_api_pb2`` modules without touching ``sys.path`` here.
 
+S2 meta-mirror (ADR-0021 Q10.2/Q10.3, chairman ruling 2026-09-20)
+-------------------------------------------------------------------
+:rpc:`SyncMetadata` serves metadata-only pages of the
+``federation_index`` (the S2 poll-first export leg; body factored into
+:meth:`MnemosCoreServicer.build_metadata_sync_response` for unit
+testing), :rpc:`UpsertIndexEntries` imports peer metadata into the index
+(S2 import leg, per-entry gate counters + fail-closed ACL). Both reuse
+the ``FederationPeer`` wire messages — the mesh relays them verbatim.
+:func:`_metadata_stream_event` fills the ``SubscribeStream.record``
+oneof's ``metadata`` variant for the standing-subscription goal.
+
 ACL model
 ---------
 The ACL reuses :class:`vesmaro.config.PeerConfig.allowed_projects` from
@@ -111,10 +122,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import grpc
+from pydantic import ValidationError
 
 from vesmaro import __version__ as _mnemos_version
 from vesmaro import _mesh_gen
-from vesmaro.compact import CompactRecord, build_compact_record
+from vesmaro.compact import (
+    CONTENT_STATE_AVAILABLE,
+    METADATA_SCHEMA,
+    CompactRecord,
+    FederationIndexEntry,
+    build_compact_record,
+    canonical_metadata_timestamp,
+    title_matches_blocklist,
+)
 from vesmaro.config import MeshTCPTLSConfig, PeerConfig, Settings
 from vesmaro.federation_server import verify_mtls_fingerprint
 from vesmaro.manager import MemoryManager
@@ -335,6 +355,122 @@ def _compact_from_proto(pb_record: Any) -> CompactRecord:
     )
 
 
+def _metadata_to_proto(entry: FederationIndexEntry) -> Any:
+    """Marshal a :class:`FederationIndexEntry` to the protobuf
+    ``MetadataRecord`` (S2 meta-mirror, ADR-0021 Q10.3).
+
+    Wire fields exactly per ``federation.proto::MetadataRecord``: ``id``,
+    ``type``, ``title``, ``tags``, ``project``, ``source_agent``,
+    ``source_peer``, ``timestamp``, ``schema_version``, plus the additive
+    ``origin_peer`` and ``content_state`` (fields 10/11, chairman ruling
+    2026-09-20 — now first-class wire fields). ``received_at`` is
+    storage-side only (when THIS core received the row) and never leaves
+    the node.
+    """
+    return _mesh_gen.fed_pb2.MetadataRecord(
+        id=entry.id,
+        type=entry.type,
+        title=entry.title,
+        tags=list(entry.tags),
+        project=entry.project,
+        source_agent=entry.source_agent,
+        source_peer=entry.source_peer,
+        timestamp=entry.timestamp,
+        schema_version=entry.schema_version,
+        origin_peer=entry.origin_peer,
+        content_state=entry.content_state,
+    )
+
+
+def _metadata_entry_from_proto(pb_record: Any, *, sender_peer_id: str) -> FederationIndexEntry:
+    """Unmarshal a protobuf ``MetadataRecord`` for import (S2 import leg).
+
+    Inverse of :func:`_metadata_to_proto`, with three import-side
+    normalisations (the wire is untrusted):
+
+    * ``origin_peer`` empty or ``"self"`` → the AUTHENTICATED sender's
+      peer id: only the local core mints ``origin_peer='self'`` about its
+      own corpus, so a foreign record claiming ``self`` (or omitting the
+      field — proto3 default) is re-stamped to the sender. A foreign
+      record must never enter the local origin namespace (it would
+      corrupt ``purge_origin('self')`` and local/remote attribution).
+    * ``content_state`` empty → ``available`` (proto3 default; the proto
+      documents empty-as-available for older senders).
+    * ``timestamp`` → the canonical UTC form via
+      :func:`vesmaro.compact.canonical_metadata_timestamp` (review
+      blocker 2): ISO-8601 is parsed, converted to UTC and stored in the
+      fixed-width ``%Y-%m-%dT%H:%M:%S.%fZ`` form so the store's
+      LWW-by-string comparison is chronologically honest — a ``+03:00``
+      offset or a missing fraction must not make an older instant win,
+      and a far-future stamp must not win forever.
+
+    Raises:
+        ValueError: the record violates the entry contract — a foreign
+            ``schema_version`` pin (explicit only; empty defaults to the
+            pinned version), or an unparseable / future-dated
+            ``timestamp`` (beyond
+            :data:`vesmaro.compact.TIMESTAMP_FUTURE_SLACK`). Construction
+            of the entry may additionally raise
+            :class:`pydantic.ValidationError` (unknown
+            ``content_state``, empty ``id``, title > 256 chars). The RPC
+            layer counts both in ``rejected_by_gate``; one bad entry
+            never aborts a batch.
+    """
+    schema_version = str(pb_record.schema_version)
+    if schema_version and schema_version != METADATA_SCHEMA:
+        raise ValueError(f"foreign schema_version {schema_version!r}")
+    origin_peer = str(pb_record.origin_peer)
+    if origin_peer in ("", "self"):
+        origin_peer = sender_peer_id
+    return FederationIndexEntry(
+        id=str(pb_record.id),
+        type=str(pb_record.type),
+        title=str(pb_record.title),
+        tags=[str(t) for t in pb_record.tags],
+        project=str(pb_record.project),
+        source_agent=str(pb_record.source_agent),
+        source_peer=str(pb_record.source_peer),
+        origin_peer=origin_peer,
+        content_state=str(pb_record.content_state) or CONTENT_STATE_AVAILABLE,
+        timestamp=canonical_metadata_timestamp(str(pb_record.timestamp)),
+        schema_version=METADATA_SCHEMA,
+        received_at="",  # stamped by the store at upsert time
+    )
+
+
+def _metadata_stream_event(
+    entry: FederationIndexEntry,
+    *,
+    event_type: int | None = None,
+    cursor: str = "",
+) -> Any:
+    """Build a ``SubscribeStream`` element carrying the METADATA oneof variant.
+
+    The phase-1 oneof contract (ADR-0021 ruling 3: "metadata-oneof enters
+    S2 phase 1") lives on ``federation.proto::SubscribeStream`` —
+    ``oneof record { CompactRecord compact = 2; MetadataRecord metadata
+    = 3; }`` (verified against the proto: SyncMetadata's own messages
+    carry NO oneof — ``MetadataSyncResponse.records`` is a plain
+    ``repeated MetadataRecord``). This helper fills the ``metadata``
+    variant so the standing-subscription goal (ruling 2) has a
+    substrate-ready marshaller; the Go mesh owns the actual stream.
+
+    Args:
+        entry: The index row to advertise.
+        event_type: ``SubscribeStream.EventType`` value; default
+            ``RECORD_ADDED`` (the common metadata case — a record
+            appeared on the origin).
+        cursor: Resume token echo (empty for substrate-level events).
+    """
+    if event_type is None:
+        event_type = _mesh_gen.fed_pb2.SubscribeStream.RECORD_ADDED
+    return _mesh_gen.fed_pb2.SubscribeStream(
+        event_type=event_type,
+        metadata=_metadata_to_proto(entry),
+        cursor=cursor,
+    )
+
+
 def _acl_allows(peer: PeerConfig, project_scope: str) -> bool:
     """Return ``True`` if ``project_scope`` is allowed for ``peer``.
 
@@ -404,7 +540,7 @@ def _tag_value(tags: list[str], prefix: str) -> str:
 
 
 class MnemosCoreServicer:
-    """gRPC servicer implementing the four ``MnemosCore`` RPCs.
+    """gRPC servicer implementing the six ``MnemosCore`` RPCs.
 
     The servicer holds a reference to the :class:`MemoryManager` (for
     SQLite access + moderation) and the :class:`Settings` (for ACL +
@@ -980,6 +1116,355 @@ class MnemosCoreServicer:
             cursor="",
             last_rev=0,
             last_sync_timestamp="",
+        )
+
+    # ── S2 metadata sync (ADR-0021 Q10.2/Q10.3 — chairman ruling 2026-09-20) ──
+
+    def build_metadata_sync_response(self, request: Any, *, peer_id: str | None = None) -> Any:
+        """Build a ``MetadataSyncResponse`` from the ``federation_index``.
+
+        The body of :rpc:`SyncMetadata` (S2 export leg, poll-first —
+        ADR-0021 ruling 2). Kept as a separate method so the semantics
+        are unit-testable without a gRPC server; the RPC wrapper
+        (:meth:`SyncMetadata`) resolves the peer identity from the
+        connection and maps ACL denials to ``PERMISSION_DENIED``.
+
+        Semantics (``federation.proto::MetadataSyncRequest/Response``):
+
+        * ``since_rev`` is the peer's watermark, mapped onto the index
+          rowid space — the ADR-0020 rowid-ASC cursor MECHANIC (same as
+          :meth:`ListMemories` / ``list_all_for_mesh``), expressed as a
+          plain int64 because the SyncMetadata wire contract has no
+          opaque-token field. Rows with ``rowid > since_rev`` are
+          served; ``latest_rev`` echoes the rowid of the last row this
+          page consumed (delivered OR filtered) so a re-poll resumes
+          exactly after it — stateless pagination, no server-side cursor
+          state (ADR-0020: core keeps no cursor state at all). An empty
+          page echoes ``since_rev`` (the watermark never regresses).
+        * ``limit`` (0 = core default 50, clamped to the hard ceiling)
+          sizes the page; the wrapper fetches one extra row to detect
+          ``has_more`` without a second query.
+        * ``project_scope`` + ``peer_id`` run the same fail-closed ACL
+          as :rpc:`ListMemories`: the effective allowed set is resolved
+          unconditionally; a scoped request must be inside it, an
+          unscoped request intersects with it. Denial via the BUILDER
+          (standalone use) → empty records + ``trigger_code=REFUSED``;
+          denial via the RPC wrapper → ``PERMISSION_DENIED``.
+        * ``filter`` (tag set) intersects with each row's tags (proto
+          semantics: "entries whose tags intersect this set"); empty =
+          no filter.
+        * Q10.9 export gates: rows whose title matches the configured
+          ``index_title_blocklist`` are dropped from the page (their
+          rowids still advance ``latest_rev``, so a blocked row never
+          wedges a poll loop); ``mnemos:no-federate`` rows are excluded
+          in SQL (they should not exist — the upsert gate refuses them;
+          serve-side belt-and-braces).
+        * The response is metadata-ONLY: no CompactRecord bodies, no
+          summary — an index row is itself an inference surface, and
+          content stays behind :rpc:`ListMemories` / :rpc:`WriteMemory`.
+
+        Args:
+            request: A ``fed_pb2.MetadataSyncRequest`` (real generated
+                message — the same shape the wire contract defines).
+            peer_id: The AUTHENTICATED peer identity (from the gRPC
+                context in the RPC path). When ``None`` the builder
+                falls back to ``request.peer_id`` / the single
+                configured peer (standalone/test path only — a real
+                caller must never trust the caller-asserted field).
+
+        Returns:
+            A ``fed_pb2.MetadataSyncResponse``.
+
+        Raises:
+            CursorError: ``since_rev`` is negative or beyond the SQLite
+                rowid ceiling — the ADR-0020 rule-3 analog (garbage
+                checkpoints are rejected loudly, never guessed); the RPC
+                wrapper maps this to ``INVALID_ARGUMENT``.
+        """
+        since_rev = int(request.since_rev)
+        if since_rev < 0 or since_rev > _SQLITE_ROWID_MAX:
+            raise CursorError(f"since_rev out of range [0, {_SQLITE_ROWID_MAX}]: {since_rev}")
+
+        def _refused() -> Any:
+            return _mesh_gen.fed_pb2.MetadataSyncResponse(
+                records=[],
+                latest_rev=since_rev,
+                has_more=False,
+                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            )
+
+        resolved_peer = peer_id or str(request.peer_id) or self._single_peer_id()
+        if resolved_peer is None:
+            logger.info("mesh_server: SyncMetadata refused — no peer identity")
+            return _refused()
+        allowed_projects = self._allowed_projects_for_peer(resolved_peer)
+        if not allowed_projects:
+            logger.info(
+                "mesh_server: SyncMetadata refused — empty effective allowed set for peer_id=%s",
+                resolved_peer,
+            )
+            return _refused()
+        project_scope = str(request.project_scope)
+        if project_scope:
+            if not self._intersect_projects([project_scope], allowed_projects):
+                logger.info(
+                    "mesh_server: SyncMetadata refused — project_scope=%s "
+                    "not allowed for peer_id=%s",
+                    project_scope,
+                    resolved_peer,
+                )
+                return _refused()
+            effective_projects: list[str] | None = [project_scope]
+        else:
+            effective_projects = list(allowed_projects)
+
+        tag_filter = [str(t) for t in request.filter]
+        title_blocklist = self._settings.federation.index_title_blocklist
+        page_limit = _clamp_page_limit(int(request.limit))
+        rows = self._manager.sqlite.list_index(
+            limit=page_limit + 1,
+            projects=effective_projects,
+            after_rowid=since_rev,
+        )
+        has_more = len(rows) > page_limit
+        records: list[Any] = []
+        latest_rev = since_rev
+        blocked = 0
+        for entry, rowid in rows[:page_limit]:
+            latest_rev = rowid
+            if tag_filter and not any(t in entry.tags for t in tag_filter):
+                continue
+            if title_blocklist and title_matches_blocklist(entry.title, title_blocklist):
+                blocked += 1
+                continue
+            records.append(_metadata_to_proto(entry))
+        logger.info(
+            "mesh_server: index sync served entries=%d peer=%s since_rev=%d "
+            "latest_rev=%d has_more=%s title_blocked=%d",
+            len(records),
+            resolved_peer,
+            since_rev,
+            latest_rev,
+            has_more,
+            blocked,
+        )
+        return _mesh_gen.fed_pb2.MetadataSyncResponse(
+            records=records,
+            latest_rev=latest_rev,
+            has_more=has_more,
+            trigger_code=_trigger_code_to_proto(TriggerCode.EXHAUSTIVE),
+        )
+
+    # ── RPC: SyncMetadata ──────────────────────────────────────────────────
+
+    def SyncMetadata(  # noqa: N802 -- gRPC servicer override; name dictated by generated core_pb2_grpc.MnemosCoreServicer
+        self,
+        request: Any,
+        context: grpc.ServicerContext[Any, Any],
+    ) -> Any:
+        """Serve a metadata-only page of the ``federation_index`` (S2 export).
+
+        Chairman ruling 2026-09-20 (ADR-0021 Q10.2 poll-first): the
+        mesh↔mnemos export leg. The mesh relays the FederationPeer wire
+        messages to its peer leg verbatim — metadata only, no content.
+
+        Steps (mirrors :rpc:`ListMemories`):
+
+        1. Resolve the peer from gRPC metadata (single-peer fallback for
+           tests) — NEVER the caller-asserted ``request.peer_id``.
+        2. W2.5 TCP leg: pin the client-cert fingerprint on TLS
+           connections (UDS calls skip this).
+        3. ACL GATE — every request, scoped OR unscoped (fail-closed):
+           empty effective set or a disallowed ``project_scope`` →
+           ``PERMISSION_DENIED``.
+        4. Delegate to :meth:`build_metadata_sync_response`; a garbage
+           ``since_rev`` surfaces as ``INVALID_ARGUMENT`` (ADR-0020
+           rule 3).
+        """
+        peer_id = self._peer_id_from_context(context) or self._single_peer_id()
+        if peer_id is None:
+            logger.info("mesh_server: SyncMetadata refused — no peer identity")
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("no peer identity and not exactly one peer configured")
+            return _mesh_gen.fed_pb2.MetadataSyncResponse(
+                records=[], latest_rev=int(request.since_rev), has_more=False
+            )
+        pin_peer = _resolve_peer(self._settings, peer_id)
+        if pin_peer is not None and not self._enforce_tls_client_pin(pin_peer, context):
+            return _mesh_gen.fed_pb2.MetadataSyncResponse(
+                records=[], latest_rev=int(request.since_rev), has_more=False
+            )
+        allowed_projects = self._allowed_projects_for_peer(peer_id)
+        if not allowed_projects:
+            logger.info(
+                "mesh_server: SyncMetadata refused — empty effective allowed set for peer_id=%s",
+                peer_id,
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(
+                f"ACL REFUSED: peer {peer_id!r} has an empty effective allowed-projects set"
+            )
+            return _mesh_gen.fed_pb2.MetadataSyncResponse(
+                records=[], latest_rev=int(request.since_rev), has_more=False
+            )
+        project_scope = str(request.project_scope)
+        if project_scope and project_scope not in allowed_projects:
+            logger.info(
+                "mesh_server: SyncMetadata refused — project_scope=%s not allowed for peer_id=%s",
+                project_scope,
+                peer_id,
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(f"ACL REFUSED: project_scope {project_scope!r} not allowed")
+            return _mesh_gen.fed_pb2.MetadataSyncResponse(
+                records=[], latest_rev=int(request.since_rev), has_more=False
+            )
+        try:
+            return self.build_metadata_sync_response(request, peer_id=peer_id)
+        except CursorError as exc:
+            logger.info("mesh_server: SyncMetadata rejected since_rev (%s)", exc)
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(f"invalid since_rev: {exc}")
+            return _mesh_gen.fed_pb2.MetadataSyncResponse(records=[], latest_rev=0, has_more=False)
+
+    # ── RPC: UpsertIndexEntries ────────────────────────────────────────────
+
+    def UpsertIndexEntries(  # noqa: N802 -- gRPC servicer override; name dictated by generated core_pb2_grpc.MnemosCoreServicer
+        self,
+        request: Any,
+        context: grpc.ServicerContext[Any, Any],
+    ) -> Any:
+        """Import peer metadata entries into ``federation_index`` (S2 leg).
+
+        Chairman ruling 2026-09-20: a SEPARATE RPC from WriteMemory —
+        index-only semantics (WriteMemory = content, UpsertIndexEntries
+        = metadata); the ACL model is the same fail-closed per-peer
+        gate on the write path.
+
+        Steps (mirrors :rpc:`WriteMemory`):
+
+        1. Resolve the peer from gRPC metadata (single-peer fallback
+           for tests); enforce the TLS pin on TLS connections.
+        2. ACL GATE (fail-closed, whole-RPC): empty effective set →
+           ``PERMISSION_DENIED``. Per entry: an entry WITHOUT a
+           ``project`` cannot be ACL'd → deny; an entry whose project
+           is outside the effective allowed set → deny. Authorization
+           violations abort the batch (the peer is misbehaving — write
+           path, same posture as WriteMemory).
+        3. Boundary validation + Q10.9 gates (per entry, COUNTED — one
+           bad entry never aborts the batch): schema validation
+           (unknown ``content_state``, oversized title, foreign
+           ``schema_version``, empty id, unparseable or future-dated
+           ``timestamp`` — canonicalised to UTC on the way in, review
+           blocker 2), ``mnemos:no-federate`` tag, title blocklist →
+           ``rejected_by_gate``.
+        4. Origin hygiene: ``origin_peer`` empty/``"self"`` on the wire
+           is re-stamped to the AUTHENTICATED sender id.
+        5. Upsert via ``upsert_index_entries`` (LWW-by-timestamp, Q10.6;
+           the storage gates re-apply as defence-in-depth). The store
+           enforces the origin-mutation ruling (review blocker 1,
+           CWE-284): an EXISTING row is only mutable by its origin —
+           the authenticated sender must equal the stored
+           ``origin_peer`` (a transit re-send or a foreign ``self``
+           claim against another origin's id is refused into
+           ``rejected_by_gate``; NEW ids with an explicit foreign
+           origin remain importable — that is transit). Entries that
+           lose LWW to a newer stored row are neither accepted nor
+           rejected (silently superseded; counted in the log line).
+        """
+        peer_id = self._peer_id_from_context(context) or self._single_peer_id()
+        if peer_id is None:
+            logger.info("mesh_server: UpsertIndexEntries refused — no peer identity")
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("no peer identity and not exactly one peer configured")
+            return _mesh_gen.core_pb2.UpsertIndexEntriesResponse(accepted=0, rejected_by_gate=0)
+        pin_peer = _resolve_peer(self._settings, peer_id)
+        if pin_peer is not None and not self._enforce_tls_client_pin(pin_peer, context):
+            return _mesh_gen.core_pb2.UpsertIndexEntriesResponse(accepted=0, rejected_by_gate=0)
+        allowed_projects = self._allowed_projects_for_peer(peer_id)
+        if not allowed_projects:
+            logger.info(
+                "mesh_server: UpsertIndexEntries refused — empty effective set for peer_id=%s",
+                peer_id,
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(
+                f"ACL REFUSED: peer {peer_id!r} has an empty effective allowed-projects set"
+            )
+            return _mesh_gen.core_pb2.UpsertIndexEntriesResponse(accepted=0, rejected_by_gate=0)
+
+        title_blocklist = self._settings.federation.index_title_blocklist
+        clean: list[FederationIndexEntry] = []
+        rejected = 0
+        for pb_record in request.entries:
+            try:
+                entry = _metadata_entry_from_proto(pb_record, sender_peer_id=peer_id)
+            except (ValidationError, ValueError) as exc:
+                rejected += 1
+                logger.info(
+                    "mesh_server: UpsertIndexEntries rejected entry (%s)",
+                    exc,
+                )
+                continue
+            # Write-path ACL BEFORE any write (WriteMemory mirror):
+            # authorization violations abort the whole RPC.
+            if not entry.project:
+                logger.info(
+                    "mesh_server: UpsertIndexEntries refused — entry id=%s carries no project",
+                    entry.id,
+                )
+                context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+                context.set_details("ACL REFUSED: entry carries no project — cannot be ACL'd")
+                return _mesh_gen.core_pb2.UpsertIndexEntriesResponse(
+                    accepted=0, rejected_by_gate=rejected
+                )
+            if entry.project not in allowed_projects:
+                logger.info(
+                    "mesh_server: UpsertIndexEntries refused — project=%s not allowed "
+                    "for peer_id=%s",
+                    entry.project,
+                    peer_id,
+                )
+                context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+                context.set_details(
+                    f"ACL REFUSED: project {entry.project!r} not allowed for peer {peer_id!r}"
+                )
+                return _mesh_gen.core_pb2.UpsertIndexEntriesResponse(
+                    accepted=0, rejected_by_gate=rejected
+                )
+            # Q10.9 import gates — counted, never abort the batch.
+            if NO_FEDERATE_TAG in entry.tags:
+                rejected += 1
+                logger.info(
+                    "mesh_server: UpsertIndexEntries rejected entry id=%s — no-federate tag",
+                    entry.id,
+                )
+                continue
+            if title_blocklist and title_matches_blocklist(entry.title, title_blocklist):
+                rejected += 1
+                logger.info(
+                    "mesh_server: UpsertIndexEntries rejected entry id=%s — title blocklist",
+                    entry.id,
+                )
+                continue
+            clean.append(entry)
+
+        stats = self._manager.sqlite.upsert_index_entries(
+            clean, sender_peer_id=peer_id, title_blocklist=title_blocklist
+        )
+        rejected_by_gate = rejected + stats.refused
+        logger.info(
+            "mesh_server: index upsert accepted=%d rejected_by_gate=%d stale=%d total=%d peer=%s",
+            stats.written,
+            rejected_by_gate,
+            stats.stale,
+            len(request.entries),
+            peer_id,
+        )
+        return _mesh_gen.core_pb2.UpsertIndexEntriesResponse(
+            accepted=stats.written,
+            rejected_by_gate=rejected_by_gate,
+            trigger_code=_trigger_code_to_proto(TriggerCode.EXHAUSTIVE),
         )
 
     # ── RPC: Heartbeat ─────────────────────────────────────────────────────

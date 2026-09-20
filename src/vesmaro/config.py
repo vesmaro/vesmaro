@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -562,6 +563,15 @@ class FederationConfig(BaseModel):
             containerised deployments where ``~/.mnemos`` is ephemeral.
             The log is never replicated, never exported, never synced
             (leak surface, contract §10 "Где хранится").
+        index_title_blocklist: Q10.9 title-regex patterns (Python ``re``,
+            ``re.search`` semantics) applied to the S2 ``federation_index``
+            at BOTH gates — metadata rows whose ``title`` matches any
+            pattern are dropped from metadata-sync answers (export) and
+            refused at upsert (import). Rationale: metadata distribution
+            IS export (ADR-0021 ruling 9 — an index row is an inference
+            surface). Empty list (default) = no title filtering. Each
+            pattern must compile — invalid regex fails at the config
+            boundary (startup fail-fast, never a silent skip).
     """
 
     shared_projects: list[str] = Field(default_factory=list)
@@ -569,6 +579,7 @@ class FederationConfig(BaseModel):
     moderation_refuse_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
     peers: dict[str, PeerConfig] = Field(default_factory=dict)
     access_log_path: str | None = Field(default=None, max_length=4096)
+    index_title_blocklist: list[str] = Field(default_factory=list, max_length=256)
 
     @field_validator("shared_projects")
     @classmethod
@@ -582,6 +593,29 @@ class FederationConfig(BaseModel):
         _reject_degenerate_project_slugs(
             "FederationConfig.shared_projects", value, allow_wildcard=False
         )
+        return value
+
+    @field_validator("index_title_blocklist")
+    @classmethod
+    def _index_title_blocklist_compiles(cls, value: list[str]) -> list[str]:
+        """Q10.9 title-regex gate — every pattern must be a valid regex.
+
+        The patterns are applied at BOTH federation-index gates (serve
+        and import) by :func:`vesmaro.compact.title_matches_blocklist`.
+        A pattern that does not compile is a config error: failing at
+        the config boundary (startup) instead of at sync time keeps the
+        operator's blocklist intent fail-closed — a silently skipped
+        pattern would quietly widen the export surface.
+        """
+        for pattern in value:
+            if not pattern:
+                raise ValueError("index_title_blocklist: blank pattern is not a valid regex")
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(
+                    f"index_title_blocklist: pattern {pattern!r} does not compile: {exc}"
+                ) from exc
         return value
 
 
