@@ -528,18 +528,18 @@ class FederationIndexEntry(BaseModel):
     Wire shape (``federation.proto::MetadataRecord``): ``id``, ``type``,
     ``title`` ≤ :data:`MAX_TITLE_LEN`, ``tags``, ``project``,
     ``source_agent``, ``source_peer`` (last-hop provenance for multi-hop
-    dedup), ``timestamp``, ``schema_version``.
-
-    Storage-side additions (Q10.3; NOT yet on the wire — adding them to
-    the proto is an archcom-enumerated additive move, see ADR-0021):
+    dedup), ``timestamp``, ``schema_version``, plus the Q10.3 additive
+    fields (wire 10/11, chairman ruling 2026-09-20):
 
     * ``origin_peer`` — where the content body lives. With >2 stores it
       diverges from ``source_peer``; conflating the two breaks lazy
-      fetch. ``"self"`` = the responding core's local corpus.
+      fetch. ``"self"`` = the responding core's local corpus (an
+      importer re-stamps a foreign ""/"self" to the authenticated
+      sender id).
     * ``content_state`` — ``available`` / ``tombstoned``.
     * ``received_at`` — ISO 8601 UTC, stamped by the STORE at upsert
-      time (when THIS core first/most-recently received the row); not
-      part of the wire record.
+      time (when THIS core first/most-recently received the row);
+      storage-side only, never on the wire.
 
     Validation at this boundary (peers are untrusted): ``id`` is
     non-empty, ``title`` ≤ 256 chars, ``content_state`` is a known

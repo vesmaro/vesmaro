@@ -1,6 +1,6 @@
-"""S2 federation_index substrate tests (ADR-0021 Q10.2/Q10.3, archcom 2026-09-20).
+"""S2 federation_index tests (ADR-0021 Q10.2/Q10.3, chairman ruling 2026-09-20).
 
-Covers the meta-mirror phase-1 substrate delivered in this slice:
+Covers the meta-mirror phase-1 substrate + the two registered RPCs:
 
 * Schema/migration — the table is created ``IF NOT EXISTS`` at startup
   on a FRESH database and re-created on an EXISTING database (the
@@ -13,31 +13,35 @@ Covers the meta-mirror phase-1 substrate delivered in this slice:
 * ``build_metadata_entry`` — local-memory → index-row synthesis
   (origin='self'), no-federate exclusion, moderation-refuse exclusion,
   title ≤ 256.
-* ``MnemosCoreServicer.build_metadata_sync_response`` — the future
-  core-side SyncMetadata RPC body, exercised with REAL generated
-  ``fed_pb2`` messages: ACL fail-closed matrix, watermark pagination
-  stability (no dupes / no gaps across pages), tag filter, Q10.9
-  title-blocklist on serve, empty corpus.
+* ``MnemosCoreServicer.build_metadata_sync_response`` — the
+  SyncMetadata RPC body, exercised with REAL generated ``fed_pb2``
+  messages: ACL fail-closed matrix, watermark pagination stability
+  (no dupes / no gaps across pages), tag filter, Q10.9 title-blocklist
+  on serve, empty corpus.
+* REAL gRPC round trips for both registered RPCs (Unix socket, no
+  mocks): ``SyncMetadata`` (wire ``origin_peer``/``content_state``/``limit``
+  fields, watermark pagination, ACL matrix → PERMISSION_DENIED, garbage
+  ``since_rev`` → INVALID_ARGUMENT) and ``UpsertIndexEntries`` (origin
+  hygiene ""/"self" → authenticated sender, gate counters, idempotent
+  replay, stale-LWW, write-path ACL matrix → PERMISSION_DENIED).
 * ``SubscribeStream`` oneof — the ``record`` oneof's ``metadata``
   variant (the only metadata oneof in the proto — verified: SyncMetadata
   messages carry none) populates ``WhichOneof("record") == "metadata"``
   and survives a serialize/parse round trip.
 * Config — ``index_title_blocklist`` rejects non-compiling regex at the
   config boundary.
-
-What these tests deliberately do NOT cover (proto STOP, task contract):
-there is no real-gRPC SyncMetadata round trip because ``MnemosCore``
-has no metadata RPC — wiring one requires the enumerated proto moves
-reported with this slice.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import grpc
 import pytest
 from pydantic import ValidationError
 
@@ -51,7 +55,11 @@ from vesmaro.compact import (
 )
 from vesmaro.config import FederationConfig, PeerConfig, Settings
 from vesmaro.manager import MemoryManager
-from vesmaro.mesh_server import MnemosCoreServicer, _metadata_stream_event
+from vesmaro.mesh_server import (
+    MeshServer,
+    MnemosCoreServicer,
+    _metadata_stream_event,
+)
 from vesmaro.models import MemoryCreate, MemorySource
 from vesmaro.storage.sqlite_store import SQLiteStore
 
@@ -595,3 +603,241 @@ class TestTitleBlocklistConfig:
         assert not title_matches_blocklist("INTERNAL ONLY note", [r"internal\s+only"])
         assert not title_matches_blocklist("Public decision", [r"secret"])
         assert not title_matches_blocklist("Anything", [])
+
+
+# ── Real-gRPC round trips (registered RPCs, chairman ruling 2026-09-20) ──────
+
+
+def _pb_entry(
+    entry_id: str = "fed:remote-agent:uuid-1",
+    *,
+    title: str = "Remote decision",
+    project: str = _PROJECT,
+    tags: list[str] | None = None,
+    origin_peer: str = _REMOTE_ORIGIN,
+    content_state: str = "available",
+    timestamp: str = "2026-09-01T10:00:00Z",
+    schema_version: str = METADATA_SCHEMA,
+) -> Any:
+    """Build a wire MetadataRecord mirroring what a peer would send."""
+    return _mesh_gen.fed_pb2.MetadataRecord(
+        id=entry_id,
+        type="decision",
+        title=title,
+        tags=tags if tags is not None else [f"project:{project}", "mnemos:decision"],
+        project=project,
+        source_agent="remote-agent",
+        source_peer=_REMOTE_ORIGIN,
+        timestamp=timestamp,
+        schema_version=schema_version,
+        origin_peer=origin_peer,
+        content_state=content_state,
+    )
+
+
+@contextmanager
+def _grpc_server(
+    tmp_path: Path,
+    *,
+    allowed: list[str] | None = None,
+    title_blocklist: list[str] | None = None,
+) -> Generator[tuple[Any, MemoryManager], None, None]:
+    """Run a real MeshServer on a tmp Unix socket; yield (stub, manager)."""
+    import grpc as _grpc
+
+    settings = _settings(tmp_path, allowed=allowed, title_blocklist=title_blocklist)
+    mgr = MemoryManager(settings)
+    mock_embedder = MagicMock()
+    mock_embedder.embed.return_value = [0.1] * 384
+    mgr._embedder = mock_embedder
+    srv = MeshServer(str(tmp_path / "core.sock"), mgr, settings, max_workers=2)
+    srv.start()
+    channel = _grpc.insecure_channel(f"unix://{srv.socket_path}")
+    _grpc.channel_ready_future(channel).result(timeout=2.0)
+    stub = _mesh_gen.core_pb2_grpc.MnemosCoreStub(channel)
+    try:
+        yield stub, mgr
+    finally:
+        channel.close()
+        srv.stop(grace=0.5)
+        mgr.close()
+
+
+class TestSyncMetadataRPC:
+    """Real gRPC round trips for MnemosCore.SyncMetadata (S2 export leg)."""
+
+    def test_serves_index_with_origin_and_content_state(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, mgr):
+            mgr.sqlite.upsert_index_entries(
+                [_entry("fed:r:1"), _entry("fed:r:2", content_state="tombstoned")]
+            )
+            resp = stub.SyncMetadata(
+                _mesh_gen.fed_pb2.MetadataSyncRequest(peer_id=_PEER_ID, since_rev=0)
+            )
+            assert len(resp.records) == 2
+            assert resp.trigger_code == _mesh_gen.fed_pb2.EXHAUSTIVE
+            by_id = {r.id: r for r in resp.records}
+            assert by_id["fed:r:1"].origin_peer == _REMOTE_ORIGIN
+            assert by_id["fed:r:1"].content_state == "available"
+            assert by_id["fed:r:2"].content_state == "tombstoned"
+            assert all(r.schema_version == METADATA_SCHEMA for r in resp.records)
+
+    def test_limit_field_paginates_over_wire(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, mgr):
+            mgr.sqlite.upsert_index_entries([_entry(f"fed:r:{i:02d}") for i in range(12)])
+            delivered: list[str] = []
+            since = 0
+            pages = 0
+            for _ in range(10):
+                resp = stub.SyncMetadata(
+                    _mesh_gen.fed_pb2.MetadataSyncRequest(
+                        peer_id=_PEER_ID, since_rev=since, limit=5
+                    )
+                )
+                pages += 1
+                assert len(resp.records) <= 5
+                delivered.extend(r.id for r in resp.records)
+                since = resp.latest_rev
+                if not resp.has_more:
+                    break
+            assert pages == 3  # 5 + 5 + 2
+            assert sorted(delivered) == sorted(f"fed:r:{i:02d}" for i in range(12))
+            assert len(delivered) == len(set(delivered))  # no dupes
+
+    def test_acl_unknown_peer_permission_denied(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, mgr):
+            mgr.sqlite.upsert_index_entries([_entry()])
+            with pytest.raises(grpc.RpcError) as excinfo:
+                stub.SyncMetadata(
+                    _mesh_gen.fed_pb2.MetadataSyncRequest(peer_id=_PEER_ID),
+                    metadata=(("x-mnemos-peer-id", "mnemos-UNKNOWN"),),
+                )
+            assert excinfo.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_acl_empty_allowed_set_permission_denied(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path, allowed=[]) as (stub, _mgr):
+            with pytest.raises(grpc.RpcError) as excinfo:
+                stub.SyncMetadata(_mesh_gen.fed_pb2.MetadataSyncRequest(peer_id=_PEER_ID))
+            assert excinfo.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_acl_denied_scope_permission_denied(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, mgr):
+            mgr.sqlite.upsert_index_entries([_entry()])
+            with pytest.raises(grpc.RpcError) as excinfo:
+                stub.SyncMetadata(
+                    _mesh_gen.fed_pb2.MetadataSyncRequest(
+                        peer_id=_PEER_ID, project_scope=_PROJECT_DENIED
+                    )
+                )
+            assert excinfo.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_garbage_since_rev_invalid_argument(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, _mgr):
+            with pytest.raises(grpc.RpcError) as excinfo:
+                stub.SyncMetadata(
+                    _mesh_gen.fed_pb2.MetadataSyncRequest(peer_id=_PEER_ID, since_rev=-1)
+                )
+            assert excinfo.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+
+class TestUpsertIndexEntriesRPC:
+    """Real gRPC round trips for MnemosCore.UpsertIndexEntries (S2 import leg)."""
+
+    def test_accepts_and_persists_with_origin_hygiene(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, mgr):
+            resp = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[
+                        _pb_entry("fed:r:explicit"),  # origin preserved
+                        _pb_entry("fed:r:selfclaim", origin_peer="self"),
+                        _pb_entry("fed:r:emptyclaim", origin_peer=""),
+                    ]
+                )
+            )
+            assert resp.accepted == 3
+            assert resp.rejected_by_gate == 0
+            assert resp.trigger_code == _mesh_gen.fed_pb2.EXHAUSTIVE
+            by_id = {e.id: e for e, _ in mgr.sqlite.list_index()}
+            assert by_id["fed:r:explicit"].origin_peer == _REMOTE_ORIGIN
+            # ""/"self" claims re-stamped to the AUTHENTICATED sender id.
+            assert by_id["fed:r:selfclaim"].origin_peer == _PEER_ID
+            assert by_id["fed:r:emptyclaim"].origin_peer == _PEER_ID
+
+    def test_gate_counters_reject_bad_entries_not_batch(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path, title_blocklist=[r"secret\s+sprint"]) as (stub, mgr):
+            resp = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[
+                        _pb_entry("fed:r:ok"),
+                        _pb_entry("fed:r:nofed", tags=["project:p", "mnemos:no-federate"]),
+                        _pb_entry("fed:r:blocked", title="Internal secret sprint plan"),
+                        _pb_entry("fed:r:badstate", content_state="vaporized"),
+                        _pb_entry("fed:r:forgn", schema_version="evil.v9"),
+                        _pb_entry("fed:r:longtitle", title="x" * 300),
+                    ]
+                )
+            )
+            assert resp.accepted == 1
+            assert resp.rejected_by_gate == 5
+            assert [e.id for e, _ in mgr.sqlite.list_index()] == ["fed:r:ok"]
+
+    def test_replay_is_idempotent_single_row(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, mgr):
+            request = _mesh_gen.core_pb2.UpsertIndexEntriesRequest(entries=[_pb_entry("fed:r:1")])
+            assert stub.UpsertIndexEntries(request).accepted == 1
+            assert stub.UpsertIndexEntries(request).accepted == 1  # LWW equal-ts replace
+            assert len(mgr.sqlite.list_index()) == 1
+
+    def test_stale_timestamp_lww_silently_superseded(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, mgr):
+            stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[_pb_entry("fed:r:1", title="Newer", timestamp="2026-09-10T00:00:00Z")]
+                )
+            )
+            resp = stub.UpsertIndexEntries(
+                _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                    entries=[_pb_entry("fed:r:1", title="Older", timestamp="2026-09-01T00:00:00Z")]
+                )
+            )
+            assert resp.accepted == 0  # stale: neither accepted nor gate-rejected
+            assert resp.rejected_by_gate == 0
+            (entry, _rowid) = mgr.sqlite.list_index()[0]
+            assert entry.title == "Newer"
+
+    def test_acl_entry_project_denied_permission_denied(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, _mgr):
+            with pytest.raises(grpc.RpcError) as excinfo:
+                stub.UpsertIndexEntries(
+                    _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                        entries=[_pb_entry("fed:r:1", project=_PROJECT_DENIED)]
+                    )
+                )
+            assert excinfo.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_acl_entry_without_project_permission_denied(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, _mgr):
+            with pytest.raises(grpc.RpcError) as excinfo:
+                stub.UpsertIndexEntries(
+                    _mesh_gen.core_pb2.UpsertIndexEntriesRequest(
+                        entries=[_pb_entry("fed:r:1", project="", tags=["mnemos:decision"])]
+                    )
+                )
+            assert excinfo.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_acl_unknown_peer_permission_denied(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path) as (stub, _mgr):
+            with pytest.raises(grpc.RpcError) as excinfo:
+                stub.UpsertIndexEntries(
+                    _mesh_gen.core_pb2.UpsertIndexEntriesRequest(entries=[_pb_entry()]),
+                    metadata=(("x-mnemos-peer-id", "mnemos-UNKNOWN"),),
+                )
+            assert excinfo.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_acl_empty_allowed_set_permission_denied(self, tmp_path: Path) -> None:
+        with _grpc_server(tmp_path, allowed=[]) as (stub, _mgr):
+            with pytest.raises(grpc.RpcError) as excinfo:
+                stub.UpsertIndexEntries(
+                    _mesh_gen.core_pb2.UpsertIndexEntriesRequest(entries=[_pb_entry()])
+                )
+            assert excinfo.value.code() == grpc.StatusCode.PERMISSION_DENIED

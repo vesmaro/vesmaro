@@ -246,13 +246,56 @@ message HeartbeatResponse {
   int64 uptime_seconds = 3;
 }
 
+// UpsertIndexEntriesRequest — S2 meta-mirror IMPORT leg (ADR-0021 Q10.2/
+// Q10.3, chairman ruling 2026-09-20). The mesh delivers MetadataRecord
+// entries learned from a peer into the receiving core's federation_index.
+//
+// Deliberately a SEPARATE RPC from WriteMemory (chairman ruling: purity of
+// semantics — WriteMemory is content, UpsertIndexEntries is index-only
+// metadata; the ACL model is the same fail-closed per-peer gate).
+//
+// Idempotent by MetadataRecord.id with LWW-by-timestamp conflict
+// resolution (ADR-0021 ruling Q10.6): replaying a batch is safe.
+message UpsertIndexEntriesRequest {
+  // The metadata entries to upsert. Each is validated at the boundary
+  // (id non-empty, title ≤256, known content_state, pinned
+  // schema_version) and passes the Q10.9 import gates (title-regex
+  // blocklist, mnemos:no-federate tag). Invalid/gated entries are
+  // COUNTED, never abort the batch.
+  repeated mnemos.federation.v1.MetadataRecord entries = 1;
+}
+
+// UpsertIndexEntriesResponse — per-batch import counters.
+message UpsertIndexEntriesResponse {
+  // Entries actually written to federation_index (inserted or replaced
+  // by LWW). NOTE: accepted + rejected_by_gate need not total the
+  // request size — an entry that loses LWW to a NEWER stored row is
+  // neither accepted nor rejected (it is silently superseded; the core
+  // logs the stale count).
+  int32 accepted = 1;
+
+  // Entries refused by the boundary gates: Q10.9 title blocklist,
+  // mnemos:no-federate tag, schema validation failure (unknown
+  // content_state, oversized title, foreign schema_version).
+  int32 rejected_by_gate = 2;
+
+  // EXHAUSTIVE on a served batch. A whole-RPC ACL violation does not
+  // reach this response — it surfaces as gRPC PERMISSION_DENIED (same
+  // fail-closed write-path contract as WriteMemory).
+  mnemos.federation.v1.TriggerCodes trigger_code = 3;
+}
+
 // MnemosCore — the mesh↔mnemos core service over Unix socket + gRPC.
 //
-// Four RPCs:
+// Six RPCs:
 //   * ListMemories          — mnemos exports to mesh (mesh reads).
 //   * WriteMemory           — mesh imports to mnemos (mesh writes).
 //   * GetSubscriptionState  — cursor persistence (mesh reads on reconnect).
 //   * Heartbeat             — liveness probe (both directions).
+//   * SyncMetadata          — S2 export leg: mesh reads the federation
+//                             index (metadata-only, ADR-0021 Q10.2).
+//   * UpsertIndexEntries    — S2 import leg: mesh writes peer metadata
+//                             into the federation index (ADR-0021).
 //
 // mnemos is the source of truth for storage AND moderation. The mesh is
 // transport only: it never decrypts payloads, never accesses the SQLite
@@ -275,6 +318,22 @@ service MnemosCore {
       returns (GetSubscriptionStateResponse);
 
   // Heartbeat — liveness probe between mesh and mnemos. Cheap unary call;
-  // failure within a configured timeout marks the peer component unhealthy.
+  // failure within a configured timeout marks the peer component as unhealthy.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // SyncMetadata — S2 meta-mirror EXPORT leg (ADR-0021 Q10.2 poll-first,
+  // chairman ruling 2026-09-20): a page of the core's federation_index as
+  // MetadataRecord entries, watermark-paginated over the index rowid
+  // space (since_rev → latest_rev; the ADR-0020 rowid-walk mechanic).
+  // Reuses the FederationPeer wire messages verbatim — the mesh relays
+  // them to its peer leg without re-marshalling. Metadata-only: no
+  // CompactRecord bodies, no content.
+  rpc SyncMetadata(mnemos.federation.v1.MetadataSyncRequest)
+      returns (mnemos.federation.v1.MetadataSyncResponse);
+
+  // UpsertIndexEntries — S2 meta-mirror IMPORT leg (ADR-0021): upsert
+  // peer metadata entries into the receiving core's federation_index.
+  // Idempotent by id (LWW-by-timestamp); Q10.9 gates at import.
+  rpc UpsertIndexEntries(UpsertIndexEntriesRequest)
+      returns (UpsertIndexEntriesResponse);
 }

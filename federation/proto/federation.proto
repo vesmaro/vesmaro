@@ -163,6 +163,21 @@ message MetadataRecord {
   // Allows the metadata-sync protocol to evolve independently from the
   // full-record pull protocol.
   string schema_version = 9;  // = "mnemos.federation.metadata.v1"
+
+  // Peer where the content BODY lives (additive, ADR-0021 Q10.3, archcom
+  // 2026-09-20 chairman ruling). `source_peer` stays "last-hop provenance"
+  // for multi-hop dedup; with >2 stores the two diverge, and conflating
+  // them breaks lazy fetch. "self" MUST only be minted by the origin core
+  // about its own corpus; an importer receiving "" or "self" rewrites it
+  // to the authenticated sender's peer id (a foreign record never enters
+  // the receiving core's local origin namespace).
+  string origin_peer = 10;
+
+  // Content availability of the pointed-at record (additive, ADR-0021
+  // Q10.3): "available" | "tombstoned". Tombstones let mirrors age out
+  // pointers without learning why — no deletion reason crosses servers.
+  // Empty string = "available" (proto3 default; importers treat it so).
+  string content_state = 11;
 }
 
 // TriggerCodes — exhaustive-response + soft-cutoff codes (contract §9).
@@ -300,6 +315,13 @@ message MetadataSyncRequest {
   // Optional tag filter — only return MetadataRecord entries whose tags
   // intersect this set. Empty list = no filter (all tags).
   repeated string filter = 4;
+
+  // Page size hint (additive, ADR-0021 chairman ruling 2026-09-20):
+  // maximum number of records in one response. 0 = the responding
+  // core's default (50); values above the core's hard ceiling are
+  // clamped down. Pagination is watermark-driven: re-poll with
+  // since_rev = the previous response's latest_rev.
+  int32 limit = 5;
 }
 
 // MetadataSyncResponse — B's answer to a MetadataSyncRequest.
