@@ -175,7 +175,7 @@ if ! $NO_RELEASE; then
       gh release create "$TAG" dist/* --generate-notes --title "v$VERSION"; rc=$?
     fi
     set -e
-    [[ $rc -eq 0 ]] && { record "GitHub Release" "PASS"; echo "  https://github.com/Korrnals/mnemos/releases/tag/$TAG"; } || { record "GitHub Release" "FAIL"; echo "  Check: gh auth status" >&2; }
+    [[ $rc -eq 0 ]] && { record "GitHub Release" "PASS"; echo "  https://github.com/vesmaro/vesmaro/releases/tag/$TAG"; } || { record "GitHub Release" "FAIL"; echo "  Check: gh auth status" >&2; }
   fi
 fi
 

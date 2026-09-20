@@ -4,7 +4,7 @@ name: publish-npm
 # @korrlabs/mnemos-pi) on every `v*` tag. Uses npm Trusted Publishing (OIDC) —
 # NO NPM_TOKEN secret is stored. Requires a one-time manual first publish of
 # each name + a Trusted Publisher configured per name on npmjs.com:
-#   repository: Korrnals/mnemos
+#   repository: vesmaro/vesmaro
 #   workflow:    publish-npm.yml
 #   environment: npm
 # See scripts/publish-all.mjs for the first-publish + trusted-publisher notes.

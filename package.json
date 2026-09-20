@@ -5,13 +5,13 @@
   "type": "module",
   "license": "Apache-2.0",
   "author": "Korrnals",
-  "homepage": "https://github.com/Korrnals/mnemos",
+  "homepage": "https://github.com/vesmaro/vesmaro",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Korrnals/mnemos.git"
+    "url": "git+https://github.com/vesmaro/vesmaro.git"
   },
   "bugs": {
-    "url": "https://github.com/Korrnals/mnemos/issues"
+    "url": "https://github.com/vesmaro/vesmaro/issues"
   },
   "keywords": [
     "pi-package",

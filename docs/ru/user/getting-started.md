@@ -42,7 +42,7 @@ Mnemos опубликован на PyPI как **`mnemos-memory-server`**. Вы�
 integration-пак:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/install.sh | bash
 ```
 
 ### Фиксация версии и другие каналы
@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/instal
 |-------|---------|
 | Зафиксировать версию | `pip install mnemos-memory-server==4.1.0` |
 | Контейнер одной командой | `… install.sh \| bash -s -- --container` — см. [container-deployment.md](../admin/runbooks/container-deployment.md) |
-| Из исходников (контрибьюторам) | `git clone https://github.com/Korrnals/mnemos && cd mnemos && uv venv && source .venv/bin/activate && uv pip install -e ".[dev]"` — см. [CONTRIBUTING.ru.md](../../../CONTRIBUTING.ru.md) |
+| Из исходников (контрибьюторам) | `git clone https://github.com/vesmaro/vesmaro && cd vesmaro && uv venv && source .venv/bin/activate && uv pip install -e ".[dev]"` — см. [CONTRIBUTING.ru.md](../../../CONTRIBUTING.ru.md) |
 
 <details>
 <summary><strong>Готовый wheel и готовый контейнерный образ</strong> — каналы с фиксированной версией</summary>
@@ -60,7 +60,7 @@ curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/instal
 
 <!-- version:pip -->
 ```bash
-pip install https://github.com/Korrnals/mnemos/releases/download/v4.3.0/mnemos_memory_server-4.3.0-py3-none-any.whl
+pip install https://github.com/vesmaro/vesmaro/releases/download/v4.3.0/mnemos_memory_server-4.3.0-py3-none-any.whl
 ```
 <!-- /version:pip -->
 

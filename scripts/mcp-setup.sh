@@ -2,7 +2,7 @@
 # scripts/mcp-setup.sh — register Mnemos as an MCP server in VS Code
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/mcp-setup.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/mcp-setup.sh | bash
 #   curl -fsSL .../mcp-setup.sh | bash -s -- --scope workspace
 #   curl -fsSL .../mcp-setup.sh | bash -s -- --scope user --data-dir ~/.mnemos --vault ~/mnemos-vault
 #
@@ -59,7 +59,7 @@ if [[ -z "$MNEMOS_CMD" ]]; then
     MNEMOS_CMD="$(command -v mnemos)"; info "Found mnemos on PATH: ${MNEMOS_CMD}"
   fi
 fi
-[[ -z "$MNEMOS_CMD" ]] && die "mnemos executable not found. Install first: curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/install.sh | bash"
+[[ -z "$MNEMOS_CMD" ]] && die "mnemos executable not found. Install first: curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/install.sh | bash"
 
 case "$(uname -s)" in
   Darwin)  VSCODE_USER_DIR="${HOME}/Library/Application Support/Code/User" ;;

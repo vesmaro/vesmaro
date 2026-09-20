@@ -5,7 +5,7 @@ FROM docker.io/library/python:3.12-slim AS base
 
 LABEL maintainer="abyss"
 LABEL description="Mnemos: hybrid long-term memory system for AI agents"
-LABEL org.opencontainers.image.source="https://github.com/Korrnals/mnemos"
+LABEL org.opencontainers.image.source="https://github.com/vesmaro/vesmaro"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 ENV PYTHONUNBUFFERED=1 \

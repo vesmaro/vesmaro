@@ -15,7 +15,7 @@
   <a href="https://www.npmjs.com/package/pi-mnemos"><img src="https://img.shields.io/npm/v/pi-mnemos?label=npm&color=cb3837" alt="npm"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-3776ab" alt="Python"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/license-Apache_2.0-blue" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/Korrnals/mnemos/releases"><img src="https://img.shields.io/github/v/release/Korrnals/mnemos?label=version&color=blueviolet" alt="Version"></a>
+  <a href="https://github.com/vesmaro/vesmaro/releases"><img src="https://img.shields.io/github/v/release/vesmaro/vesmaro?label=version&color=blueviolet" alt="Version"></a>
 </p>
 
 <p align="center">
@@ -361,7 +361,7 @@ HTTP-поверхность также открывает **A2A Sessions API** �
 
 ## ⚖️ Лицензия и вклад
 
-Apache-2.0 — см. [LICENSE](LICENSE) и [NOTICE](NOTICE). Исходники: [github.com/Korrnals/mnemos](https://github.com/Korrnals/mnemos).
+Apache-2.0 — см. [LICENSE](LICENSE) и [NOTICE](NOTICE). Исходники: [github.com/vesmaro/vesmaro](https://github.com/vesmaro/vesmaro).
 
 Вклад приветствуется — в [CONTRIBUTING.ru.md](CONTRIBUTING.ru.md): настройка окружения разработки,
 конвенции веток и коммитов и quality gate, который должно пройти каждое изменение.
