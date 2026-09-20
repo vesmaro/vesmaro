@@ -44,6 +44,22 @@ configured peer's ``allowed_projects`` (or the global ``["*"]``
 wildcard) and returns ``PERMISSION_DENIED`` when the scope is
 disallowed. Fail-closed: unknown peer or empty allow-list → refuse.
 
+Fail-closed contract (ACL hardening, vesmaro#371/#369 family):
+
+* **No implicit "all".** The EFFECTIVE allowed set of a peer is its
+  ``allowed_projects`` verbatim, or — for the explicit ``["*"]``
+  wildcard — the global ``shared_projects`` union. An EMPTY effective
+  set (unknown peer, empty allow-list, ``"*"`` with an empty
+  ``shared_projects``) permits NOTHING: the data RPCs return
+  ``PERMISSION_DENIED``. It never widens into an unfiltered query.
+* **Unscoped = intersection.** A request without a project filter is
+  served the intersection of the corpus with the peer's effective
+  allowed set — never the whole corpus.
+* **Every data path is gated before serve/write.** :rpc:`ListMemories`
+  and :rpc:`WriteMemory` enforce the gate unconditionally (scoped AND
+  unscoped); :rpc:`WriteMemory` additionally refuses records without a
+  ``project:`` tag (an untagged record cannot be ACL'd).
+
 Security notes:
     * The server binds a Unix socket with filesystem permissions.
       Default modes are ``0600`` socket / ``0700`` dir (mnemos user
@@ -384,8 +400,12 @@ class MnemosCoreServicer:
         view of what mnemos is willing to federate. Steps (contract §3.1,
         ADR-0020 cursor contract):
 
-        1. Resolve the caller's peer. Enforce the ACL on every
-           ``project`` in the request.
+        1. Resolve the caller's peer. Enforce the ACL on every request,
+           scoped AND unscoped: each requested ``project`` must be in the
+           peer's effective allowed set, and an unscoped request is
+           intersected with that set. An empty effective set or an empty
+           intersection → ``PERMISSION_DENIED`` — never an unfiltered
+           query (fail-closed contract, vesmaro#371/#369).
         2. Validate ``resume_cursor`` when non-empty: garbage →
            ``INVALID_ARGUMENT`` (ADR-0020 rule 3 — never a silent empty
            page). A valid checkpoint takes PRIORITY over ``since`` and
@@ -422,6 +442,40 @@ class MnemosCoreServicer:
                 records=[], total=0, has_more=False, cursor=""
             )
 
+        # ACL GATE — every request, scoped OR unscoped (vesmaro#371/#369
+        # hardening): the effective allowed set is resolved
+        # UNCONDITIONALLY. An empty set (unknown peer, empty allow-list,
+        # or "*" with an empty shared_projects) DENIES — it never widens
+        # into an unfiltered query. An unscoped request intersects to the
+        # peer's full allowed set (principle: unscoped = intersection).
+        allowed_projects = self._allowed_projects_for_peer(peer_id)
+        if not allowed_projects:
+            logger.info(
+                "mesh_server: ListMemories refused — empty effective allowed set for peer_id=%s",
+                peer_id,
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(
+                f"ACL REFUSED: peer {peer_id!r} has an empty effective allowed-projects set"
+            )
+            return _mesh_gen.core_pb2.ListMemoriesResponse(
+                records=[], total=0, has_more=False, cursor=""
+            )
+        effective_projects = self._intersect_projects(projects, allowed_projects)
+        if not effective_projects:
+            # Fail-closed safety net: the store treats an empty project
+            # list as "no filter", so an empty intersection must DENY —
+            # never hand the store an unfiltered query.
+            logger.info(
+                "mesh_server: ListMemories refused — no requested project allowed for peer_id=%s",
+                peer_id,
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("ACL REFUSED: no requested project is in the allowed set")
+            return _mesh_gen.core_pb2.ListMemoriesResponse(
+                records=[], total=0, has_more=False, cursor=""
+            )
+
         # ADR-0020 resume path: validate the opaque checkpoint BEFORE any
         # query. Garbage/foreign cursors are rejected loudly so the mesh
         # degrades to a fresh subscribe (empty resume_cursor) instead of
@@ -438,9 +492,6 @@ class MnemosCoreServicer:
                     records=[], total=0, has_more=False, cursor=""
                 )
 
-        allowed_projects = self._allowed_projects_for_peer(peer_id)
-        effective_projects = self._intersect_projects(projects, allowed_projects)
-
         tags_include = list(request.tags_include) if request.tags_include else None
         tags_exclude = list(request.tags_exclude) if request.tags_exclude else None
         include_no_federate = bool(request.include_no_federate)
@@ -456,13 +507,14 @@ class MnemosCoreServicer:
         total_seen = 0
         has_more = False
         last_delivered_rowid = 0
-        # One query over the ACL-intersected project set (empty =
-        # "everything this peer is allowed", mirroring the pre-cursor
-        # semantics) — a single rowid-ASC walk keeps every page boundary a
-        # valid project-global resume checkpoint.
+        # One query over the ACL-intersected project set — a single
+        # rowid-ASC walk keeps every page boundary a valid project-global
+        # resume checkpoint. ``effective_projects`` is guaranteed non-empty
+        # by the gate above; the store treats an empty/None list as "no
+        # filter", so it is never handed one.
         rows = self._manager.sqlite.list_all_for_mesh(
             limit=fetch_limit,
-            projects=list(effective_projects) if effective_projects else None,
+            projects=list(effective_projects),
             tags=tags_include,
             since=since,
             after_rowid=checkpoint_rowid,
@@ -522,9 +574,12 @@ class MnemosCoreServicer:
 
         1. Validate the request: ``import_mode`` must be MERGE or
            RESTORE; RESTORE requires ``confirm=True`` (hard gate).
-        2. Resolve the peer from the record's ``source_agent`` (the
-           provenance). Enforce the ACL on the record's project (parsed
-           from its tags).
+        2. Resolve the peer from gRPC metadata (single-peer fallback for
+           tests). Enforce the ACL on the record's project (parsed from
+           its tags): the project must be in the peer's EFFECTIVE allowed
+           set, a record WITHOUT a ``project:`` tag is refused (it cannot
+           be ACL'd), and an empty effective set refuses everything
+           (fail-closed contract, vesmaro#371/#369).
         3. #359 duplicate gate: look up an already-imported record by
            ``fed_id`` (fallback ``title`` + ``source_agent``). A hit
            refreshes ``metadata.last_fed_at`` (when present) and returns
@@ -587,7 +642,54 @@ class MnemosCoreServicer:
                 mode_applied=mode_applied,
                 trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
             )
-        if project and self._check_acl(peer_id, project, context) is None:
+        # ACL GATE — fail-closed on the write path too (vesmaro#371/#369
+        # family), enforced BEFORE the duplicate gate, moderation, and any
+        # storage mutation:
+        # (a) an empty effective allowed set (unknown peer, empty
+        #     allow-list, "*" with an empty shared_projects) denies —
+        #     there is no implicit "all";
+        # (b) a record WITHOUT a project: tag cannot be ACL'd at all —
+        #     deny instead of writing into the project-less namespace;
+        # (c) the record's project must be IN the effective allowed set
+        #     (for a "*" peer that is the shared_projects union —
+        #     symmetric with the read-side intersection).
+        allowed_projects = self._allowed_projects_for_peer(peer_id)
+        if not allowed_projects:
+            logger.info(
+                "mesh_server: WriteMemory refused — empty effective allowed set for peer_id=%s",
+                peer_id,
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(
+                f"ACL REFUSED: peer {peer_id!r} has an empty effective allowed-projects set"
+            )
+            return _mesh_gen.core_pb2.WriteMemoryResponse(
+                written_id="",
+                mode_applied=mode_applied,
+                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            )
+        if not project:
+            logger.info(
+                "mesh_server: WriteMemory refused — record fed_id=%s carries no project tag",
+                compact.id,
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("ACL REFUSED: record carries no project: tag — cannot be ACL'd")
+            return _mesh_gen.core_pb2.WriteMemoryResponse(
+                written_id="",
+                mode_applied=mode_applied,
+                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            )
+        if project not in allowed_projects:
+            logger.info(
+                "mesh_server: WriteMemory refused — project=%s not allowed for peer_id=%s",
+                project,
+                peer_id,
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(
+                f"ACL REFUSED: project {project!r} not allowed for peer {peer_id!r}"
+            )
             return _mesh_gen.core_pb2.WriteMemoryResponse(
                 written_id="",
                 mode_applied=mode_applied,
@@ -687,8 +789,21 @@ class MnemosCoreServicer:
         :rpc:`Subscribe` stream on (re)connect. The ACL is still
         enforced: a disallowed scope returns ``PERMISSION_DENIED`` and
         an empty response.
+
+        Identity resolution matches ListMemories/WriteMemory (review
+        MINOR): gRPC metadata, or the single configured peer — NEVER the
+        caller-asserted ``request.peer_id`` (kept on the wire for
+        informational correlation only), which was an ACL oracle over
+        arbitrary peer ids.
         """
-        peer_id = self._peer_id_from_context(context) or request.peer_id
+        peer_id = self._peer_id_from_context(context) or self._single_peer_id()
+        if peer_id is None:
+            logger.info("mesh_server: GetSubscriptionState refused — no peer identity")
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("no peer identity and not exactly one peer configured")
+            return _mesh_gen.core_pb2.GetSubscriptionStateResponse(
+                cursor="", last_rev=0, last_sync_timestamp=""
+            )
         if self._check_acl(peer_id, request.project_scope, context) is None:
             return _mesh_gen.core_pb2.GetSubscriptionStateResponse(
                 cursor="", last_rev=0, last_sync_timestamp=""
@@ -747,7 +862,21 @@ class MnemosCoreServicer:
         return peers[0] if len(peers) == 1 else None
 
     def _allowed_projects_for_peer(self, peer_id: str) -> list[str]:
-        """Return the allowed projects for a peer (``["*"]`` → all shared)."""
+        """Return the peer's EFFECTIVE allowed project set (fail-closed).
+
+        Resolution rules (ACL hardening contract):
+
+        * unknown peer → ``[]`` — the caller MUST deny (no implicit
+          trust of an unconfigured identity);
+        * ``"*" in allowed_projects`` → the global ``shared_projects``
+          union (the explicit wildcard grants everything SHARED, nothing
+          more); an empty union yields ``[]`` — the caller MUST deny;
+        * otherwise → ``allowed_projects`` verbatim; an empty allow-list
+          yields ``[]`` — the caller MUST deny.
+
+        An empty result never means "no filter": every data-path caller
+        treats it as ``PERMISSION_DENIED``.
+        """
         peer = _resolve_peer(self._settings, peer_id)
         if peer is None:
             return []

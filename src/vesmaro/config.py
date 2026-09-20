@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Final, Literal
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
@@ -427,6 +427,39 @@ class OutputStyleConfig(BaseModel):
     default_effort: str = "medium"
 
 
+def _reject_degenerate_project_slugs(
+    field_name: str,
+    projects: list[str],
+    *,
+    allow_wildcard: bool,
+) -> None:
+    """Fail-closed config gate for federation project lists (review MAJOR).
+
+    Blank slugs are refused everywhere: the memories table DEFAULTs
+    ``project`` to ``''``, so an ``''`` entry in an allow-list matches
+    every UNTAGGED record in SQL (``project IN ('')``) — a silent
+    fail-open against the mesh-server untagged-record deny.
+    ``'*'`` is refused in ``shared_projects``: the wildcard is a
+    PER-PEER concept (:attr:`PeerConfig.allowed_projects`, documented);
+    a ``'*'`` in the global shared list would flow through the
+    effective-set resolution into ``_intersect_projects``, whose
+    wildcard branch returns the requested list verbatim — handing a
+    scoped read ANY project while the write path stays bounded
+    (read/write asymmetry, vesmaro#371/#369 review).
+    """
+    for item in projects:
+        if not item.strip():
+            raise ValueError(
+                f"{field_name}: blank project slug {item!r} is not allowed — "
+                "it would match every untagged record (fail-closed)"
+            )
+        if item == "*" and not allow_wildcard:
+            raise ValueError(
+                f"{field_name}: '*' is not allowed here — the wildcard is a "
+                "per-peer allowed_projects grant, not a shared_projects entry"
+            )
+
+
 class PeerConfig(BaseModel):
     """Per-peer federation ACL — Phase 1 prerequisite (contract §3.2, §6).
 
@@ -452,6 +485,8 @@ class PeerConfig(BaseModel):
             :attr:`FederationConfig.shared_projects` whitelist. Empty
             list = none (fail-closed). ``["*"]`` = all projects in
             ``shared_projects`` (explicit wildcard, not implicit).
+            Blank slugs are rejected at the config boundary — an ``''``
+            entry would match every untagged record in SQL.
         allowed_types: Which record types this peer may pull
             (``decision`` / ``learning`` / ``bug-pattern`` / ``rule`` /
             ``open-question`` / ``checkpoint`` / ``session``). Empty
@@ -475,6 +510,13 @@ class PeerConfig(BaseModel):
     rate_limit_per_minute: int = Field(default=30, ge=1, le=600)
     mtls_cert_fingerprint: str | None = Field(default=None, max_length=128)
 
+    @field_validator("allowed_projects")
+    @classmethod
+    def _allowed_projects_no_degenerate_slugs(cls, value: list[str]) -> list[str]:
+        """Reject blank slugs (``'*'`` stays legal here — documented grant)."""
+        _reject_degenerate_project_slugs("PeerConfig.allowed_projects", value, allow_wildcard=True)
+        return value
+
 
 class FederationConfig(BaseModel):
     """Federation (Phase 0 batch sync) configuration.
@@ -486,6 +528,10 @@ class FederationConfig(BaseModel):
 
     Fields:
         shared_projects: Whitelist of project slugs eligible for sync.
+            Blank slugs and ``'*'`` are rejected at the config boundary:
+            ``''`` would match every untagged record in SQL, and ``'*'``
+            is a per-peer ``allowed_projects`` concept — a wildcard here
+            would bypass the shared-union bound on scoped reads.
             Only records whose ``project:`` tag matches a slug in this
             list are included in ``mnemos sync export``. Empty list =
             no projects are eligible (sync exports nothing). The
@@ -523,6 +569,20 @@ class FederationConfig(BaseModel):
     moderation_refuse_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
     peers: dict[str, PeerConfig] = Field(default_factory=dict)
     access_log_path: str | None = Field(default=None, max_length=4096)
+
+    @field_validator("shared_projects")
+    @classmethod
+    def _shared_projects_no_degenerate_slugs(cls, value: list[str]) -> list[str]:
+        """Reject blank slugs and the ``'*'`` wildcard (per-peer-only grant).
+
+        ``'*'`` here would bypass the shared-union bound on scoped reads
+        (see :func:`_reject_degenerate_project_slugs`); blank slugs would
+        match every untagged record in SQL.
+        """
+        _reject_degenerate_project_slugs(
+            "FederationConfig.shared_projects", value, allow_wildcard=False
+        )
+        return value
 
 
 class ScannerConfig(BaseModel):
