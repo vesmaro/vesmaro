@@ -11,6 +11,9 @@ tests cover:
   (empty response, ``PERMISSION_DENIED``).
 * :rpc:`WriteMemory` writes to SQLite (verified via a direct DB query).
 * :rpc:`WriteMemory` with a disallowed scope → ``PERMISSION_DENIED``.
+* :rpc:`WriteMemory` idempotency (#359): replays return
+  ``ALREADY_EXHAUSTED`` with the existing storage id (fed_id key,
+  title+source_agent fallback, no match for provenance-less records).
 * :rpc:`GetSubscriptionState` returns an empty cursor (M4: mesh-side
   persistence in M5) and enforces the ACL.
 * Server lifecycle (start/stop cleanly, socket cleanup, context manager).
@@ -489,6 +492,165 @@ class TestWriteMemory:
                 timeout=2.0,
             )
         assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+
+
+# ── WriteMemory idempotency (vesmaro #359) ───────────────────────────────────
+
+
+class TestWriteMemoryIdempotency:
+    """Replayed one-shot pulls (mnemos-mesh #34) must not duplicate rows.
+
+    The mesh classifies each response by trigger_code: EXHAUSTIVE →
+    Written, ALREADY_EXHAUSTED → Duplicates. These tests pin the core
+    side of that contract (#359).
+    """
+
+    def _write(self, server: MeshServer, record: CompactRecord) -> Any:
+        """One WriteMemory(MERGE, confirm=false) call — the mesh pull shape."""
+        _wait_for_server(server)
+        stub = _stub(server)
+        return stub.WriteMemory(
+            _mesh_gen.core_pb2.WriteMemoryRequest(
+                record=_to_proto_record(record),
+                import_mode=_mesh_gen.core_pb2.ImportMode.MERGE,
+                confirm=False,
+            ),
+            timeout=2.0,
+        )
+
+    def _rows_with_fed_id(self, server: MeshServer, fed_id: str) -> list[Any]:
+        """All stored memories whose metadata.fed_id equals fed_id."""
+        servicer = server.servicer
+        assert servicer is not None
+        return [
+            m
+            for m in servicer._manager.sqlite.list_all(limit=1000)
+            if m.metadata.get("fed_id") == fed_id
+        ]
+
+    def test_replay_same_fed_id_returns_already_exhausted_same_id(self, server: MeshServer) -> None:
+        """Same record twice: EXHAUSTIVE then ALREADY_EXHAUSTED, same
+        storage id, exactly one stored row."""
+        record = _make_compact_record(summary="Idempotent replay candidate.")
+        first = self._write(server, record)
+        assert first.trigger_code == _mesh_gen.fed_pb2.TriggerCodes.EXHAUSTIVE
+        second = self._write(server, record)
+        assert second.trigger_code == _mesh_gen.fed_pb2.TriggerCodes.ALREADY_EXHAUSTED
+        assert second.written_id == first.written_id
+        assert second.mode_applied == _mesh_gen.core_pb2.ImportMode.MERGE
+        rows = self._rows_with_fed_id(server, record.id)
+        assert len(rows) == 1
+
+    def test_triple_replay_mesh_scenario(self, server: MeshServer) -> None:
+        """The mnemos-mesh #34 one-shot pull replay, end to end: N replays
+        → 1 Written + (N-1) Duplicates in mesh Stats terms, one row."""
+        record = _make_compact_record(summary="Mesh replay scenario.")
+        ids = set()
+        outcomes = []
+        for _ in range(3):
+            resp = self._write(server, record)
+            ids.add(resp.written_id)
+            outcomes.append(resp.trigger_code)
+        assert outcomes == [
+            _mesh_gen.fed_pb2.TriggerCodes.EXHAUSTIVE,
+            _mesh_gen.fed_pb2.TriggerCodes.ALREADY_EXHAUSTED,
+            _mesh_gen.fed_pb2.TriggerCodes.ALREADY_EXHAUSTED,
+        ]
+        assert len(ids) == 1
+        assert len(self._rows_with_fed_id(server, record.id)) == 1
+
+    def test_duplicate_refreshes_last_fed_at_without_rewrite(self, server: MeshServer) -> None:
+        """A replay refreshes metadata.last_fed_at; content/title stay."""
+        record = _make_compact_record(summary="Freshness touch candidate.")
+        first = self._write(server, record)
+        servicer = server.servicer
+        assert servicer is not None
+        before = servicer._manager.sqlite.get(first.written_id)
+        assert before is not None
+        assert "last_fed_at" in before.metadata  # seeded at first import (#359)
+        ts_before = before.metadata["last_fed_at"]
+        self._write(server, record)
+        after = servicer._manager.sqlite.get(first.written_id)
+        assert after is not None
+        assert after.metadata["last_fed_at"] > ts_before
+        # No rewrite: the stored projection is untouched.
+        assert after.content == before.content
+        assert after.title == before.title
+
+    def test_fallback_title_source_agent_without_fed_id(self, server: MeshServer) -> None:
+        """Records arriving without a fed id dedup on title+source_agent."""
+        record = _make_compact_record(
+            record_id="", summary="No-fed-id record body.", title="No-fed-id title"
+        )
+        first = self._write(server, record)
+        assert first.trigger_code == _mesh_gen.fed_pb2.TriggerCodes.EXHAUSTIVE
+        second = self._write(server, record)
+        assert second.trigger_code == _mesh_gen.fed_pb2.TriggerCodes.ALREADY_EXHAUSTED
+        assert second.written_id == first.written_id
+
+    def test_no_provenance_records_are_never_deduped(self, server: MeshServer) -> None:
+        """No fed_id AND no source_agent → plain API semantics: every call
+        creates a fresh row (обычные API-записи не трогаем)."""
+        record = _make_compact_record(
+            record_id="",
+            agent="",
+            summary="Provenance-less body.",
+            title="No provenance",
+            tags=[f"project:{_PROJECT}", "mnemos:decision"],
+        )
+        assert record.source_agent == ""
+        first = self._write(server, record)
+        second = self._write(server, record)
+        assert first.trigger_code == _mesh_gen.fed_pb2.TriggerCodes.EXHAUSTIVE
+        assert second.trigger_code == _mesh_gen.fed_pb2.TriggerCodes.EXHAUSTIVE
+        assert second.written_id != first.written_id
+
+    def test_different_fed_id_creates_new_record(self, server: MeshServer) -> None:
+        """Same title+source_agent but a different fed_id → a new row (the
+        fed_id branch is the priority key and never falls through)."""
+        record_a = _make_compact_record(
+            record_id="fed:gcw-test-agent:aaa", summary="Body A.", title="Shared headline"
+        )
+        record_b = _make_compact_record(
+            record_id="fed:gcw-test-agent:bbb", summary="Body B.", title="Shared headline"
+        )
+        first = self._write(server, record_a)
+        second = self._write(server, record_b)
+        assert first.trigger_code == _mesh_gen.fed_pb2.TriggerCodes.EXHAUSTIVE
+        assert second.trigger_code == _mesh_gen.fed_pb2.TriggerCodes.EXHAUSTIVE
+        assert second.written_id != first.written_id
+
+    def test_different_title_creates_new_record(self, server: MeshServer) -> None:
+        """Fallback path: same source_agent, different title → new row."""
+        record_a = _make_compact_record(record_id="", summary="Body A.", title="Headline one")
+        record_b = _make_compact_record(record_id="", summary="Body B.", title="Headline two")
+        first = self._write(server, record_a)
+        second = self._write(server, record_b)
+        assert first.trigger_code == _mesh_gen.fed_pb2.TriggerCodes.EXHAUSTIVE
+        assert second.trigger_code == _mesh_gen.fed_pb2.TriggerCodes.EXHAUSTIVE
+        assert second.written_id != first.written_id
+
+    def test_regular_api_record_not_matched_by_fallback(self, server: MeshServer) -> None:
+        """A federated record sharing title+agent with a LOCAL API memory
+        (no federation metadata) still imports — the fallback only matches
+        previously imported federated rows."""
+        # The seeded fixture has a local "ADR-0014 auth decision" memory
+        # authored by _AGENT without any fed_* metadata.
+        record = _make_compact_record(
+            record_id="",
+            summary="Federated namesake of a local note.",
+            title="ADR-0014 auth decision",
+        )
+        resp = self._write(server, record)
+        assert resp.trigger_code == _mesh_gen.fed_pb2.TriggerCodes.EXHAUSTIVE
+        servicer = server.servicer
+        assert servicer is not None
+        namesakes = [
+            m
+            for m in servicer._manager.sqlite.list_all(limit=1000)
+            if m.title == "ADR-0014 auth decision"
+        ]
+        assert len(namesakes) == 2  # the local seed + the federated import
 
 
 # ── GetSubscriptionState ──────────────────────────────────────────────────────

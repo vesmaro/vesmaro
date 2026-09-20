@@ -2932,6 +2932,88 @@ class SQLiteStore:
         ).fetchone()
         return self._row_to_memory(row) if row is not None else None
 
+    def find_federated_duplicate(
+        self, *, fed_id: str = "", title: str = "", source_agent: str = ""
+    ) -> Memory | None:
+        """Idempotent mesh-import duplicate lookup (vesmaro #359).
+
+        Called by :rpc:`WriteMemory` BEFORE any create so a replayed
+        one-shot pull (mnemos-mesh #34) performs no duplicate writes.
+        Match keys, priority order:
+
+        1. ``fed_id`` — the incoming ``CompactRecord.id`` vs the stored
+           ``metadata.fed_id`` minted by the mesh import path. The
+           ``fed:<source_agent>:<local_uuid>`` scheme makes this globally
+           unique (contract §2).
+        2. ``title`` + ``source_agent`` — fallback for records arriving
+           without a fed id: incoming title/source_agent vs stored
+           ``title`` + ``metadata.fed_source_agent``. Only rows imported
+           through the mesh carry ``fed_source_agent``, so plain API
+           records never satisfy the fallback (the #359 "не трогаем
+           обычные API-записи" invariant on the stored side).
+
+        Records without provenance (empty ``fed_id`` AND empty
+        ``source_agent``) return ``None`` without querying — no match
+        attempt at all. v1 (#359): linear ``json_extract`` scan, no
+        denormalised column or index — same trade-off as
+        :meth:`find_checkpoint_by_dedup_key`; revisit if mesh import
+        volume makes the scan hot. Earliest match wins, so the storage
+        id returned across replays is stable.
+        """
+        conn = self._get_conn()
+        row: sqlite3.Row | None
+        if fed_id:
+            row = conn.execute(
+                """
+                SELECT * FROM memories
+                WHERE json_extract(metadata, '$.fed_id') = ?
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """,
+                (fed_id,),
+            ).fetchone()
+        elif title and source_agent:
+            row = conn.execute(
+                """
+                SELECT * FROM memories
+                WHERE title = ?
+                  AND json_extract(metadata, '$.fed_source_agent') = ?
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """,
+                (title, source_agent),
+            ).fetchone()
+        else:
+            return None
+        return self._row_to_memory(row) if row is not None else None
+
+    def touch_last_fed_at(self, memory_id: str) -> bool:
+        """Refresh ``metadata.last_fed_at`` on a federated record (#359).
+
+        Fires ONLY when the stored metadata already carries the key —
+        the mesh import path seeds it at first create, so the guard
+        keeps foreign rows untouched ("при наличии", no key is ever
+        invented here). A single guarded UPDATE via ``json_set``: no
+        read-modify-write race, no other metadata key is touched, and
+        content/title stay as stored (v1 decision: a duplicate is
+        reported, never re-written).
+        """
+        now = datetime.now(UTC).isoformat()
+        conn = self._get_conn()
+        cur = conn.execute(
+            """
+            UPDATE memories
+            SET metadata = json_set(metadata, '$.last_fed_at', ?),
+                updated_at = ?
+            WHERE id = ?
+              AND json_extract(metadata, '$.last_fed_at') IS NOT NULL
+            """,
+            (now, now, memory_id),
+        )
+        conn.commit()
+        self._invalidate_caches()
+        return cur.rowcount > 0
+
     # ── CCR cache (P1-4) ──────────────────────────────────────────────────
 
     def ccr_store(

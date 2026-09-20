@@ -62,6 +62,7 @@ import os
 import time
 from collections.abc import Sequence
 from concurrent import futures
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -382,21 +383,26 @@ class MnemosCoreServicer:
     ) -> Any:
         """Import a :class:`CompactRecord` from a peer into vesmaro.
 
-        Steps (contract §3.1, #86 import validation):
+        Steps (contract §3.1, #86 import validation, #359 idempotency):
 
         1. Validate the request: ``import_mode`` must be MERGE or
            RESTORE; RESTORE requires ``confirm=True`` (hard gate).
         2. Resolve the peer from the record's ``source_agent`` (the
            provenance). Enforce the ACL on the record's project (parsed
            from its tags).
-        3. Run mnemos's own moderation on the record's ``summary`` (the
+        3. #359 duplicate gate: look up an already-imported record by
+           ``fed_id`` (fallback ``title`` + ``source_agent``). A hit
+           refreshes ``metadata.last_fed_at`` (when present) and returns
+           ``ALREADY_EXHAUSTED`` with the EXISTING storage id — no
+           re-write, so replayed pulls (mnemos-mesh #34) are idempotent.
+        4. Run mnemos's own moderation on the record's ``summary`` (the
            compact payload is already moderation-processed by the peer,
            but mnemos applies its own validation on top per #86).
-        4. Persist via :class:`MemoryManager.add` (Layer 1 secrets
+        5. Persist via :class:`MemoryManager.add` (Layer 1 secrets
            scanner runs inside).
-        5. Return the written id + the mode actually applied + trigger
+        6. Return the written id + the mode actually applied + trigger
            code (``EXHAUSTIVE`` on clean merge, ``REFUSED`` on ACL or
-           moderation refusal).
+           moderation refusal, ``ALREADY_EXHAUSTED`` on a duplicate).
         """
         import_mode = int(request.import_mode)
         # Validate import_mode (UNSPECIFIED is rejected).
@@ -452,6 +458,35 @@ class MnemosCoreServicer:
                 mode_applied=mode_applied,
                 trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
             )
+        # #359 idempotent import — duplicate gate BEFORE moderation and
+        # create. The mesh replays one-shot pulls (mnemos-mesh #34);
+        # without this gate every replay would mint a fresh row. Placed
+        # after the ACL (fail-closed security first) and before the
+        # moderation call: a duplicate performs no write, so the
+        # moderation-on-write gate has nothing to gate and replays stay
+        # cheap (no redaction-mapping churn).
+        duplicate = self._manager.sqlite.find_federated_duplicate(
+            fed_id=compact.id,
+            title=compact.title,
+            source_agent=compact.source_agent,
+        )
+        if duplicate is not None:
+            # v1 decision (#359): found = duplicate, no content re-write.
+            # Refresh metadata.last_fed_at when present (seeded at first
+            # import) so operators can see federation freshness; return
+            # the EXISTING storage id so the mesh correlates the replay
+            # with the row that is already there.
+            self._manager.sqlite.touch_last_fed_at(duplicate.id)
+            logger.info(
+                "mesh_server: WriteMemory duplicate — existing_id=%s fed_id=%s → ALREADY_EXHAUSTED",
+                duplicate.id,
+                compact.id,
+            )
+            return _mesh_gen.core_pb2.WriteMemoryResponse(
+                written_id=duplicate.id,
+                mode_applied=mode_applied,
+                trigger_code=_trigger_code_to_proto(TriggerCode.ALREADY_EXHAUSTED),
+            )
         # mnemos's own moderation on the compact summary (#86 import
         # validation). The peer already moderated, but mnemos re-checks
         # on import — defence-in-depth.
@@ -478,7 +513,14 @@ class MnemosCoreServicer:
             title=compact.title or None,
             tags=list(compact.tags),
             source=MemorySource.MCP,
-            metadata={"fed_id": compact.id, "fed_source_agent": compact.source_agent},
+            metadata={
+                "fed_id": compact.id,
+                "fed_source_agent": compact.source_agent,
+                # #359: seeded at first import so dedup replays can
+                # refresh it (touch_last_fed_at only updates a key that
+                # exists — it never invents one).
+                "last_fed_at": datetime.now(UTC).isoformat(),
+            },
         )
         memory = self._manager.add(
             data, project=project, agent=agent, mint_relates_to=False
