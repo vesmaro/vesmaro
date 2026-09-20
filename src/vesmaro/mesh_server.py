@@ -1211,8 +1211,14 @@ class MeshServer:
         # block is skipped entirely and the process opens NO TCP port.
         tcp = self._settings.mesh.tcp
         if tcp.enabled:
-            creds = _tcp_server_credentials(tcp.tls)
             addr = f"{tcp.bind}:{tcp.port}"
+            try:
+                creds = _tcp_server_credentials(tcp.tls)
+            except Exception as exc:
+                # Unreadable/broken PEM material: same rollback as a failed
+                # bind — a half-started server must not survive (review N1).
+                self._abort_failed_start()
+                raise MeshTCPLegError(f"mesh tcp leg: invalid TLS material: {exc}") from exc
             try:
                 # Recent grpcio raises on a failed bind; the >=1.62 floor
                 # only returns 0 — BOTH paths must fail fast (3c).

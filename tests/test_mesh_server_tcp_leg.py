@@ -436,6 +436,33 @@ def test_fail_fast_on_busy_port(tmp_path: Path, pki: _PKI, manager: MemoryManage
         blocker.close()
 
 
+def test_fail_fast_on_unreadable_tls_material(
+    tmp_path: Path,
+    pki: _PKI,
+    manager: MemoryManager,
+) -> None:
+    """Broken PEM paths with the leg enabled → typed error + FULL rollback
+    (review N1/N3): no stale is_running, no leftover UDS socket file, and a
+    second start() is not refused as "already started"."""
+    garbage = tmp_path / "garbage.pem"
+    garbage.write_text("not a pem")
+    settings = _tcp_settings(
+        tmp_path,
+        pki,
+        tls_cert=str(garbage),
+        tls_key=str(tmp_path / "missing-key.pem"),
+    )
+    sock = tmp_path / "core.sock"
+    srv = MeshServer(str(sock), manager, settings, max_workers=2)
+    with pytest.raises(MeshTCPLegError, match="invalid TLS material"):
+        srv.start()
+    assert not srv.is_running
+    assert not sock.exists()
+    # The failed instance must not poison a retry (N1: "already started").
+    with pytest.raises(MeshTCPLegError, match="invalid TLS material"):
+        srv.start()
+
+
 # ── Client-auth matrix (anonymous/foreign-CA/valid) ─────────────────────────
 
 
