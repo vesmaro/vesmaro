@@ -23,6 +23,11 @@ tests cover:
   title+source_agent fallback, no match for provenance-less records).
 * :rpc:`GetSubscriptionState` returns an empty cursor (M4: mesh-side
   persistence in M5) and enforces the ACL.
+* ACL hardening fail-closed matrix (vesmaro#371/#369 family): unscoped
+  requests intersect with the peer's allowed set; empty allow-list /
+  wildcard-with-empty-shared / unknown peer → ``PERMISSION_DENIED`` on
+  read AND write; untagged WriteMemory records are refused; wildcard
+  read/write is bounded by ``shared_projects``.
 * Server lifecycle (start/stop cleanly, socket cleanup, context manager).
 
 The tests use the real :class:`MemoryManager` against a tmp SQLite store
@@ -55,6 +60,10 @@ _PROJECT = "test-project"
 #: A second project the peer is NOT allowed to access — for ACL refusal.
 _PROJECT_DENIED = "project-secret"
 
+#: A second SHAREABLE project — for the ACL-hardening matrix (seeded, but
+#: visible to the peer only when its allowed set / shared union says so).
+_PROJECT_OTHER = "project-other"
+
 #: A2A id of the single configured peer (the mesh in these tests).
 _PEER_ID = "mnemos-A"
 
@@ -70,9 +79,23 @@ _TOKEN_ENV = "VESMARO_FED_PEER_TEST_TOKEN"
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
-def _settings_with_peer(tmp_path: Path, *, allow_wildcard: bool = False) -> Settings:
-    """Build a :class:`Settings` with one configured peer + isolated store."""
-    allowed = ["*"] if allow_wildcard else [_PROJECT]
+def _settings_with_peer(
+    tmp_path: Path,
+    *,
+    allow_wildcard: bool = False,
+    allowed: list[str] | None = None,
+    shared: list[str] | None = None,
+) -> Settings:
+    """Build a :class:`Settings` with one configured peer + isolated store.
+
+    ``allowed``/``shared`` override the peer's ``allowed_projects`` and
+    the global ``shared_projects`` (ACL-hardening matrix tests); the
+    defaults reproduce the historical single-project fixture.
+    """
+    if allowed is None:
+        allowed = ["*"] if allow_wildcard else [_PROJECT]
+    if shared is None:
+        shared = [_PROJECT]
     # Pydantic coerces dict kwargs into the nested config models at
     # runtime; the cast keeps mypy --strict happy without changing behaviour.
     settings = Settings(
@@ -85,7 +108,7 @@ def _settings_with_peer(tmp_path: Path, *, allow_wildcard: bool = False) -> Sett
             "embedding": {"provider": "onnx"},
             "scanner": {"enabled": False},
             "federation": FederationConfig(
-                shared_projects=[_PROJECT],
+                shared_projects=shared,
                 peers={
                     _PEER_ID: PeerConfig(
                         bearer_token_env=_TOKEN_ENV,
@@ -857,6 +880,266 @@ class TestGetSubscriptionState:
                     peer_id=_PEER_ID,
                     project_scope=_PROJECT_DENIED,
                 ),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+
+# ── ACL hardening (vesmaro#371/#369 family) ───────────────────────────────────
+
+
+#: gRPC metadata asserting an UNKNOWN peer id (identity spoof attempt).
+_GHOST_METADATA = (("x-mnemos-peer-id", "mnemos-ghost"),)
+
+
+@pytest.fixture
+def acl_server_factory(tmp_path: Path) -> Generator[Any, None, None]:
+    """Factory for ACL-matrix servers: one peer, N seeded projects.
+
+    Yields a callable taking ``allowed`` / ``shared`` / ``seed_projects``
+    (ACL-hardening matrix axes) that starts an isolated ``MeshServer``
+    with one seeded federable memory per seed project. Multiple servers
+    per test are supported (each gets its own subdir + socket). All
+    servers and managers are torn down after the test.
+    """
+    started: list[tuple[MeshServer, MemoryManager]] = []
+
+    def _make(
+        *,
+        allowed: list[str],
+        shared: list[str],
+        seed_projects: tuple[str, ...] = (_PROJECT, _PROJECT_OTHER),
+    ) -> MeshServer:
+        n = len(started)
+        base = tmp_path / f"acl{n}"
+        settings = _settings_with_peer(base, allowed=allowed, shared=shared)
+        manager = MemoryManager(settings)
+        mock_embedder = MagicMock()
+        mock_embedder.embed.return_value = [0.1] * 384
+        manager._embedder = mock_embedder
+        for project in seed_projects:
+            manager.add(
+                MemoryCreate(
+                    content=f"ACL-hardening seed record for {project}.",
+                    title=f"Seed {project}",
+                    tags=[f"project:{project}", f"agent:{_AGENT}", "mnemos:decision"],
+                    source=MemorySource.MANUAL,
+                ),
+                project=project,
+                agent=_AGENT,
+            )
+        srv = MeshServer(str(base / "core.sock"), manager, settings, max_workers=2)
+        srv.start()
+        started.append((srv, manager))
+        return srv
+
+    yield _make
+    for srv, manager in started:
+        srv.stop(grace=0.5)
+        manager.close()
+
+
+class TestAclHardeningFailClosed:
+    """Regression matrix for the fail-open family (vesmaro#371/#369).
+
+    Fix- principles ratified by these tests: (a) no implicit "all" — an
+    empty effective allowed set (empty allow-list, or "*" with an empty
+    shared_projects) denies reads AND writes; (b) an unscoped request is
+    the intersection with the peer's allowed set, never the whole corpus;
+    (c) every data path is ACL-gated before serve/write, unknown peers
+    included.
+    """
+
+    def test_unscoped_request_returns_only_allowed_projects(self, acl_server_factory: Any) -> None:
+        """(i) Unscoped ListMemories from a limited peer → ONLY its projects.
+
+        The live #371/#369 pair: the peer's allowed set is [_PROJECT] while
+        the store also holds _PROJECT_OTHER — an unscoped pull must return
+        exactly the allowed project, never the foreign records.
+        """
+        server = acl_server_factory(allowed=[_PROJECT], shared=[_PROJECT, _PROJECT_OTHER])
+        _wait_for_server(server)
+        stub = _stub(server)
+        response = stub.ListMemories(
+            _mesh_gen.core_pb2.ListMemoriesRequest(),
+            timeout=2.0,
+        )
+        assert len(response.records) == 1, "only the allowed project's record"
+        for rec in response.records:
+            assert f"project:{_PROJECT}" in list(rec.tags)
+            assert f"project:{_PROJECT_OTHER}" not in list(rec.tags)
+
+    def test_unscoped_request_wildcard_peer_returns_shared_union(
+        self, acl_server_factory: Any
+    ) -> None:
+        """Wildcard peer + non-empty shared → unscoped pull = shared union."""
+        server = acl_server_factory(allowed=["*"], shared=[_PROJECT, _PROJECT_OTHER])
+        _wait_for_server(server)
+        stub = _stub(server)
+        response = stub.ListMemories(
+            _mesh_gen.core_pb2.ListMemoriesRequest(),
+            timeout=2.0,
+        )
+        assert len(response.records) == 2, "both shared projects are served"
+
+    def test_empty_allowed_set_denies_read_and_write(self, acl_server_factory: Any) -> None:
+        """(ii) Empty allowed_projects → PERMISSION_DENIED on read AND write."""
+        server = acl_server_factory(allowed=[], shared=[_PROJECT], seed_projects=(_PROJECT,))
+        _wait_for_server(server)
+        stub = _stub(server)
+        # Read: unscoped …
+        with pytest.raises(grpc.RpcError) as unscoped:
+            stub.ListMemories(_mesh_gen.core_pb2.ListMemoriesRequest(), timeout=2.0)
+        assert unscoped.value.code() == grpc.StatusCode.PERMISSION_DENIED
+        # … and scoped (the pre-existing membership deny stays).
+        with pytest.raises(grpc.RpcError) as scoped:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]), timeout=2.0
+            )
+        assert scoped.value.code() == grpc.StatusCode.PERMISSION_DENIED
+        # Write: a tagged record the peer would otherwise accept.
+        with pytest.raises(grpc.RpcError) as write:
+            stub.WriteMemory(
+                _mesh_gen.core_pb2.WriteMemoryRequest(
+                    record=_to_proto_record(_make_compact_record()),
+                    import_mode=_mesh_gen.core_pb2.ImportMode.MERGE,
+                ),
+                timeout=2.0,
+            )
+        assert write.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_wildcard_with_empty_shared_denies_everything(self, acl_server_factory: Any) -> None:
+        """(iii) '*' allow-list + empty shared_projects → DENIED, not 'all'.
+
+        Pre-fix this was the #369 fail-open: the wildcard resolved to an
+        empty shared union, the empty union became ``projects=None``, and
+        the unscoped query returned EVERY project in the store.
+        """
+        server = acl_server_factory(allowed=["*"], shared=[], seed_projects=(_PROJECT,))
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as unscoped:
+            stub.ListMemories(_mesh_gen.core_pb2.ListMemoriesRequest(), timeout=2.0)
+        assert unscoped.value.code() == grpc.StatusCode.PERMISSION_DENIED
+        with pytest.raises(grpc.RpcError) as scoped:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]), timeout=2.0
+            )
+        assert scoped.value.code() == grpc.StatusCode.PERMISSION_DENIED
+        with pytest.raises(grpc.RpcError) as write:
+            stub.WriteMemory(
+                _mesh_gen.core_pb2.WriteMemoryRequest(
+                    record=_to_proto_record(_make_compact_record()),
+                    import_mode=_mesh_gen.core_pb2.ImportMode.MERGE,
+                ),
+                timeout=2.0,
+            )
+        assert write.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_unknown_peer_denied_read_and_write(self, acl_server_factory: Any) -> None:
+        """(iv) Unknown peer (spoofed metadata) → DENIED on every data path.
+
+        Pre-fix the unscoped read from an unknown peer skipped the ACL
+        gate AND fell into the empty-allowed-set → unfiltered query — a
+        full-corpus leak. The scoped read/write were already denied via
+        the scope check; they stay denied.
+        """
+        server = acl_server_factory(
+            allowed=[_PROJECT], shared=[_PROJECT], seed_projects=(_PROJECT,)
+        )
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as unscoped:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(),
+                timeout=2.0,
+                metadata=_GHOST_METADATA,
+            )
+        assert unscoped.value.code() == grpc.StatusCode.PERMISSION_DENIED
+        with pytest.raises(grpc.RpcError) as scoped:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+                timeout=2.0,
+                metadata=_GHOST_METADATA,
+            )
+        assert scoped.value.code() == grpc.StatusCode.PERMISSION_DENIED
+        with pytest.raises(grpc.RpcError) as write:
+            stub.WriteMemory(
+                _mesh_gen.core_pb2.WriteMemoryRequest(
+                    record=_to_proto_record(_make_compact_record()),
+                    import_mode=_mesh_gen.core_pb2.ImportMode.MERGE,
+                ),
+                timeout=2.0,
+                metadata=_GHOST_METADATA,
+            )
+        assert write.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_untagged_record_write_denied_even_for_allowed_peer(
+        self, acl_server_factory: Any
+    ) -> None:
+        """A record WITHOUT a project: tag cannot be ACL'd → DENIED.
+
+        Pre-fix ``if project and …`` skipped the gate entirely and the
+        record landed in the project-less namespace regardless of the
+        peer's allow-list. Also asserts nothing was persisted.
+        """
+        server = acl_server_factory(
+            allowed=[_PROJECT], shared=[_PROJECT], seed_projects=(_PROJECT,)
+        )
+        _wait_for_server(server)
+        stub = _stub(server)
+        record = _make_compact_record(tags=[f"agent:{_AGENT}", "mnemos:decision"])
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.WriteMemory(
+                _mesh_gen.core_pb2.WriteMemoryRequest(
+                    record=_to_proto_record(record),
+                    import_mode=_mesh_gen.core_pb2.ImportMode.MERGE,
+                ),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
+        servicer = server.servicer
+        assert servicer is not None
+        assert (
+            servicer._manager.sqlite.find_federated_duplicate(
+                fed_id=record.id,
+                title=record.title,
+                source_agent=record.source_agent,
+            )
+            is None
+        ), "the refused record must not be persisted"
+
+    def test_wildcard_write_to_non_shared_project_denied(self, acl_server_factory: Any) -> None:
+        """Wildcard write is bounded by shared_projects (read/write symmetry).
+
+        Pre-fix ``_acl_allows`` short-circuited '*' → True for ANY
+        project, letting a wildcard peer write into projects the operator
+        never shared. The read side never served those projects; now the
+        write side matches.
+        """
+        server = acl_server_factory(allowed=["*"], shared=[_PROJECT], seed_projects=(_PROJECT,))
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.WriteMemory(
+                _mesh_gen.core_pb2.WriteMemoryRequest(
+                    record=_to_proto_record(_make_compact_record(project=_PROJECT_OTHER)),
+                    import_mode=_mesh_gen.core_pb2.ImportMode.MERGE,
+                ),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_wildcard_scoped_read_of_non_shared_project_denied(
+        self, acl_server_factory: Any
+    ) -> None:
+        """Wildcard scoped read of a non-shared project → DENIED (safety net)."""
+        server = acl_server_factory(allowed=["*"], shared=[_PROJECT], seed_projects=(_PROJECT,))
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT_OTHER]),
                 timeout=2.0,
             )
         assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
