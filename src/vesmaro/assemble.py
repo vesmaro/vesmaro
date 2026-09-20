@@ -476,6 +476,14 @@ def _recall_stage(
     # reorders (invariant: a lens may only narrow — no re-ranking, no
     # pinning; #248 stays open). ``lens=None`` (default) skips the whole
     # block — byte-identical to the pre-Phase-0 output.
+    # The projection binds to the LANES leg candidates too — symmetric
+    # with the contentType mode filter above (``mode=code`` strips prose
+    # governance rows in the lanes loop the same way): an ACTIVE lens
+    # strips inadmissible governance rows BEFORE the applyTo partition
+    # (a code-shaped query under lanes must not have prose rules drown
+    # the code rows — the E3 drowning pattern), while an inactive lens
+    # leaves the lanes output untouched (pinned by tests as the exact
+    # stripping contract; #360 review item 3).
     lens_filtered = 0
     lens_active_for_query = lens_active(lens, query=derived_query) if lens is not None else False
     if lens is not None and lens_active_for_query:

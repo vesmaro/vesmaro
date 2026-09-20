@@ -1528,6 +1528,14 @@ class MemoryManager:
         cross-project by definition and is counted in
         ``search_stats()["cross_project_requests_total"]`` for audit.
 
+        A9-completion (epic #308 Ф1-PREP, #360 review) — the AGENT
+        predicate: native on the FTS leg only; the vector resolve loop
+        and the graph leg carry the authoritative resolve-time mirror on
+        the SQLite ``Memory.agent``, so ``agent=``-scoped searches never
+        surface other agents' rows through a stale embed or an edge
+        neighbour. No native VectorStore agent predicate by TL decision
+        (the store stays project-only; scoping guards resolve here).
+
         Search v2 (issue #313) — PROJECT SOFT FALLBACK: a scoped search
         that returns ZERO rows is retried ONCE without the scope (the
         A9 pre-RRF predicate is unchanged — the fallback is a NEW OUTER
@@ -1557,9 +1565,10 @@ class MemoryManager:
         fused are appended with a decayed rank slot and
         ``via_graph=True`` provenance, passing the SAME gates as the
         fused rows on every axis: project (the A9 authoritative guard —
-        an edge never widens a scope), status (default set AND the
-        explicit ``status=`` drill-down), quarantine (ADR-0019 §5) and
-        refined_only (§4). Headroom-gated: the expansion runs only when
+        an edge never widens a scope), agent (the A9-completion
+        resolve-time mirror — same rule, Ф1-PREP epic #308), status
+        (default set AND the explicit ``status=`` drill-down), quarantine
+        (ADR-0019 §5) and refined_only (§4). Headroom-gated: the expansion runs only when
         the fused legs left room (a full fused page needs no
         enrichment); no edges → the leg is a no-op. ADR-0030 A0 (issue
         #324): with ``mnemos.graph_walk`` ON (default OFF) the walk
@@ -1809,6 +1818,15 @@ class MemoryManager:
                     continue
                 if project and (candidate.project or "") != project:
                     continue  # A9 authoritative guard (metadata drift)
+                # A9-completion (epic #308 Ф1-PREP, #360 review): the
+                # agent predicate — the FTS leg filters natively; this
+                # resolve-time mirror keeps the vector leg symmetric, so
+                # an agent-scoped search never surfaces another agent's
+                # row through a stale embed. Deliberately NO native
+                # VectorStore agent predicate (TL decision: the guard is
+                # authoritative here, the store stays project-only).
+                if agent and (candidate.agent or "") != agent:
+                    continue
                 # Filter vector results by the same status policy as the
                 # FTS leg. The vector store only holds published memories
                 # in normal operation, but a non-published memory that
@@ -1935,6 +1953,12 @@ class MemoryManager:
                 # scoped search (review F2 — the edge must not widen the
                 # A9 scope, only the soft-fallback retry may, and it tags).
                 if project and (neighbour.project or "") != project:
+                    continue
+                # A9-completion agent mirror (epic #308 Ф1-PREP): an
+                # edge must not widen the agent scope either — the same
+                # resolve-time guard as the vector leg above; the FTS
+                # leg filters natively.
+                if agent and (neighbour.agent or "") != agent:
                     continue
                 if tags and not all(t in neighbour.tags for t in tags):
                     continue

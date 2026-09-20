@@ -63,7 +63,22 @@ _LENS_CONTENT_TYPE: Final[dict[Lens, str]] = {Lens.CODE: "code"}
 #: pattern is a documented, deterministic code signal:
 #:   1. function definitions — keyword + identifier + ``(``;
 #:   2. class definitions — keyword + identifier + ``:``/``{``/``(``;
-#:   3. a call expression — identifier + parens (parse_args());
+#:   3. a call expression with code-typical ARGUMENTS — identifier
+#:      DIRECTLY followed by ``(`` (no space: English typography mandates
+#:      one before a parenthetical) whose group carries code evidence:
+#:      a comma (``connect(host, port)``), ``=`` (``retry(backoff=5)``),
+#:      an underscored/dotted token (``foo(max_retries)``, ``bar(x.y)``)
+#:      or a comparison/bitwise operator. The #360 review false-fired
+#:      the old word-group shape on prose parentheticals ("how does the
+#:      retry loop work (with backoff)" activated the lens and stripped
+#:      the prose rows), so empty groups and word-only groups are now
+#:      REJECTED, and so are characters that occur in prose
+#:      parentheticals: hyphens ("(step-by-step)"), slashes ("(and/or)"),
+#:      percents ("(50% of runs)"), quotes ("(the server's config)") and
+#:      bare digits ("(404 pages)"). An empty-arg call ("parse_args()")
+#:      no longer activates either — with nothing inside the group the
+#:      shape is indistinguishable from prose, and a MISSED activation is
+#:      the safe direction (identity projection keeps every row);
 #:   4. a method call — receiver.identifier(;
 #:   5. code-file paths (src/vesmaro/manager.py, app.ts);
 #:   6. code-only operators (=> arrow, :: scope resolution).
@@ -74,7 +89,7 @@ _LENS_CONTENT_TYPE: Final[dict[Lens, str]] = {Lens.CODE: "code"}
 _QUERY_CODE_SIGNALS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\b(?:def|function|fn)\s+[A-Za-z_]\w*\s*\("),
     re.compile(r"\bclass\s+[A-Za-z_]\w*\s*[:({]"),
-    re.compile(r"\b[A-Za-z_]\w*\s*\([^()]*\)"),
+    re.compile(r"\b[A-Za-z_]\w*\((?=[^()]*(?:[,=*<>&|]|\w[_.]\w))[^()]*\)"),
     re.compile(r"\b[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\("),
     re.compile(
         r"\b[\w./\\-]+\.(?:py|pyi|ts|tsx|js|jsx|mjs|rs|go|c|h|cc|cpp|java|kt|rb|sh|sql|toml)\b"

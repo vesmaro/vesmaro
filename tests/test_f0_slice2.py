@@ -23,11 +23,18 @@ Covers:
    suspenders in ``MemoryManager.add``/``update`` (a validator-bypassed
    ``model_construct`` DTO still cannot persist a partial triple).
 
-Item 4 of the slice-2 scope (the vector-leg agent predicate) is an
-ANALYSIS deliverable, not code: the task tail threads ``tags=``, which
-the search core post-filters exactly on every leg (fused + graph,
-slice-1 M2 pin) — the agent gap is not load-bearing for the task
-composition. Reported in the epic, no behavior pinned here.
+Item 4 of the slice-2 scope (the vector-leg agent predicate) was an
+ANALYSIS deliverable of slice 2; the Ф1-PREP wave (#360 review item 5)
+has since landed it as manager-side resolve-time guards (vector leg +
+graph leg mirror) — pinned in ``tests/test_a9_agent_predicate.py``.
+
+Ф1-PREP WAVE additions (#360 review, before any lens default-enablement
+or Ф1 runs): the lens signal-#3 tightening pins (negative pins WITH
+parentheses; the empty-group/word-only prose shapes no longer activate),
+the ``task="t1\\n"`` boundary pin (``\\Z`` anchor), the lens x lanes
+composition contract (§2e — governance rows ARE lens-stripped before the
+applyTo partition; symmetric with the contentType mode filter), and the
+graph-edge strict-subset fixture (both edge kinds).
 
 Test embedder: ``_HashEmbedder`` (deterministic hashed bag-of-tokens) —
 same rationale as the slice-1 suite: a MagicMock embedder cannot
@@ -99,9 +106,11 @@ PROSE_CONTENT = (
     "provenance wrappers for every recalled block."
 )
 
-#: A query that lexically hits both rows AND carries a code signal
-#: (``load_settings()`` — call-expression), so the CODE lens activates.
-CODE_QUERY = "how does load_settings() parse the config"
+#: A query that lexically hits both rows AND carries a code signal:
+#: ``load_settings(path, env)`` — a call expression with code-typical
+#: arguments (comma list, Ф1-PREP tightening — the old empty-group shape
+#: ``load_settings()`` no longer activates the lens).
+CODE_QUERY = "how does load_settings(path, env) parse the config"
 
 
 class _HashEmbedder:
@@ -118,12 +127,13 @@ class _HashEmbedder:
         return [v / norm for v in vec]
 
 
-def _settings(tmp: Path, *, lanes_enabled: bool = False) -> Settings:
+def _settings(tmp: Path, *, lanes_enabled: bool = False, graph_walk: bool = False) -> Settings:
     settings = Settings(
         mnemos={
             "vault_path": str(tmp / "vault"),
             "data_dir": str(tmp / "data"),
             "db_name": "test.db",
+            "graph_walk": graph_walk,
         },
         scanner={"enabled": False},  # type: ignore[arg-type]
         lanes={"enabled": lanes_enabled},  # type: ignore[arg-type]
@@ -200,7 +210,10 @@ class TestLensUnit:
         "query",
         [
             "def run(self):",
-            "call parse_args() first",
+            "call parse_args(verbose=True) first",
+            "what does connect(host, port) do",
+            "how do I call foo(max_retries)",
+            "what does retry(backoff=5) do",
             "check src/vesmaro/manager.py search",
             "rewrite fetch(url) => Result",
             "class SettingsLoader: what fields",
@@ -222,12 +235,26 @@ class TestLensUnit:
             "import the CSV data",  # bare-word import is prose-ambiguous
             "import vesmaro.manager",  # dotted import: no code-extension path
             "define the function area for review",
+            # Ф1-PREP item 1 — negative pins WITH parentheses (the #360
+            # review false-fire class): prose parentheticals must not
+            # activate the lens, whatever sits inside the group.
+            "how does the retry loop work (with backoff)",  # THE review case
+            "how does the retry loop work (backoff)",  # word-only group
+            "how does parse () work",  # empty group (space = typography)
+            "pick a color (red, green, blue)",  # prose list, spaced paren
+            "the retry policy (and/or fallback)",  # slash is not evidence
+            "see the notes (step-by-step guide)",  # hyphen is not evidence
+            "retries happen (50% of runs)",  # percent is not evidence
+            "the handler (the server's config)",  # quote/apostrophe neither
         ],
     )
     def test_prose_queries_do_not_activate(self, query: str) -> None:
         """Query-conditioned (E3 class ban): a prose question about code
         keeps the identity projection — its corpus legitimately includes
-        prose notes about code."""
+        prose notes about code. The parenthesized entries pin the Ф1-PREP
+        signal-#3 tightening: only code-typical content INSIDE the parens
+        (comma list, ``=``, underscored/dotted token, operator) activates;
+        empty and word-only groups are prose parentheticals."""
         assert lens_active(Lens.CODE, query=query) is False
 
     def test_admit_identity_when_inactive(self) -> None:
@@ -325,10 +352,21 @@ class TestLensAssembly:
 
 
 class TestTaskParamValidation:
-    @pytest.mark.parametrize("bad", ["Bad!", "", "  ", "task:t1", "t1 t2", "x" * 65, "рефакторинг"])
+    @pytest.mark.parametrize(
+        "bad", ["Bad!", "", "  ", "task:t1", "t1 t2", "x" * 65, "рефакторинг", "t1\n"]
+    )
     def test_invalid_task_rejected(self, mgr: MemoryManager, bad: str) -> None:
         with pytest.raises(ValueError, match="task must"):
             mgr.assemble_context(session=SESSION, project=PROJECT, task=bad)
+
+    def test_trailing_newline_rejected_not_dead_tag(self, mgr: MemoryManager) -> None:
+        """Ф1-PREP item 2 — the ``$``-anchor flaw: ``task="t1\\n"`` used to
+        validate (``$`` also matches just before a trailing newline) and
+        mint ``task:t1\\n`` — a tag the exact-membership search filter can
+        never hit (a dead scope). The ``\\Z`` anchor rejects it at the
+        boundary instead."""
+        with pytest.raises(ValueError, match="task must match"):
+            mgr.assemble_context(session=SESSION, project=PROJECT, task="t1\n")
 
     def test_prefixed_task_gets_actionable_error(self, mgr: MemoryManager) -> None:
         """The prefix is the boundary's job — point the caller at the slug."""
@@ -426,6 +464,56 @@ class TestTaskScopedAssembly:
         assert t1 == t2
 
 
+class TestTaskGraphEdgeStrictSubset:
+    """Ф1-PREP item 4 (#360 review) — the strict-subset pin on the GRAPH path.
+
+    Slice-2's subset pin (``test_task_scoped_assembly_intersects_every_scope``)
+    covers the FUSED leg only (the vector store is wiped, FTS decides). The
+    graph edge leg is a second surfacing path with its own gate sequence, so
+    the subset property is pinned here separately: an edge-sourced row
+    surfaces in the DEFAULT assembly via the graph leg, and the task-scoped
+    assembly stays a strict, order-preserving SUBSET of it — the tags gate
+    binds to the graph leg (slice-1 M2), so a task assembly never surfaces
+    an edge row the task-less assembly would not. Both edge kinds: the
+    unconditional ``supersedes`` leg and the flag-gated ``relates_to`` walk
+    (``mnemos.graph_walk``) share the gate sequence under test.
+    """
+
+    @pytest.mark.parametrize("kind", ["supersedes", "relates_to"])
+    def test_task_assembly_stays_subset_on_graph_path(self, tmp_path: Path, kind: str) -> None:
+        walk = kind == "relates_to"
+        manager = MemoryManager(_settings(tmp_path, graph_walk=walk))
+        manager._embedder = _HashEmbedder()
+        try:
+            anchor = _row(manager, "anchor tide schedule notes", task="t1")
+            # Lexically disjoint from the query: the neighbour can surface
+            # ONLY through the edge, never through the fused legs.
+            neighbour = _row(manager, "dormant ledger reconciliation figures")
+            manager.add_memory_edge(anchor.id, neighbour.id, kind=kind)
+            manager.vectors.wipe()  # FTS + graph legs decide
+
+            default_out = manager.assemble_context(
+                session=SESSION, project=PROJECT, query="anchor tide"
+            )
+            default_ids = [b["memory_id"] for b in default_out["blocks"]]
+            # Fixture sanity: the graph leg DID surface the neighbour in
+            # the task-less assembly (the subset pin is not vacuous).
+            assert neighbour.id in default_ids
+            assert anchor.id in default_ids
+
+            task_out = manager.assemble_context(
+                session=SESSION, project=PROJECT, task="t1", query="anchor tide"
+            )
+            task_ids = [b["memory_id"] for b in task_out["blocks"]]
+            # STRICT SUBSET, order-preserving (tail-only narrowing).
+            assert set(task_ids) <= set(default_ids)
+            assert task_ids == [mid for mid in default_ids if mid in set(task_ids)]
+            assert task_ids == [anchor.id]
+            assert task_out["task"] == "t1"
+        finally:
+            manager.close()
+
+
 # ---------------------------------------------------------------------------
 # 2c. task x lanes composition (intersection binds the governance leg)
 # ---------------------------------------------------------------------------
@@ -463,6 +551,92 @@ class TestTaskLanesComposition:
         assert {tagged_rule.id, untagged_rule.id} <= control_ids
         # Lane telemetry carries the task filter count (additive key).
         assert out["stats"]["recall"]["lanes"]["task_filtered"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# 2e. lens x lanes composition (Ф1-PREP item 3, #360 review)
+# ---------------------------------------------------------------------------
+
+
+class TestLensLanesComposition:
+    """Pin the TRUE lens x lanes ordering contract (Ф1-PREP item 3).
+
+    In ``_recall_stage`` the lens projection runs over the COMBINED
+    candidate list (lanes leg + knowledge leg) BEFORE the applyTo
+    partition. The #360 review flagged governance rows as "possibly
+    stripped before the partition" — investigated: they ARE, and that is
+    the intended contract, symmetric with the pre-existing contentType
+    mode filter (``mode=code`` strips prose governance rows inside the
+    lanes loop the same way). An ACTIVE lens strips inadmissible
+    governance rows before the partition; an INACTIVE lens (prose query)
+    is the identity projection and governance rows survive to the
+    partition and surface with their lane keys.
+    """
+
+    def _seed(self, manager: MemoryManager) -> dict[str, Memory]:
+        return {
+            "rule": _row(
+                manager,
+                "Rule: run the migration linter before merge",
+                subtype="mnemos:rule",
+            ),
+            "code": _row(manager, CODE_CONTENT, title="loader"),
+            "prose": _row(manager, PROSE_CONTENT, title="deploy notes"),
+        }
+
+    def test_active_lens_strips_governance_before_partition(self, lanes_mgr: MemoryManager) -> None:
+        """The stripping contract: a code-shaped query under lanes narrows
+        the WHOLE candidate list — the prose rule (lane) and the prose
+        knowledge row drop before the applyTo partition ever runs; only
+        the code row survives."""
+        rows = self._seed(lanes_mgr)
+        out = lanes_mgr.assemble_context(
+            session=SESSION, project=PROJECT, query=CODE_QUERY, lens="code"
+        )
+        ids = {b["memory_id"] for b in out["blocks"]}
+        assert ids == {rows["code"].id}
+        assert all(b["lane"] == "knowledge" for b in out["blocks"])
+        # Lens telemetry: the rule (lane) and prose rows were filtered.
+        assert out["stats"]["recall"]["lens"] == {
+            "name": "code",
+            "active": True,
+            "filtered": 2,
+        }
+        # Lane telemetry asymmetry is part of the contract: rules/decisions
+        # carry the RAW lane query counts, knowledge counts post-lens
+        # survivors (the raw lane counts were never post-filtered — same
+        # as the pre-lens contentType filter before this wave).
+        lanes_stats = out["stats"]["recall"]["lanes"]
+        assert lanes_stats["rules"] == 1
+        assert lanes_stats["knowledge"] == 1
+
+    def test_inactive_lens_keeps_governance_rows(self, lanes_mgr: MemoryManager) -> None:
+        """Identity projection: a prose query under the CODE lens narrows
+        nothing — the governance row survives to the partition and
+        surfaces as a rules-lane block."""
+        rows = self._seed(lanes_mgr)
+        out = lanes_mgr.assemble_context(
+            session=SESSION, project=PROJECT, query="migration linter", lens="code"
+        )
+        ids = {b["memory_id"] for b in out["blocks"]}
+        assert rows["rule"].id in ids
+        rule_block = next(b for b in out["blocks"] if b["memory_id"] == rows["rule"].id)
+        assert rule_block["lane"] == "rules"
+        assert out["stats"]["recall"]["lens"] == {
+            "name": "code",
+            "active": False,
+            "filtered": 0,
+        }
+
+    def test_no_lens_governance_rows_surface_control(self, lanes_mgr: MemoryManager) -> None:
+        """Control: same code-shaped query, NO lens — the lanes behavior
+        stands untouched (the stripping in the first test is the lens
+        gate, not a broken lane)."""
+        rows = self._seed(lanes_mgr)
+        out = lanes_mgr.assemble_context(session=SESSION, project=PROJECT, query=CODE_QUERY)
+        ids = {b["memory_id"] for b in out["blocks"]}
+        assert rows["rule"].id in ids
+        assert "lens" not in out["stats"]["recall"]
 
 
 # ---------------------------------------------------------------------------
