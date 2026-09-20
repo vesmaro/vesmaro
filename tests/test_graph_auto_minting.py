@@ -336,9 +336,7 @@ class TestExclusions:
     def test_raw_and_processing_candidates_excluded(self, mint_manager: MemoryManager) -> None:
         """General gates: raw/processing rows are not near-dup fuel."""
         raw = _add(mint_manager, f"{NEAR_DUP_A} draft", status=MemoryStatus.RAW)
-        processing = _add(
-            mint_manager, f"{NEAR_DUP_A} draft two", status=MemoryStatus.PROCESSING
-        )
+        processing = _add(mint_manager, f"{NEAR_DUP_A} draft two", status=MemoryStatus.PROCESSING)
         clean = _add(mint_manager, NEAR_DUP_A)
         new = _add(mint_manager, NEAR_DUP_B)
 
@@ -689,9 +687,7 @@ class TestFromSideGates:
         # (the raw row stays excluded on the candidate side as well).
         third = _add(mint_manager, f"{NEAR_DUP_B} again")
         assert {e["to_memory_id"] for e in _out_edges(mint_manager, third.id)} == {a.id}
-        assert raw_write.id not in {
-            r["from_memory_id"] for r in _relates_to_rows(mint_manager)
-        }
+        assert raw_write.id not in {r["from_memory_id"] for r in _relates_to_rows(mint_manager)}
 
 
 # ── Fuel policy (review M2): organic user writes only ────────────────────────
@@ -822,9 +818,7 @@ class TestTelemetry:
         finally:
             mgr.close()
 
-    def test_unscoped_writes_bucket_under_empty_project(
-        self, mint_manager: MemoryManager
-    ) -> None:
+    def test_unscoped_writes_bucket_under_empty_project(self, mint_manager: MemoryManager) -> None:
         _add(mint_manager, NEAR_DUP_A, project="")
         _add(mint_manager, NEAR_DUP_B, project="")
         stats = mint_manager.graph_mint_stats()

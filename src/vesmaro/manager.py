@@ -98,6 +98,7 @@ def _derive_feedback_event_id(event_id: str, memory_id: str) -> str:
     canonical = f"{len(event_id)}:{event_id}{len(memory_id)}:{memory_id}"
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
+
 # heal_stale_embeddings (review P2): a dead/erroring embedder must not
 # walk the whole refined set in one background tick. `limit` bounds the
 # ATTEMPTS, and this cutoff stops the pass early when that many rows
@@ -888,9 +889,7 @@ class MemoryManager:
             try:
                 self._mint_relates_to_edges(memory)
             except Exception as exc:
-                logger.warning(
-                    "graph auto-mint failed (non-fatal) for %s: %s", memory.id[:8], exc
-                )
+                logger.warning("graph auto-mint failed (non-fatal) for %s: %s", memory.id[:8], exc)
 
         logger.info("add: id=%s project=%s agent=%s", memory.id[:8], project, agent)
         return memory
@@ -1607,9 +1606,7 @@ class MemoryManager:
             # pages. The rows carry their first-anchor discovery kind
             # (``via_graph_kind``); each leg counts the requests its
             # own rows enriched.
-            if any(
-                r.via_graph and r.via_graph_kind == "supersedes" for r in results
-            ):
+            if any(r.via_graph and r.via_graph_kind == "supersedes" for r in results):
                 self._search_stats["graph_supersedes_enriched_requests_total"] = (
                     int(self._search_stats["graph_supersedes_enriched_requests_total"]) + 1
                 )
@@ -3079,9 +3076,7 @@ class MemoryManager:
                 "graph_supersedes_enriched_requests_total": s_stats[
                     "graph_supersedes_enriched_requests_total"
                 ],
-                "graph_walk_enriched_requests_total": s_stats[
-                    "graph_walk_enriched_requests_total"
-                ],
+                "graph_walk_enriched_requests_total": s_stats["graph_walk_enriched_requests_total"],
                 "avg_latency_ms": s_stats["avg_latency_ms"],
                 "avg_results": s_stats["avg_results"],
             },

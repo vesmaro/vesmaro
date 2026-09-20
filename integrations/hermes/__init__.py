@@ -78,12 +78,11 @@ import time
 from typing import Any
 
 from agent.memory_provider import MemoryProvider
-from tools.registry import tool_error
-
 from mnemos.adapters.hermes import HermesMemoryAdapter
 from mnemos.config import Settings
 from mnemos.models import MemoryType
 from mnemos.sdk import MnemosSDK
+from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 

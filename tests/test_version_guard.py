@@ -15,7 +15,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
-import mnemos, vesmaro  # noqa: E402 — canonical + dual-period shim
+import mnemos
+import vesmaro
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

@@ -3430,9 +3430,7 @@ class SQLiteStore:
         if kind is None:
             row = conn.execute("SELECT COUNT(*) FROM edge_stats").fetchone()
         else:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM edge_stats WHERE kind = ?", (kind,)
-            ).fetchone()
+            row = conn.execute("SELECT COUNT(*) FROM edge_stats WHERE kind = ?", (kind,)).fetchone()
         return int(row[0])
 
     def get_memory_id_by_rewrite_event_key(self, event_key: str) -> str | None:

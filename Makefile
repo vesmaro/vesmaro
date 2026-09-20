@@ -37,30 +37,37 @@ help:
 	@echo "  make push-image - Tag and push local image to ghcr.io/korrnals/mnemos (requires: podman login ghcr.io)"
 	@echo "  make pypi-publish - PyPI pipeline: name+version gates, build, twine check, smoke (upload needs scripts/pypi-publish.sh --publish)"
 
+# Gate targets invoke the repo venv EXPLICITLY (.venv/bin/*), never bare
+# tool names through PATH (#337 / #335): a bare `pytest`/`ruff` resolves a
+# foreign interpreter when the venv is not activated — green locally, wrong
+# build. tests/test_repo_hygiene.py::test_pytest_runs_from_repo_venv is the
+# runtime tripwire for the same invariant.
+VENV := .venv/bin
+
 install:
 	uv pip install -e ".[dev]"
 
 test:
-	pytest tests/ -v --tb=short
+	$(VENV)/pytest tests/ -v --tb=short
 
 lint:
-	ruff check src/ tests/ benchmarks/
+	$(VENV)/ruff check .
 
 lint-shell:  ## Run shellcheck on all shell scripts
 	shellcheck scripts/*.sh
 
 format:
-	ruff format src/ tests/
+	$(VENV)/ruff format src/ tests/
 
 format-check:
-	ruff format --check src/ tests/
+	$(VENV)/ruff format --check src/ tests/
 
 typecheck:
-	mypy --strict src/mnemos/
+	$(VENV)/mypy --strict src/vesmaro/ src/mnemos/
 
 security:
-	bandit -r src/ -f json -o bandit-report.json || true
-	pip-audit --ignore-vuln CVE-2026-45829
+	$(VENV)/bandit -r src/ -f json -o bandit-report.json || true
+	$(VENV)/pip-audit --ignore-vuln CVE-2026-45829
 
 security-reminder:
 	@echo "⚠️  SECURITY REMINDER: review the pip-audit output weekly (make security / make update-deps);"
@@ -72,7 +79,7 @@ update-deps:
 	pip-audit
 
 coverage:
-	pytest --cov=src/mnemos --cov-report=term-missing --cov-fail-under=80 tests/ -q
+	$(VENV)/pytest --cov=src/vesmaro --cov-report=term-missing --cov-fail-under=80 tests/ -q
 
 check-version:
 	@python scripts/check_version.py
@@ -166,9 +173,9 @@ bootstrap:
 
 check-venv:
 	@if [ -x .venv/bin/python ]; then \
-		.venv/bin/python -c "import mnemos, pathlib, sys; got=pathlib.Path(mnemos.__file__).resolve(); want=(pathlib.Path.cwd()/'src/mnemos/__init__.py').resolve(); sys.exit(0 if got == want else 1)" \
+		.venv/bin/python -c "import vesmaro, pathlib, sys; got=pathlib.Path(vesmaro.__file__).resolve(); want=(pathlib.Path.cwd()/'src/vesmaro/__init__.py').resolve(); sys.exit(0 if got == want else 1)" \
 			&& echo "✅ .venv editable install resolves to ./src" \
-			|| { echo '⚠️  .venv is stale: mnemos does not import from ./src (project moved or venv built elsewhere). Run: make bootstrap'; exit 1; }; \
+			|| { echo '⚠️  .venv is stale: vesmaro does not import from ./src (project moved or venv built elsewhere). Run: make bootstrap'; exit 1; }; \
 	else \
 		echo "ℹ️  No .venv found — run: make bootstrap"; \
 	fi

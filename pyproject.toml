@@ -145,6 +145,17 @@ all = [
     "vesmaro[anthropic,openai,gemini,azure,ollama,mcp,pdf,docx,dev]",
 ]
 
+# PEP 735 dev group (#337, fix wave for #335): plain `uv sync` (and with it
+# `uv run`) now installs the gate tools too, without remembering `--extra
+# dev`. This kills the PATH-fallthrough class where `uv run pytest` /
+# `.venv/bin/pytest` silently resolved a foreign interpreter because the
+# repo venv held no pytest. The group self-references the `dev` EXTRA so
+# the tool list lives in exactly one place — pip workflows
+# (`pip install -e ".[dev]"`) and `uv sync --extra dev` keep working
+# unchanged (uv installs the default `dev` group plus any requested extras).
+[dependency-groups]
+dev = ["vesmaro[dev]"]
+
 [project.scripts]
 # Canonical + short hook (owner-approved, GWS card #331 amendment)
 vesmaro = "vesmaro.cli.main:app"
@@ -211,6 +222,16 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "RUF"]
 # E501 rationale class as generate_report.py).
 "benchmarks/strata/e2_d/conflict_pairs.py" = ["E501"]
 "benchmarks/strata/e2_d/replay224.py" = ["E501"]
+# benchmarks/corpus/deterministic_embedder.py: the module's SOURCE BYTES are
+# pinned by corpus_fingerprint() (sha256 over module bytes — see
+# benchmarks/stands/s1_quality/run.py), which 8 baseline/manifest gates
+# compare against recorded values. Ruff classifies the legacy `mnemos.*`
+# import as third-party and wants it merged into the numpy block (I001);
+# applying that cosmetic re-sort changes the fingerprint and falsely trips
+# every S1/E2/E3 gate. Re-recording baselines for a whitespace change is
+# forbidden (ADR-0020: event-driven triggers only). Suppress I001 for this
+# file until the fingerprint no longer covers it (#337).
+"benchmarks/corpus/deterministic_embedder.py" = ["I001"]
 # src/mnemos/storage/sqlite_store.py: the search-v2 short-token guard
 # (issue #314) carries the RU half of the `_FTS_STOPWORDS` frozenset and
 # RU examples in its docstrings — that IS the intended content (same
