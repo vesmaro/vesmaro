@@ -13,6 +13,7 @@ Memory entries without consistent structure become unsearchable noise.
 The tag contract:
 
 - Pins every entry to exactly **one project** and **one agent**
+- Optionally narrows the entry to **one task scope** (`task:`, ADR-0027)
 - Classifies the entry with at least **one Mnemos subtype** (cognitive category)
 - Enables per-agent recall (M3) and project-scoped cleanup
 - Prevents ambiguous dual-project entries (a common source of context pollution)
@@ -50,10 +51,37 @@ rejected in strict mode.
 
 | Tag | Format | Purpose |
 |-----|--------|---------|
+| `task:<slug>` | `[a-z0-9][a-z0-9\-_]*` (max 64) | Binds the entry to one task scope (see below) |
 | `source:<slug>` | any string | Origin of the entry (chat, file, url, …) |
 | `applyTo:<glob>` | file glob | Scope a `rule` to specific file paths |
 | `milestone:<id>` | any string | Links entry to a project milestone |
 | `domain:<slug>` | any string | Domain sub-classifier within a project |
+
+---
+## `task:` — task scope (multi-context memory, ADR-0027 Phase 0)
+
+`task:<slug>` is an **optional scope tag** (at most **one** per entry,
+format `^task:[a-z0-9_-]{1,64}$`) introduced by the multi-context memory
+decision (ADR-0027, epic #308, Phase 0 — composition without schema
+migration). It lets one agent run several concurrent tasks over one mixed
+corpus: entries written while working on a task carry that task's tag;
+entries without a `task:` tag imply **no global task** — they belong to
+the enclosing project/agent scope only.
+
+**Scope hierarchy = intersection, never union** (ADR-0027 doctrine):
+`project × agent × session × task`. A task tag can only **narrow** the
+admissible set, never widen it. A task-scoped query
+(`search(..., tags=["task:x"], project=..., agent=...)`) returns only
+rows that are inside the project AND the agent AND the task. A scoped
+search that returns zero rows is treated as information ("this task has
+no matching rows yet"), not as scope drift: the project soft-fallback
+retry is deliberately **not** applied to task-scoped queries, so a
+task-scoped search can never widen back out of its project scope.
+
+Multiple `task:` tags on one entry are always rejected (strict AND lax
+mode): an entry belongs to at most one task — two task tags would make
+the record visible in two task scopes (a union), which the intersection
+doctrine forbids.
 
 ---
 ## `mnemos:no-federate` — federation exclusion marker
@@ -115,7 +143,10 @@ renamed to `mnemos:no-federate` because the same exclusion must cover
 ### Lax mode (`strict_tag_contract=False`, for migrations)
 
 - Missing required tags emit a warning but do **not** raise.
-- Multiple `project:` / `agent:` tags still raise (always ambiguous).
+- Multiple `project:` / `agent:` / `task:` tags still raise (always ambiguous).
+- An invalid `task:` slug is normalized when salvageable (case, spaces);
+  an unsalvageable one is **dropped** — lax mode never mints a fake
+  `task:unknown` scope.
 - Used by `mnemos migrate from-ai-brain` CLI command.
 
 ---
@@ -136,6 +167,12 @@ tc = TagContract(tags=["project:myproject", "agent:copilot", "mnemos:decision"])
 print(tc.project)       # "myproject"
 print(tc.agent)         # "copilot"
 print(tc.mnemos_subtypes)  # {"decision"}
+
+# With an (optional) task scope tag
+tc = TagContract(
+    tags=["project:myproject", "agent:copilot", "mnemos:learning", "task:refactor-auth"]
+)
+print(tc.task)          # "refactor-auth" ("" when the entry carries no task:)
 
 # Pass tags when creating a Memory
 from mnemos.models import Memory
@@ -314,3 +351,5 @@ Common messages:
 | `invalid mnemos: subtype` | Subtype not in allowed set |
 | `invalid slug for project:` | Slug contains uppercase or special chars |
 | `invalid slug for agent:` | Slug contains uppercase or special chars |
+| `at most one task:` | ≥2 `task:` tags (always fatal, strict and lax) |
+| `invalid task: tag format` | Task slug contains uppercase, spaces, special chars, or exceeds 64 chars |

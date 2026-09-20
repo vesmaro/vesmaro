@@ -1494,7 +1494,15 @@ class MemoryManager:
         retry would resurface junk from other projects' lanes (the same
         status policy is KEPT on the retry; the guard here is that a
         scoped ``status=`` query returning zero is information, not a
-        scope-drift candidate).
+        scope-drift candidate). ADR-0027 Phase 0 (#308) adds the same
+        exemption for TASK-SCOPED queries — a ``tags`` filter carrying a
+        ``task:`` tag asserts the task dimension of the scope hierarchy
+        (project x agent x session x task, inheritance = INTERSECTION),
+        and a task tag may only NARROW, never widen: the retry keeps the
+        task tag while dropping the project scope, which would surface
+        foreign-project rows into a task view. Zero rows in a task scope
+        is information ("this task has no matching rows yet"), not scope
+        drift.
 
         Graph leg v1 (issue #313): after RRF fusion, the top-``limit``
         fused ids are 1-hop expanded along ``memory_edges`` (BOTH
@@ -1562,8 +1570,13 @@ class MemoryManager:
         # include_raw / refined_only policy (no junk resurfacing); only the
         # project scope is dropped. Not triggered for the explicit global
         # mode (project=None is already unscoped) and not for status
-        # drill-downs (see the docstring rationale).
-        if project and not results and status is None:
+        # drill-downs (see the docstring rationale). ADR-0027 Phase 0
+        # (#308): also not for task-scoped queries — the retry would keep
+        # the task tag while dropping the project scope, widening a task
+        # view across projects (intersection doctrine: a task tag only
+        # NARROWS, never widens).
+        task_scoped = tags is not None and any(t.startswith("task:") for t in tags)
+        if project and not results and status is None and not task_scoped:
             logger.info(
                 "search: project=%s scoped search returned 0 rows — "
                 "retrying without the scope (soft fallback)",

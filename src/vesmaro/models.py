@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
@@ -226,6 +227,11 @@ POLICY_TAG_PREFIXES: frozenset[str] = frozenset({"applyTo:", "severity:"})
 
 _PROJECT_RE = re.compile(r"^project:[a-z0-9_\-]{1,64}$")
 _AGENT_RE = re.compile(r"^agent:[a-z0-9_\-]{1,64}$")
+# ADR-0027 Phase 0 (epic #308): the optional task-scope tag. Same slug
+# alphabet/length as project/agent. Zero or one per record — a record
+# belongs to at most one task scope (see validate_tag_contract docstring
+# for the intersection doctrine).
+_TASK_RE = re.compile(r"^task:[a-z0-9_\-]{1,64}$")
 _VESMARO_RE = re.compile(r"^mnemos:[a-z][a-z0-9\-]*$")
 
 
@@ -236,17 +242,36 @@ class TagContractError(ValueError):
 def validate_tag_contract(tags: list[str], *, strict: bool = True) -> list[str]:
     """Validate tags against the Mnemos tag contract.
 
+    Scope hierarchy doctrine (ADR-0027 Phase 0, epic #308): inheritance is
+    **INTERSECTION, not union** — ``project x agent x session x task``.
+    A ``task:`` tag NARROWS the admissible set, never widens it: a
+    task-scoped query sees a row only where the project, agent AND task
+    admissibility sets already overlap. Consequences enforced here:
+
+    * ``task:<slug>`` is OPTIONAL (zero or one). A record without a
+      ``task:`` tag implies no global task — it belongs to the enclosing
+      project/agent scope only.
+    * MORE THAN ONE ``task:`` tag is always fatal (strict and lax): an
+      entry visible in two task scopes is a union, which the doctrine
+      forbids — the same ambiguity rule as duplicate ``project:`` /
+      ``agent:`` tags.
+
     Args:
         tags: The list of tag strings to validate.
         strict: When True, raises TagContractError on any violation.
                 When False (lax mode), patches the tag list with legacy
                 defaults and returns it with a warning-level log entry.
+                An invalid-but-salvageable ``task:`` slug is normalized;
+                an unsalvageable one is DROPPED (lax mode never mints a
+                fake ``task:unknown`` scope — for an optional tag, absence
+                is the honest fallback).
 
     Returns:
         The (possibly augmented) tag list.
 
     Raises:
-        TagContractError: If strict=True and any contract requirement is not met.
+        TagContractError: If strict=True and any contract requirement is not met,
+            or (always) on ambiguous tag sets (multiple project:/agent:/task:).
     """
     # Backward compat: gcw: is accepted as an alias for mnemos:
     # Old memories with gcw: tags are auto-migrated to mnemos: on validation.
@@ -264,6 +289,7 @@ def validate_tag_contract(tags: list[str], *, strict: bool = True) -> list[str]:
 
     project_tags = [t for t in tags if t.startswith("project:")]
     agent_tags = [t for t in tags if t.startswith("agent:")]
+    task_tags = [t for t in tags if t.startswith("task:")]
     mnemos_tags = [t for t in tags if t.startswith("mnemos:")]
 
     # Errors that are fatal even in lax mode (ambiguous context, can't auto-patch)
@@ -292,6 +318,17 @@ def validate_tag_contract(tags: list[str], *, strict: bool = True) -> list[str]:
     elif not _AGENT_RE.match(agent_tags[0]):
         patchable_errors.append(
             f"invalid agent: tag format '{agent_tags[0]}' (must match agent:[a-z0-9_-]{{1,64}})"
+        )
+
+    # --- Optional task:* scope tag (ADR-0027 Phase 0, at most one) ---
+    # Intersection doctrine: a task tag may only narrow. Multiple task
+    # tags would make the record visible in several task scopes (a
+    # union) — always fatal, mirroring the project/agent ambiguity rule.
+    if len(task_tags) > 1:
+        fatal_errors.append(f"at most one task: tag allowed, got {len(task_tags)}: {task_tags}")
+    elif len(task_tags) == 1 and not _TASK_RE.match(task_tags[0]):
+        patchable_errors.append(
+            f"invalid task: tag format '{task_tags[0]}' (must match task:[a-z0-9_-]{{1,64}})"
         )
 
     # --- Require at least one mnemos:* tag ---
@@ -369,18 +406,40 @@ def validate_tag_contract(tags: list[str], *, strict: bool = True) -> list[str]:
     elif not agent_tags:
         patched.append("agent:unknown")
 
+    # ADR-0027 Phase 0: task is optional, so the honest lax fallback for
+    # an unsalvageable task slug is DROPPING it (a task-less record),
+    # never minting a fake ``task:unknown`` scope — unlike the required
+    # project/agent families, absence carries no ambiguity.
+    if task_tags and not _TASK_RE.match(task_tags[0]):
+        normalized = _normalize_slug(task_tags[0], _TASK_RE, "task:")
+        if normalized is not None:
+            patched = [normalized if t == task_tags[0] else t for t in patched]
+            logger.warning("Normalized task tag: %s → %s", task_tags[0], normalized)
+        else:
+            patched = [t for t in patched if t != task_tags[0]]
+            logger.warning(
+                "Dropped unsalvageable task tag (lax mode — optional scope): %s",
+                task_tags[0],
+            )
+
     if not mnemos_tags:
         patched.append("mnemos:legacy")
     return patched
 
 
 class TagContract(BaseModel):
-    """Validated tag set with denormalised project + agent slugs."""
+    """Validated tag set with denormalised project + agent (+ task) slugs.
+
+    ``task`` (ADR-0027 Phase 0) is ``""`` when the entry carries no
+    ``task:`` scope tag — absence means "no global task", never a fake
+    ``unknown`` scope.
+    """
 
     tags: list[str]
     strict: bool = Field(default=True, exclude=True)
     project: str = ""
     agent: str = ""
+    task: str = ""
     mnemos_subtypes: frozenset[str] = Field(default_factory=frozenset, exclude=True)
 
     @model_validator(mode="after")
@@ -394,10 +453,92 @@ class TagContract(BaseModel):
                 self.project = tag[len("project:") :]
             elif tag.startswith("agent:") and not self.agent:
                 self.agent = tag[len("agent:") :]
+            elif tag.startswith("task:") and not self.task:
+                self.task = tag[len("task:") :]
             elif tag.startswith("mnemos:"):
                 subtypes.add(tag[len("mnemos:") :])
         self.mnemos_subtypes = frozenset(subtypes)
         return self
+
+
+# ── Multi-context doc grouping (ADR-0027 Phase 0 — convention) ─────────────────
+#
+# Docs-as-memory grouping rides the EXISTING ``Memory.metadata`` JSON
+# column: a memory row that is a chunk of an ingested document carries
+# ``{doc_id, chunk_idx, heading_path}`` in its metadata dict. This is a
+# CONVENTION, not enforced schema (ADR-0027: a separate ``documents``
+# table only if a measured parent→chunks query pattern appears) — hence
+# zero migration: no column, no index, no backfill. ``file_path`` /
+# ``source_url`` remain the existing first-class columns; ``doc_id`` is
+# the logical document identity that survives re-chunking.
+DOC_GROUPING_METADATA_FIELDS: tuple[str, ...] = ("doc_id", "chunk_idx", "heading_path")
+
+#: Defensive bound on ``doc_id`` length (no external spec; matches the
+#: conservative slug sizes used across the tag contract).
+_DOC_ID_MAX_LEN = 256
+
+
+def build_doc_grouping_metadata(
+    doc_id: str, chunk_idx: int, heading_path: Sequence[str]
+) -> dict[str, Any]:
+    """Build the doc-grouping metadata convention dict (ADR-0027 Phase 0).
+
+    Validates the triple's shape at the single construction site so the
+    convention cannot drift between writers:
+
+    * ``doc_id`` — non-empty string (stripped), at most 256 chars;
+    * ``chunk_idx`` — 0-based, non-negative ``int`` (``bool`` rejected);
+    * ``heading_path`` — ordered root→leaf heading chain, a sequence of
+      strings (an empty chain is legal: a chunk before the first heading).
+
+    Returns a fresh dict meant to be merged into ``Memory.metadata``
+    (the caller owns the rest of the metadata dict). Raises
+    ``ValueError`` on any shape violation.
+    """
+    if not isinstance(doc_id, str):
+        raise ValueError(f"doc_id must be a string, got {type(doc_id).__name__}")
+    stripped = doc_id.strip()
+    if not stripped or len(stripped) > _DOC_ID_MAX_LEN:
+        raise ValueError(f"doc_id must be a non-empty string of at most {_DOC_ID_MAX_LEN} chars")
+    if isinstance(chunk_idx, bool) or not isinstance(chunk_idx, int) or chunk_idx < 0:
+        raise ValueError(f"chunk_idx must be a non-negative int, got {chunk_idx!r}")
+    if not isinstance(heading_path, Sequence) or isinstance(heading_path, (str, bytes)):
+        raise ValueError("heading_path must be a sequence of strings")
+    headings = list(heading_path)
+    for h in headings:
+        if not isinstance(h, str):
+            raise ValueError(f"heading_path entries must be strings, got {h!r}")
+    return {"doc_id": stripped, "chunk_idx": chunk_idx, "heading_path": headings}
+
+
+def doc_grouping_from_metadata(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Extract the doc-grouping triple from a memory metadata dict.
+
+    Returns ``None`` when the metadata carries no doc grouping at all
+    (the default for every non-document row). When ANY of the three
+    convention keys is present, ALL must be present and well-formed —
+    a half-written grouping is corruption, so a ``ValueError`` is raised
+    (loud) rather than silently treating the row as a non-document:
+    Phase-3 assembly groups chunks by ``doc_id`` and a silent ``None``
+    would split a document without a trace.
+    """
+    present = [k for k in DOC_GROUPING_METADATA_FIELDS if k in metadata]
+    if not present:
+        return None
+    missing = [k for k in DOC_GROUPING_METADATA_FIELDS if k not in metadata]
+    if missing:
+        raise ValueError(
+            f"partial doc grouping metadata: present {present}, missing {missing} "
+            "(the convention is all-or-nothing)"
+        )
+    # Delegate shape validation to the single construction site. Raw
+    # values, no coercion: a chunk_idx stored as "3" or 1.5 is malformed
+    # metadata and must raise, not silently normalize.
+    return build_doc_grouping_metadata(
+        metadata["doc_id"],
+        metadata["chunk_idx"],
+        metadata["heading_path"],
+    )
 
 
 # ── Core memory model ──────────────────────────────────────────────────────────
