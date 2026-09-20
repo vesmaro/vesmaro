@@ -23,10 +23,24 @@ I5-capture requirements, each as a test:
 * scope fields (project/agent) recorded from the FIRST event;
 * default-off flag — flag off means zero writes and zero telemetry;
 * failure isolation — a capture-side failure never fails the caller.
+
+Review #338 hardening (N1-N4, the A1 pre-requisites):
+
+* N1 — the id preimage covers principal + kind: cross-agent /
+  cross-project / used-vs-rejected collisions under one logical report
+  id no longer silently drop the second event;
+* N2 — GLOBAL row cap (``EDGE_STATS_TOTAL_ROWS_CAP``) plus the ONE
+  operator purge path (``purge_edge_stats_oldest``: single maintenance
+  transaction, trigger recreated, meta audit stamp; never automatic
+  eviction);
+* N3 — the durable telemetry reads are ONE ``GROUP BY kind``
+  aggregation, not three full scans;
+* N4 — ``EDGE_STATS_KINDS`` is public API alongside the cap constants.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
@@ -38,7 +52,8 @@ from vesmaro.config import Settings
 from vesmaro.manager import MemoryManager
 from vesmaro.models import MemoryCreate, MemorySource, MemoryStatus
 from vesmaro.storage.sqlite_store import (
-    _EDGE_STATS_KINDS,
+    EDGE_STATS_KINDS,
+    EDGE_STATS_LAST_PURGE_META_KEY,
     SQLiteStore,
 )
 
@@ -152,11 +167,11 @@ class TestSchema:
         assert _object_exists(conn, "idx_edge_stats_scope")
 
     def test_check_accepts_exactly_the_whitelist(self, store: SQLiteStore) -> None:
-        """The SQL CHECK and _EDGE_STATS_KINDS are the same set (DB-level
+        """The SQL CHECK and EDGE_STATS_KINDS are the same set (DB-level
         sync, the _EDGE_KINDS rule), and anything else aborts."""
-        assert set(_EDGE_STATS_KINDS) == {"used", "rejected"}
+        assert set(EDGE_STATS_KINDS) == {"used", "rejected"}
         conn = store._get_conn()
-        for kind in _EDGE_STATS_KINDS:
+        for kind in EDGE_STATS_KINDS:
             conn.execute(
                 "INSERT INTO edge_stats (event_id, memory_id, kind, created_at) VALUES (?,?,?,?)",
                 (f"ev-{kind}", "m-x", kind, "2026-09-16T00:00:00+00:00"),
@@ -484,9 +499,10 @@ class TestFailureIsolation:
     def test_telemetry_read_failure_degrades(
         self, manager_on: MemoryManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # N3: the durable read surface is the single by-kind aggregation.
         monkeypatch.setattr(
             manager_on.sqlite,
-            "count_edge_stats",
+            "count_edge_stats_by_kind",
             MagicMock(side_effect=sqlite3.OperationalError("locked")),
         )
         stats = manager_on.feedback_capture_stats()  # must not raise
@@ -580,3 +596,260 @@ class TestSearchIntegration:
         )
         assert len(_rows(manager)) == 0
         assert manager.feedback_capture_stats()["events_total"] == 0
+
+
+# ── Review #338 N1: the id preimage covers principal + kind ──────────────────
+
+
+class TestEventIdPreimage:
+    """N1 — hashing only (event_id, memory_id) let two principals
+    sharing one logical report id collide: the second agent's legitimate
+    event was silently dropped as a "duplicate". The preimage now
+    covers (event_id, memory_id, kind, project, agent) while staying
+    retry-stable — idempotency remains the point."""
+
+    def test_hash_retry_stable_and_field_sensitive(self) -> None:
+        from vesmaro.manager import _derive_feedback_event_id as derive
+
+        base = derive("r1", "m-a", kind="used", project="p", agent="ag")
+        # Retry-stable: same tuple → same row id (the whole point).
+        assert derive("r1", "m-a", kind="used", project="p", agent="ag") == base
+        # Each preimage dimension moves the id.
+        assert derive("r1", "m-a", kind="rejected", project="p", agent="ag") != base
+        assert derive("r1", "m-a", kind="used", project="q", agent="ag") != base
+        assert derive("r1", "m-a", kind="used", project="p", agent="ag2") != base
+        assert derive("r2", "m-a", kind="used", project="p", agent="ag") != base
+        # Length-prefix injectivity (the compute_event_key property): a
+        # delimiter-containing id cannot spoof a different split.
+        assert derive("ab", "c", kind="used", project="", agent="") != derive(
+            "a", "bc", kind="used", project="", agent=""
+        )
+
+    def test_cross_agent_same_logical_id_both_land(self, manager_on: MemoryManager) -> None:
+        """Two agents share the caller's logical report id (e.g. the same
+        harness turn id reused across agents) — BOTH events land; the
+        second is no longer a silent "duplicate" drop."""
+        m = _add(manager_on, "cited by two agents")
+        first = manager_on.report_search_feedback(
+            [m.id], kind="used", project=None, agent="agent-one", event_id="turn-42"
+        )
+        second = manager_on.report_search_feedback(
+            [m.id], kind="used", project=None, agent="agent-two", event_id="turn-42"
+        )
+        assert (first["captured"], second["captured"]) == (1, 1)
+        assert (first["duplicates"], second["duplicates"]) == (0, 0)
+        rows = _rows(manager_on)
+        assert len(rows) == 2
+        assert {r["agent"] for r in rows} == {"agent-one", "agent-two"}
+
+    def test_cross_project_same_logical_id_both_land(self, manager_on: MemoryManager) -> None:
+        """The project half of the principal: two projects, one logical
+        report id — both events land."""
+        m_a = _add(manager_on, "project a citation", project="proj-a")
+        m_b = _add(manager_on, "project b citation", project="proj-b")
+        first = manager_on.report_search_feedback(
+            [m_a.id], kind="used", project="proj-a", agent=AGENT, event_id="turn-42"
+        )
+        second = manager_on.report_search_feedback(
+            [m_b.id], kind="used", project="proj-b", agent=AGENT, event_id="turn-42"
+        )
+        assert (first["captured"], second["captured"]) == (1, 1)
+        rows = _rows(manager_on)
+        assert len(rows) == 2
+        assert {r["project"] for r in rows} == {"proj-a", "proj-b"}
+
+    def test_used_then_rejected_same_logical_id_both_land(self, manager_on: MemoryManager) -> None:
+        """One caller id, both verdicts: 'used' then 'rejected' for the
+        same citation under one logical report id are TWO events — the
+        kind is in the preimage, the retraction is not swallowed."""
+        m = _add(manager_on, "used first, rejected on reflection")
+        used = manager_on.report_search_feedback(
+            [m.id], kind="used", project=PROJECT, agent=AGENT, event_id="r1"
+        )
+        rejected = manager_on.report_search_feedback(
+            [m.id], kind="rejected", project=PROJECT, agent=AGENT, event_id="r1"
+        )
+        assert (used["captured"], rejected["captured"]) == (1, 1)
+        rows = _rows(manager_on)
+        assert len(rows) == 2
+        assert {r["kind"] for r in rows} == {"used", "rejected"}
+
+    def test_retry_same_principal_same_kind_still_idempotent(
+        self, manager_on: MemoryManager
+    ) -> None:
+        """N1 does not loosen idempotency: the SAME (event, memory,
+        kind, principal) tuple retries to a duplicate — exactly one row."""
+        m = _add(manager_on, "retried report")
+        first = manager_on.report_search_feedback(
+            [m.id], kind="used", project=PROJECT, agent=AGENT, event_id="r1"
+        )
+        retry = manager_on.report_search_feedback(
+            [m.id], kind="used", project=PROJECT, agent=AGENT, event_id="r1"
+        )
+        assert (first["captured"], retry["duplicates"]) == (1, 1)
+        assert len(_rows(manager_on)) == 1
+
+
+# ── Review #338 N2: global row cap + the operator purge path ─────────────────
+
+
+class TestGlobalRowsCap:
+    def test_global_cap_drops_across_principals(
+        self, store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The per-bucket cap bounds ONE identity; the global cap bounds
+        the TABLE across all minted principals — over-cap events drop
+        regardless of which principal reports them."""
+        monkeypatch.setattr("vesmaro.storage.sqlite_store.EDGE_STATS_TOTAL_ROWS_CAP", 3)
+        for i, p in enumerate(["p1", "p2", "p3"]):
+            assert (
+                store.record_edge_stat_event(f"e-{i}", "m-a", kind="used", project=p) == "inserted"
+            )
+        # A FOURTH principal, first event, per-bucket cap far away — the
+        # global ceiling is what drops it.
+        assert (
+            store.record_edge_stat_event("e-x", "m-a", kind="used", project="p4") == "cap_dropped"
+        )
+        assert store.count_edge_stats() == 3
+
+    def test_capture_resumes_after_operator_purge(
+        self, store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The global cap is NOT automatic eviction: capture stays
+        dropped until an operator reclaims rows — then it flows again."""
+        monkeypatch.setattr("vesmaro.storage.sqlite_store.EDGE_STATS_TOTAL_ROWS_CAP", 2)
+        assert store.record_edge_stat_event("e-1", "m-a", kind="used", project="p1") == "inserted"
+        assert store.record_edge_stat_event("e-2", "m-b", kind="used", project="p1") == "inserted"
+        assert (
+            store.record_edge_stat_event("e-3", "m-c", kind="used", project="p2") == "cap_dropped"
+        )
+        purged = store.purge_edge_stats_oldest(keep_last=0, dry_run=False)
+        assert purged["purged"] == 2
+        # Same previously-dropped event, same id — now it lands.
+        assert store.record_edge_stat_event("e-3", "m-c", kind="used", project="p2") == "inserted"
+
+
+def _seed_direct(store: SQLiteStore, rows: list[tuple[str, str]]) -> None:
+    """Insert rows with CONTROLLED created_at (bypasses the store method,
+    which stamps now()) — purge ordering must be testable deterministically."""
+    conn = store._get_conn()
+    for event_id, created_at in rows:
+        conn.execute(
+            "INSERT INTO edge_stats (event_id, memory_id, kind, project, agent, created_at)"
+            " VALUES (?, 'm-x', 'used', 'p', 'a', ?)",
+            (event_id, created_at),
+        )
+    conn.commit()
+
+
+class TestOperatorPurge:
+    def test_dry_run_reports_and_writes_nothing(self, store: SQLiteStore) -> None:
+        _seed_direct(store, [(f"e-{i}", f"2026-09-{10 + i}T00:00:00+00:00") for i in range(5)])
+        result = store.purge_edge_stats_oldest(keep_last=2, dry_run=True)
+        assert result == {"rows_before": 5, "purged": 3, "rows_after": 2, "dry_run": True}
+        assert store.count_edge_stats() == 5  # nothing written
+        assert store.get_meta(EDGE_STATS_LAST_PURGE_META_KEY) is None  # no audit stamp either
+
+    def test_apply_purges_oldest_keeps_newest(self, store: SQLiteStore) -> None:
+        _seed_direct(store, [(f"e-{i}", f"2026-09-{10 + i}T00:00:00+00:00") for i in range(5)])
+        result = store.purge_edge_stats_oldest(keep_last=2, dry_run=False)
+        assert result == {"rows_before": 5, "purged": 3, "rows_after": 2, "dry_run": False}
+        kept = {r[0] for r in store._get_conn().execute("SELECT event_id FROM edge_stats")}
+        assert kept == {"e-3", "e-4"}  # the NEWEST two survive
+
+    def test_append_only_guards_survive_purge(self, store: SQLiteStore) -> None:
+        """The purge transaction restores the DELETE trigger: after it,
+        plain DELETE and UPDATE abort exactly as before (the audit trail
+        is still a database guarantee — the operator path is the only
+        exception, and it re-arms itself)."""
+        _seed_direct(store, [("e-1", "2026-09-10T00:00:00+00:00")])
+        store.purge_edge_stats_oldest(keep_last=1, dry_run=False)
+        conn = store._get_conn()
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("DELETE FROM edge_stats WHERE event_id = 'e-1'")
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("UPDATE edge_stats SET kind = 'rejected' WHERE event_id = 'e-1'")
+
+    def test_purge_stamps_meta_audit_trail(self, store: SQLiteStore) -> None:
+        """The compensating audit: the append-only table shrank, and the
+        record of THAT shrink survives in meta (at/purged/keep_last)."""
+        _seed_direct(store, [(f"e-{i}", f"2026-09-{10 + i}T00:00:00+00:00") for i in range(4)])
+        store.purge_edge_stats_oldest(keep_last=2, dry_run=False)
+        stamp = json.loads(store.get_meta(EDGE_STATS_LAST_PURGE_META_KEY) or "{}")
+        assert stamp["purged"] == 2
+        assert stamp["keep_last"] == 2
+        assert stamp["at"]  # ISO timestamp of the operator action
+
+    def test_negative_keep_last_rejected(self, store: SQLiteStore) -> None:
+        with pytest.raises(ValueError, match="keep_last"):
+            store.purge_edge_stats_oldest(keep_last=-1)
+
+    def test_keep_last_beyond_total_is_noop(self, store: SQLiteStore) -> None:
+        _seed_direct(store, [("e-1", "2026-09-10T00:00:00+00:00")])
+        result = store.purge_edge_stats_oldest(keep_last=10, dry_run=False)
+        assert result["purged"] == 0
+        assert result["rows_after"] == 1
+
+    def test_created_at_tie_broken_deterministically(self, store: SQLiteStore) -> None:
+        """Same-timestamp rows order by insertion (rowid): the purge set
+        is a deterministic function of the table state."""
+        _seed_direct(
+            store,
+            [
+                ("old-a", "2026-09-10T00:00:00+00:00"),
+                ("old-b", "2026-09-10T00:00:00+00:00"),
+                ("new-a", "2026-09-11T00:00:00+00:00"),
+                ("new-b", "2026-09-11T00:00:00+00:00"),
+            ],
+        )
+        result = store.purge_edge_stats_oldest(keep_last=2, dry_run=False)
+        assert result["purged"] == 2
+        kept = {r[0] for r in store._get_conn().execute("SELECT event_id FROM edge_stats")}
+        assert kept == {"new-a", "new-b"}
+
+
+# ── Review #338 N3/N4: one-aggregation telemetry; public kinds constant ─────
+
+
+class TestSingleAggregationTelemetry:
+    def test_count_by_kind_one_query_exact_total(self, store: SQLiteStore) -> None:
+        store.record_edge_stat_event("e1", "m-a", kind="used", project="p")
+        store.record_edge_stat_event("e2", "m-b", kind="used", project="p")
+        store.record_edge_stat_event("e3", "m-b", kind="rejected", project="p")
+        assert store.count_edge_stats_by_kind() == {"used": 2, "rejected": 1}
+        # The CHECK on kind guarantees the by-kind counts PARTITION the
+        # table: their sum IS the total, no second counting pass.
+        assert sum(store.count_edge_stats_by_kind().values()) == store.count_edge_stats()
+
+    def test_count_by_kind_empty_table_zeroed(self, store: SQLiteStore) -> None:
+        assert store.count_edge_stats_by_kind() == {"used": 0, "rejected": 0}
+
+    def test_stats_read_issues_one_aggregation_no_full_scans(
+        self, manager_on: MemoryManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """N3 regression pin: feedback_capture_stats must issue exactly
+        ONE durable read (the GROUP BY) and must NOT fall back to the
+        per-kind/full-table count scans it replaced."""
+        m = _add(manager_on, "counted once, scanned once")
+        manager_on.report_search_feedback([m.id], kind="used", project=PROJECT, event_id="r1")
+
+        real = manager_on.sqlite.count_edge_stats_by_kind
+        by_kind_spy = MagicMock(side_effect=real)
+        full_scan_trap = MagicMock(side_effect=AssertionError("full-scan count_edge_stats used"))
+        monkeypatch.setattr(manager_on.sqlite, "count_edge_stats_by_kind", by_kind_spy)
+        monkeypatch.setattr(manager_on.sqlite, "count_edge_stats", full_scan_trap)
+
+        stats = manager_on.feedback_capture_stats()
+        assert by_kind_spy.call_count == 1
+        assert full_scan_trap.call_count == 0
+        assert stats["events_total"] == 1
+        assert stats["captured_used_total"] == 1
+        assert stats["captured_rejected_total"] == 0
+
+    def test_kinds_constant_is_public_api(self) -> None:
+        """N4: EDGE_STATS_KINDS is public (cross-module import surface)
+        and the private spelling is gone — no private cross-module import."""
+        from vesmaro.storage import sqlite_store
+
+        assert frozenset({"used", "rejected"}) == sqlite_store.EDGE_STATS_KINDS
+        assert not hasattr(sqlite_store, "_EDGE_STATS_KINDS")

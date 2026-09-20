@@ -66,7 +66,7 @@ from vesmaro.pipeline import (
 )
 from vesmaro.policy.engine import PolicyAction
 from vesmaro.storage.sqlite_store import (
-    _EDGE_STATS_KINDS,
+    EDGE_STATS_KINDS,
     FTS_SNIPPET_ELLIPSIS,
     FTS_SNIPPET_END_MARK,
     FTS_SNIPPET_START_MARK,
@@ -82,20 +82,41 @@ logger = logging.getLogger(__name__)
 _MAX_REDIRECTS: int = 5
 
 
-def _derive_feedback_event_id(event_id: str, memory_id: str) -> str:
+def _derive_feedback_event_id(
+    event_id: str, memory_id: str, *, kind: str, project: str, agent: str
+) -> str:
     """Deterministic per-row event id from the caller's logical report id.
 
     ADR-0030 A0 (issue #323, I5 idempotency): length-prefixed SHA-256
-    over ``(event_id, memory_id)`` — injective for arbitrary caller
-    strings (the ``compute_event_key`` pattern from context_rewrite: a
-    delimiter scheme could be spoofed by an id containing the
-    delimiter). Retrying the same report with the same ``event_id``
-    re-derives the same row ids, so ``INSERT OR IGNORE`` drops them —
-    an agent retry contributes no double weight. The hash also keeps
-    the raw caller string out of the PK namespace: a hostile caller
-    cannot squat a predictable id shape.
+    over ``(event_id, memory_id, kind, project, agent)`` — injective
+    for arbitrary caller strings (the ``compute_event_key`` pattern
+    from context_rewrite: a delimiter scheme could be spoofed by an id
+    containing the delimiter). Retrying the same report re-derives the
+    same row ids, so ``INSERT OR IGNORE`` drops them — an agent retry
+    contributes no double weight. The hash also keeps the raw caller
+    string out of the PK namespace: a hostile caller cannot squat a
+    predictable id shape.
+
+    Review #338 N1: the preimage includes the reporting PRINCIPAL
+    ``(project, agent)`` and the ``kind``. Hashing only
+    ``(event_id, memory_id)`` let two different principals sharing one
+    logical report id collide — the second agent's legitimate event was
+    silently dropped as a "duplicate" — and likewise a ``used`` then
+    ``rejected`` report under one caller id. The full tuple keeps
+    idempotency EXACT: same (caller event, memory, principal, kind) →
+    same row id (retry-stable); anything else → a distinct row.
+    ``project``/``agent`` here are the NORMALIZED values that land in
+    the row (``""`` for the explicit global mode) — the hash must be
+    stable across processes, and the stored columns are the stable
+    form.
     """
-    canonical = f"{len(event_id)}:{event_id}{len(memory_id)}:{memory_id}"
+    canonical = (
+        f"{len(event_id)}:{event_id}"
+        f"{len(memory_id)}:{memory_id}"
+        f"{len(kind)}:{kind}"
+        f"{len(project)}:{project}"
+        f"{len(agent)}:{agent}"
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -2899,10 +2920,13 @@ class MemoryManager:
         so it is not an existence oracle.
 
         Idempotency (I5): pass a retry-stable ``event_id`` — per-row ids
-        are derived from it, so an agent retrying the same report
-        inserts nothing (``duplicates`` counts the idempotent drops).
-        Without ``event_id`` each report mints fresh uuids (no
-        cross-call idempotency — retrying callers must pass one).
+        are derived from ``(event_id, memory, kind, principal)`` (review
+        #338 N1), so an agent retrying the same report inserts nothing
+        (``duplicates`` counts the idempotent drops), while a DIFFERENT
+        principal or kind under the same logical id is a distinct,
+        legitimately captured event. Without ``event_id`` each report
+        mints fresh uuids (no cross-call idempotency — retrying callers
+        must pass one).
         Residual (A0): validation uses the DEFAULT issuance gates;
         feedback on rows received via the documented widenings
         (``include_raw`` / explicit ``status=``) stays out of scope
@@ -2921,9 +2945,9 @@ class MemoryManager:
             "duplicates", "out_of_scope", "cap_dropped"}`` — counts
             only, no per-id detail (uniform-404).
         """
-        if kind not in _EDGE_STATS_KINDS:
+        if kind not in EDGE_STATS_KINDS:
             raise ValueError(
-                f"unknown feedback kind {kind!r}; supported kinds: {sorted(_EDGE_STATS_KINDS)}"
+                f"unknown feedback kind {kind!r}; supported kinds: {sorted(EDGE_STATS_KINDS)}"
             )
         # One event row per memory — duplicate ids within one report are
         # the same citation reported twice, not two events.
@@ -2941,20 +2965,29 @@ class MemoryManager:
             return outcome
         with self._feedback_stats_lock:
             self._feedback_stats["reports_total"] += 1
+        # Normalized principal — the exact values stored on the row (the
+        # explicit global mode is the ("", "") bucket). Kept stable so
+        # the N1 id preimage (below) and the stored scope columns agree.
+        norm_project = project or ""
+        norm_agent = agent or ""
         try:
             for mid in unique_ids:
                 if not self._feedback_target_visible(mid, project=project):
                     outcome["out_of_scope"] += 1
                     continue
                 row_event_id = (
-                    _derive_feedback_event_id(event_id, mid) if event_id else str(uuid.uuid4())
+                    _derive_feedback_event_id(
+                        event_id, mid, kind=kind, project=norm_project, agent=norm_agent
+                    )
+                    if event_id
+                    else str(uuid.uuid4())
                 )
                 result = self.sqlite.record_edge_stat_event(
                     row_event_id,
                     mid,
                     kind=kind,
-                    project=project or "",
-                    agent=agent or "",
+                    project=norm_project,
+                    agent=norm_agent,
                 )
                 if result == "inserted":
                     outcome["captured"] += 1
@@ -3009,18 +3042,25 @@ class MemoryManager:
         ``events_total`` / ``captured_used_total`` /
         ``captured_rejected_total`` are DURABLE — read from the
         edge_stats table, so the A0-review D-behavioral signal survives
-        restarts. ``since_restart`` is the in-memory window breakdown
-        (drops, duplicates, errors): operational health of the capture
-        leg, not volume.
+        restarts. Review #338 N3: all three numbers come from ONE
+        ``GROUP BY kind`` aggregation (``count_edge_stats_by_kind``) —
+        the previous shape issued three separate full-table scans per
+        dashboard/stats read. ``since_restart`` is the in-memory window
+        breakdown (drops, duplicates, errors): operational health of
+        the capture leg, not volume.
         """
         enabled = bool(self.settings.search.feedback_capture_enabled)
         try:
-            used = self.sqlite.count_edge_stats(kind="used")
-            rejected = self.sqlite.count_edge_stats(kind="rejected")
-            events_total = self.sqlite.count_edge_stats()
+            by_kind = self.sqlite.count_edge_stats_by_kind()
         except Exception as exc:
             logger.warning("feedback capture stats read failed: %s", exc)
-            used = rejected = events_total = 0
+            by_kind = {}
+        used = int(by_kind.get("used", 0))
+        rejected = int(by_kind.get("rejected", 0))
+        # Exact, not an approximation: the SQL CHECK on kind guarantees
+        # no row exists outside EDGE_STATS_KINDS, so the by-kind counts
+        # partition the table.
+        events_total = sum(by_kind.values())
         with self._feedback_stats_lock:
             window = dict(self._feedback_stats)
         return {

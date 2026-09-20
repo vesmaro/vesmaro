@@ -17,6 +17,10 @@ from vesmaro.cli._manager import get_manager
 from vesmaro.config import find_config_file, load_settings
 from vesmaro.logging_setup import setup_logging
 from vesmaro.models import MemoryCreate, MemorySource, MemoryType
+from vesmaro.storage.sqlite_store import (
+    EDGE_STATS_LAST_PURGE_META_KEY,
+    EDGE_STATS_TOTAL_ROWS_CAP,
+)
 
 # ``get_manager`` lives in the leaf module ``_manager`` so that CLI
 # subcommand modules (export_cmd, import_cmd) can import it without forming
@@ -741,6 +745,87 @@ def backfill_embedding_ids_cmd(
     console.print(f"  [green]stamped: {result['stamped']}[/green]")
     console.print(f"  already set (skipped): {result['skipped_already_set']}")
     mgr.close()
+
+
+# ── edge-stats maintenance (ADR-0030 A0, review #338 N2) ────────────────────
+
+
+@app.command(name="edge-stats")
+def edge_stats_cmd(
+    action: str = typer.Argument("stats", help="Action: stats | purge"),
+    keep_last: int = typer.Option(
+        None,
+        "--keep-last",
+        "-k",
+        help=(
+            "Purge retention target: the NEWEST N edge_stats rows survive, "
+            "everything older is dropped. Required for 'purge' — there is no "
+            "default retention by design (an operator states it explicitly)."
+        ),
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help=(
+            "Execute the purge (default is a dry run that only reports what "
+            "would be dropped: review it, then re-run with --apply)."
+        ),
+    ),
+    config: str = ConfigOption,
+) -> None:
+    """edge_stats (used/rejected feedback capture) maintenance.
+
+    The table is append-only (I5): UPDATE and DELETE abort at the DB
+    level, and capture volume is bounded per principal AND globally
+    (EDGE_STATS_EVENTS_PER_PRINCIPAL_CAP / EDGE_STATS_TOTAL_ROWS_CAP —
+    over-cap events are dropped, never an error). 'purge' is the ONE
+    operator path that may shrink it: it drops the OLDEST rows past the
+    --keep-last retention inside a single maintenance transaction
+    (trigger dropped and recreated atomically, the purge stamped into
+    the meta audit trail). There is NO automatic eviction — once the
+    global cap is reached, capture stays dropped until an operator runs
+    this. Run 'stats' first; run purge as a dry run first.
+
+    \b
+    Examples:
+      vesmaro edge-stats stats
+      vesmaro edge-stats purge --keep-last 100000          (dry run)
+      vesmaro edge-stats purge --keep-last 100000 --apply  (executes)
+    """
+    mgr = get_manager(config)
+    try:
+        if action == "stats":
+            by_kind = mgr.sqlite.count_edge_stats_by_kind()
+            console.print(
+                f"  [cyan]rows total: {sum(by_kind.values())}[/cyan] "
+                f"(global cap {EDGE_STATS_TOTAL_ROWS_CAP})"
+            )
+            for k in sorted(by_kind):
+                console.print(f"  {k}: {by_kind[k]}")
+            console.print(f"  capture flag: {mgr.settings.search.feedback_capture_enabled}")
+            stamp = mgr.sqlite.get_meta(EDGE_STATS_LAST_PURGE_META_KEY)
+            console.print(f"  last purge: {stamp or 'never'}")
+        elif action == "purge":
+            if keep_last is None:
+                console.print("[red]'purge' requires --keep-last N (no default retention)[/red]")
+                raise typer.Exit(1)
+            if keep_last < 0:
+                console.print("[red]--keep-last must be >= 0[/red]")
+                raise typer.Exit(1)
+            result = mgr.sqlite.purge_edge_stats_oldest(keep_last=keep_last, dry_run=not apply)
+            if result["dry_run"]:
+                console.print("  [cyan]dry run (no writes)[/cyan] — re-run with --apply to purge")
+            console.print(f"  rows before: {result['rows_before']}")
+            color = "green" if apply else "yellow"
+            console.print(
+                f"  [{color}]{'purged' if apply else 'would purge'}: {result['purged']}[/{color}]"
+            )
+            console.print(f"  rows after: {result['rows_after']}")
+        else:
+            console.print("[red]Unknown action: {action}. Use 'stats' or 'purge'.[/red]")
+            raise typer.Exit(1)
+    finally:
+        mgr.close()
 
 
 # ── filter (M10) ───────────────────────────────────────────────────────────────
