@@ -48,6 +48,10 @@ What is measured and persisted (F1 §2/§4.3 — NOTHING else):
 * per-query outcome tuples per arm: binary hit (gold id in the issued
   top-5), assembled token count, issued block slugs, foreign-task
   leakage slugs, lens activation + the G4a pre/post-lens gold probes;
+* every L-neg outcome row carries the committed ``substratum`` flag
+  ("trap" | "mixed", §8 entry 15): the G4b corridor's trap-family
+  scope and the mixed-phrasing activation-cost descriptive measure are
+  read from the artifact data, never re-derived by the analysis wave;
 * discordance tallies for the registered comparisons (T-gold: A/A0,
   A/C, A/B, C/B; X-gold and L-neg: A/A0);
 * NO statistics at run time: no p-values, no CIs, no verdicts, no
@@ -114,7 +118,7 @@ from vesmaro.lens import Lens  # noqa: E402
 from vesmaro.manager import MemoryManager  # noqa: E402
 from vesmaro.models import MemoryCreate, MemorySource, MemoryStatus  # noqa: E402
 
-RUNNER_VERSION = "f1-task-scope-runner-1"
+RUNNER_VERSION = "f1-task-scope-runner-2"
 EXPERIMENT = "f1-task-scope"
 SPEC = "docs/experiments/f1-task-scope.md §1.3, §2.8, §3, §4, §6.5, §9"
 
@@ -740,6 +744,19 @@ _ARM_TUPLE_KEYS: frozenset[str] = frozenset(
     }
 )
 
+#: The exact key set of a per-query outcome row. L-neg rows carry ONE
+#: additional key — ``substratum`` ("trap" | "mixed") — the committed
+#: evaluation-scope flag (§8 entry 15): the G4b corridor reads the trap
+#: family, the mixed-phrasing activation-cost descriptive measure reads
+#: the mixed family. Non-L-neg rows carry no substratum key (there is
+#: no sub-split to name there).
+_QUERY_ROW_KEYS: frozenset[str] = frozenset(
+    {"qid", "stratum", "query_class", "task", "gold_slug", "axis", "arms"}
+)
+
+#: The legal substratum values (L-neg only).
+_SUBSTRATA: frozenset[str] = frozenset({"trap", "mixed"})
+
 #: Registered comparisons per stratum (§2.1-§2.4, §2.7b, §6.1).
 _COMPARISONS: dict[str, tuple[tuple[str, str], ...]] = {
     "t_gold": (("A", "A0"), ("A", "C"), ("A", "B"), ("C", "B")),
@@ -785,17 +802,23 @@ def build_outcomes(
     """Per-query outcome tuples per arm + discordance tallies ONLY."""
     rows = []
     for q in queries:
-        rows.append(
-            {
-                "qid": q.qid,
-                "stratum": q.stratum,
-                "query_class": q.query_class,
-                "task": q.current_task,
-                "gold_slug": q.gold_slug,
-                "axis": q.axis,
-                "arms": {arm: per_arm[arm][q.qid].as_dict() for arm in ARM_ORDER},
-            }
-        )
+        row: dict[str, Any] = {
+            "qid": q.qid,
+            "stratum": q.stratum,
+            "query_class": q.query_class,
+            "task": q.current_task,
+            "gold_slug": q.gold_slug,
+            "axis": q.axis,
+            "arms": {arm: per_arm[arm][q.qid].as_dict() for arm in ARM_ORDER},
+        }
+        if q.stratum == "l_neg":
+            # The committed evaluation-scope flag (§8 entry 15): the
+            # corridor/descriptive split rides IN the artifact, not in
+            # analysis-wave prose.
+            substratum = q.substratum
+            assert substratum is not None  # l_neg by the branch above
+            row["substratum"] = substratum
+        rows.append(row)
 
     def _tally(stratum: str, first: str, second: str) -> dict[str, int]:
         qs = [q for q in queries if q.stratum == stratum]
@@ -859,8 +882,22 @@ def verify_outcomes(outcomes: dict[str, Any]) -> None:
     if len(set(qids)) != len(qids):
         raise AssertionError("pairing keys (qids) must be unique")
     per_stratum: dict[str, int] = {}
+    substratum_counts: dict[str, int] = {}
     for row in queries:
         per_stratum[row["stratum"]] = per_stratum.get(row["stratum"], 0) + 1
+        expected_keys = _QUERY_ROW_KEYS | ({"substratum"} if row["stratum"] == "l_neg" else set())
+        if set(row) != expected_keys:
+            raise AssertionError(
+                f"{row['qid']}: row keys must be exactly {sorted(expected_keys)} — "
+                f"got {sorted(row)}"
+            )
+        if row["stratum"] == "l_neg":
+            if row["substratum"] not in _SUBSTRATA:
+                raise AssertionError(
+                    f"{row['qid']}: substratum must be one of {sorted(_SUBSTRATA)}, "
+                    f"got {row['substratum']!r}"
+                )
+            substratum_counts[row["substratum"]] = substratum_counts.get(row["substratum"], 0) + 1
         if set(row["arms"]) != set(ARM_ORDER):
             raise AssertionError(f"{row['qid']}: arms must be exactly {list(ARM_ORDER)}")
         for arm in ARM_ORDER:
@@ -874,6 +911,13 @@ def verify_outcomes(outcomes: dict[str, Any]) -> None:
                 raise AssertionError(f"{row['qid']}/{arm}: more than top-5 blocks issued")
     if per_stratum != f1_corpus.ANALYZED_COUNTS:
         raise AssertionError(f"stratum coverage drifted: {per_stratum}")
+    # The L-neg sub-split must cover the stratum exactly (§8 entry 15);
+    # the 16-trap/8-mixed bootstrap composition itself is pinned by the
+    # manifest + tests, not hard-coded here (a §3.5 adjudication that
+    # replaces a rejected mixed pair with trap-shaped surplus legitimately
+    # shifts the split — the manifest records the run's own composition).
+    if sum(substratum_counts.values()) != f1_corpus.ANALYZED_COUNTS["l_neg"]:
+        raise AssertionError(f"l_neg substrata must cover the stratum exactly: {substratum_counts}")
     expected_disc = {s: {f"{f}_vs_{sec}" for f, sec in comps} for s, comps in _COMPARISONS.items()}
     if set(outcomes["discordance"]) != set(expected_disc):
         raise AssertionError("discordance strata drifted")
@@ -937,6 +981,16 @@ def build_manifest_core(
     produce the identical run id — and any drift produces a new one.
     """
     audit_pairs = f1_corpus.audit_subsample(corpus)
+    # The run's own L-neg sub-split (§8 entry 15), computed from the
+    # ACTIVE analyzed set: bootstrap = 16 trap + 8 mixed; a §3.5
+    # adjudication replacing a rejected mixed pair with trap-shaped
+    # surplus shifts it — the manifest records what THIS run measured.
+    l_neg_composition: dict[str, int] = {"trap": 0, "mixed": 0}
+    for q in analyzed:
+        if q.stratum == "l_neg":
+            substratum = q.substratum
+            assert substratum is not None  # l_neg by the branch above
+            l_neg_composition[substratum] += 1
     return {
         "runner_version": RUNNER_VERSION,
         "experiment": EXPERIMENT,
@@ -969,6 +1023,7 @@ def build_manifest_core(
             "tasks": list(f1_corpus.TASKS),
             "projects": dict(f1_corpus.TASK_PROJECTS),
             "agent": f1_corpus.AGENT,
+            "l_neg_composition": l_neg_composition,
         },
         "ledger": {
             "artifact": "benchmarks/experiments/f1_task_scope/adjudication_ledger.json",
@@ -1098,6 +1153,15 @@ def verify_manifest(manifest: dict[str, Any]) -> None:
             raise AssertionError(f"corpus count {key}={counts.get(key)} != {expected_count} (§3.4)")
     if manifest["ledger"]["analyzed"] != f1_corpus.ANALYZED_COUNTS:
         raise AssertionError("ledger analyzed strata drifted off 192/48/24")
+    composition = manifest["corpus"]["l_neg_composition"]
+    if (
+        not isinstance(composition, dict)
+        or set(composition) - {"trap", "mixed"}
+        or sum(composition.values()) != f1_corpus.ANALYZED_COUNTS["l_neg"]
+    ):
+        raise AssertionError(
+            f"l_neg_composition must cover the stratum over trap/mixed only: {composition!r}"
+        )
     if manifest["clock"]["run_now"] != RUN_NOW.isoformat():
         raise AssertionError("scenario clock drifted from the frozen RUN_NOW")
     if manifest["corpus"]["fingerprint_blake2b"] != f1_corpus.corpus_fingerprint():
@@ -1226,7 +1290,10 @@ def run_ledger_entry(manifest: dict[str, Any]) -> str:
         f"state `{ledger['state_sha256'][:12]}…` (rejects={ledger['rejects']}, "
         f"replacements={ledger['replacements']}, analyzed "
         f"{ledger['analyzed']['t_gold']}/{ledger['analyzed']['x_gold']}/"
-        f"{ledger['analyzed']['l_neg']}); budget {manifest['equal_budget']}, top-"
+        f"{ledger['analyzed']['l_neg']} — L-neg split "
+        f"{corpus['l_neg_composition']['trap']} trap + "
+        f"{corpus['l_neg_composition']['mixed']} mixed, §8/15); "
+        f"budget {manifest['equal_budget']}, top-"
         f"{manifest['top_k']}, lanes off, type-boost on, frozen clock "
         f"{manifest['clock']['run_now']}; code {manifest['code']['git_commit'][:12]}…"
         f" (mnemos {manifest['code']['mnemos_version']}, python "
@@ -1306,18 +1373,28 @@ def _print_summary(manifest: dict[str, Any], outcomes: dict[str, Any]) -> None:
         f"replacements={manifest['ledger']['replacements']})"
     )
     arm_hits: dict[str, dict[str, int]] = {arm: {} for arm in ARM_ORDER}
+    l_neg_split_hits: dict[str, dict[str, int]] = {arm: {} for arm in ARM_ORDER}
     for row in outcomes["queries"]:
         for arm in ARM_ORDER:
             stratum = row["stratum"]
             bucket = arm_hits[arm].setdefault(stratum, 0)
             arm_hits[arm][stratum] = bucket + (1 if row["arms"][arm]["hit"] else 0)
+            if stratum == "l_neg":
+                sub_bucket = l_neg_split_hits[arm].setdefault(row["substratum"], 0)
+                l_neg_split_hits[arm][row["substratum"]] = sub_bucket + (
+                    1 if row["arms"][arm]["hit"] else 0
+                )
+    split = manifest["corpus"]["l_neg_composition"]
     for arm in ARM_ORDER:
         hits = arm_hits[arm]
+        sub = l_neg_split_hits[arm]
         counts = f1_corpus.ANALYZED_COUNTS
         print(
             f"arm {arm:>2}: t-gold hits {hits.get('t_gold', 0)}/{counts['t_gold']}   "
             f"x-gold hits {hits.get('x_gold', 0)}/{counts['x_gold']}   "
-            f"l-neg hits {hits.get('l_neg', 0)}/{counts['l_neg']}"
+            f"l-neg hits {hits.get('l_neg', 0)}/{counts['l_neg']} "
+            f"(trap {sub.get('trap', 0)}/{split['trap']} corridor, "
+            f"mixed {sub.get('mixed', 0)}/{split['mixed']} descriptive — §8/15)"
         )
     for stratum, comparisons in outcomes["discordance"].items():
         for comparison, tally in comparisons.items():

@@ -186,9 +186,22 @@ class GoldQuery:
     surplus: bool = False  # replacement-pool pair, not analyzed by default
     #: L-neg mixed-phrasing birth property (the G4b falsifiability
     #: repair): True on the activating prose-gold queries whose code-
-    #: shaped call token makes the CODE lens narrow — the corridor's
-    #: falsifiable arm. Unused on every other stratum.
+    #: shaped call token makes the CODE lens narrow. Unused on every
+    #: other stratum.
     mixed: bool = False
+
+    @property
+    def substratum(self) -> str | None:
+        """The L-neg sub-split ("trap" | "mixed"); None outside L-neg.
+
+        The committed, fingerprinted evaluation-scope flag (§8 entry 15):
+        the G4b corridor reads the trap family; the mixed-phrasing
+        activation-cost measure reads the mixed family. Derived from the
+        ``mixed`` birth flag — deterministic, no outcome input.
+        """
+        if self.stratum != "l_neg":
+            return None
+        return "mixed" if self.mixed else "trap"
 
 
 # ── vocabulary pools (all committed content; the rng only picks) ──────────────

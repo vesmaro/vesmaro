@@ -314,26 +314,91 @@ def test_invariants_v1_to_v6_executed_and_logged(collected: tuple[dict, dict]) -
     assert len(inv["store_copy"]["content_digest_sha256"]) == 64
 
 
-def test_g4b_corridor_measures_at_arm_level(collected: tuple[dict, dict]) -> None:
-    """The G4b corridor has signal, not structure: on the activating
-    mixed L-neg queries arm A's lens excludes the prose gold from its
-    code-only candidates (hit(A)=0 by construction), while A0 reaches
-    it — discordance A0-only > 0 is possible, so the §2.7b corridor can
-    FAIL. Before the repair every L-neg query was lens-inactive (arm A
-    ran the identity projection, byte-identical to A0) and the corridor
-    could never fail — the reviewer's falsifiability defect."""
+def test_g4b_trap_corridor_and_mixed_measure_split(collected: tuple[dict, dict]) -> None:
+    """§8 entry 15 (TL decision, review round 2): the G4b corridor's
+    scope and the descriptive activation-cost measure ride IN the
+    artifact — every l_neg row carries substratum trap|mixed — and both
+    are falsifiable in their own direction:
+
+    * TRAP subset (16, the corridor): lens-inactive under current
+      regexes ⇒ arm A runs the identity projection ⇒ hit(A) == hit(A0);
+      if the regexes ever broaden onto a trap phrasing, A loses the
+      trap gold and the corridor FAILS (the round-1 falsifiability).
+    * MIXED subset (8, the descriptive measure): activating prose-gold
+      queries — a behavior pin under CURRENT regexes, not a threshold:
+      arm A drops exactly these 8 (the lens hard-excludes prose), while
+      A0 reaches them (the measure is non-vacuous). Deterministic-red
+      here is a REPORTED result, never a corridor verdict.
+    """
     _, outcomes = collected
     l_neg = [row for row in outcomes["queries"] if row["stratum"] == "l_neg"]
-    mixed = [row for row in l_neg if row["arms"]["A"]["lens_active"]]
-    traps = [row for row in l_neg if not row["arms"]["A"]["lens_active"]]
+    mixed = [row for row in l_neg if row["substratum"] == "mixed"]
+    traps = [row for row in l_neg if row["substratum"] == "trap"]
     assert len(mixed) == 8 and len(traps) == 16
-    # the active lens's code-only narrowing structurally drops the prose gold
+    # the committed flag agrees with the measured lens activation
+    assert all(row["arms"]["A"]["lens_active"] for row in mixed)
+    assert all(not row["arms"]["A"]["lens_active"] for row in traps)
+    # behavior pin (current regexes): A drops exactly the 8 mixed…
     assert all(not row["arms"]["A"]["hit"] for row in mixed)
-    # A0 reaches at least one mixed gold — otherwise the corridor would
-    # be vacuous in the other direction (0-vs-0 everywhere)
-    assert any(row["arms"]["A0"]["hit"] for row in mixed)
-    # trap majority: the identity projection keeps A byte-equal to A0 there
+    assert any(row["arms"]["A0"]["hit"] for row in mixed)  # …and A0 reaches them
+    # …while the trap corridor is A0-mirrored under current calibration
     assert all(row["arms"]["A"]["hit"] == row["arms"]["A0"]["hit"] for row in traps)
+
+
+def test_substratum_flag_schema_enforced(collected: tuple[dict, dict]) -> None:
+    """The substratum flag is schema, not convention: present on EVERY
+    l_neg row (exact row-key set), absent on every other stratum's
+    rows; the manifest pins the run's own composition (bootstrap:
+    16 trap + 8 mixed); drift fails verify_* loud."""
+    manifest, outcomes = collected
+    assert manifest["corpus"]["l_neg_composition"] == {"trap": 16, "mixed": 8}
+    for row in outcomes["queries"]:
+        if row["stratum"] == "l_neg":
+            assert row["substratum"] in ("trap", "mixed")
+        else:
+            assert "substratum" not in row
+    # negative: dropping the flag from an l_neg row breaks the schema
+    stripped = {
+        **outcomes,
+        "queries": [
+            {k: v for k, v in row.items() if k != "substratum"}
+            if row["stratum"] == "l_neg"
+            else row
+            for row in outcomes["queries"]
+        ],
+    }
+    with pytest.raises(AssertionError, match="row keys"):
+        runner.verify_outcomes(stripped)
+    # negative: a bogus substratum value breaks the schema
+    bogus = {
+        **outcomes,
+        "queries": [
+            {**row, "substratum": "bogus"} if row["stratum"] == "l_neg" else row
+            for row in outcomes["queries"]
+        ],
+    }
+    with pytest.raises(AssertionError, match="substratum must be one of"):
+        runner.verify_outcomes(bogus)
+    # negative: substratum on a non-l_neg row breaks the schema
+    foreign = {
+        **outcomes,
+        "queries": [
+            {**row, "substratum": "trap"} if row["stratum"] == "t_gold" else row
+            for row in outcomes["queries"]
+        ],
+    }
+    with pytest.raises(AssertionError, match="row keys"):
+        runner.verify_outcomes(foreign)
+    # negative: a manifest composition that stops covering the stratum
+    # (re-finalized so the sha/run-id guards pass and the composition
+    # check itself is what fires)
+    bad_core = {
+        **runner._core(manifest),
+        "corpus": {**manifest["corpus"], "l_neg_composition": {"trap": 16, "mixed": 7}},
+    }
+    bad_manifest = runner.finalize_manifest(bad_core, manifest["invariants"])
+    with pytest.raises(AssertionError, match="l_neg_composition"):
+        runner.verify_manifest(bad_manifest)
 
 
 def test_arm_c_dual_token_basis(collected: tuple[dict, dict]) -> None:
@@ -461,11 +526,13 @@ def test_record_run_refuses_existing_directory(
 def test_run_ledger_entry_shape(collected: tuple[dict, dict], tmp_path: Path) -> None:
     manifest, _ = collected
     entry = runner.run_ledger_entry(manifest)
+    split = manifest["corpus"]["l_neg_composition"]
     for expected in (
         manifest["run_id"],
         manifest["corpus"]["fingerprint_blake2b"],
         "budget 2048",
         "lanes off",
+        f"L-neg split {split['trap']} trap + {split['mixed']} mixed",  # §8/15 in §9
     ):
         assert expected in entry
     doc_copy = tmp_path / "doc.md"
