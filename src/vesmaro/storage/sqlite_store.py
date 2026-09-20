@@ -2967,7 +2967,7 @@ class SQLiteStore:
                 """
                 SELECT * FROM memories
                 WHERE json_extract(metadata, '$.fed_id') = ?
-                ORDER BY created_at ASC
+                ORDER BY created_at ASC, id ASC
                 LIMIT 1
                 """,
                 (fed_id,),
@@ -2978,7 +2978,7 @@ class SQLiteStore:
                 SELECT * FROM memories
                 WHERE title = ?
                   AND json_extract(metadata, '$.fed_source_agent') = ?
-                ORDER BY created_at ASC
+                ORDER BY created_at ASC, id ASC
                 LIMIT 1
                 """,
                 (title, source_agent),
