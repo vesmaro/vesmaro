@@ -1,0 +1,667 @@
+"""ADR-0027 Phase 0, slice 2 (epic #308, checklist items 3-5 + review notes).
+
+Covers:
+
+1. **Code lens preset** (``vesmaro.lens`` — a code-defined, query-
+   conditioned projection that only narrows): resolve/activate/admit
+   unit pins, the assembly-level narrowing pin (subset + order), the
+   inactive-lens identity projection, and the DEFAULT-ABSENT byte
+   identity pin (no lens → no ``lens`` keys anywhere).
+2. **Optional ``task`` parameter on ``assemble_context``** (tail-only,
+   ADR-0027 invariant 1): boundary validation (bare slug), the
+   intersection-doctrine narrowing through the whole six-stage pipeline
+   (task rows only — never foreign tasks, never task-less rows, never
+   foreign projects), the echo/stats additive-only discipline, the
+   provenance/prefix stability across task and default assemblies of
+   one session, the governance-lanes composition, and the harness
+   carriers (``pre_llm_call`` hook, ``dispatch_hook``, REST
+   ``/hooks/pre_llm_call``).
+3. **Write-side doc-grouping validation** (slice-1 review item 1): the
+   DTO boundary (``MemoryCreate``/``MemoryUpdate`` field validators — a
+   partial ``{doc_id, chunk_idx, heading_path}`` triple fails
+   construction, REST gets a 422) and the store-boundary belt-and-
+   suspenders in ``MemoryManager.add``/``update`` (a validator-bypassed
+   ``model_construct`` DTO still cannot persist a partial triple).
+
+Item 4 of the slice-2 scope (the vector-leg agent predicate) is an
+ANALYSIS deliverable, not code: the task tail threads ``tags=``, which
+the search core post-filters exactly on every leg (fused + graph,
+slice-1 M2 pin) — the agent gap is not load-bearing for the task
+composition. Reported in the epic, no behavior pinned here.
+
+Test embedder: ``_HashEmbedder`` (deterministic hashed bag-of-tokens) —
+same rationale as the slice-1 suite: a MagicMock embedder cannot
+discriminate and would fake the ranking/gate semantics under test.
+
+MUTATION PROTOCOL — the load-bearing pins are mutation-verified
+(mutant → failing test, documented in the report; unmutated code GREEN):
+
+* ``test_lens_absent_default_is_byte_identical`` — M1 changes the
+  ``lens`` default in the ``MemoryManager.assemble_context`` wrapper
+  (the effective call boundary — the core function receives the
+  wrapper's explicit ``None``) to a member value; the additive-only
+  echo keys appear on the default path.
+* ``test_task_scoped_assembly_intersects_every_scope`` — M2 drops the
+  ``tags=search_tags`` threading in ``_recall_stage`` (foreign-task and
+  task-less rows surface in a task-scoped assembly).
+* ``test_lens_projection_is_subset_and_order_preserving`` — M3 makes
+  the lens block reorder survivors (``candidates = kept[::-1]``) — the
+  order-preservation assertion fails (the fixture keeps TWO code
+  survivors so the pin is non-vacuous).
+* ``test_manager_add_rejects_bypassed_partial_triple`` — M4 removes the
+  ``doc_grouping_from_metadata`` call from ``MemoryManager.add`` (a
+  ``model_construct`` partial triple persists).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import re
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+from vesmaro.api import main as api_main
+from vesmaro.api.main import app as real_app
+from vesmaro.api.main import lifespan
+from vesmaro.config import Settings
+from vesmaro.hooks import dispatch_hook, pre_llm_call
+from vesmaro.lens import Lens, lens_active, lens_admits, resolve_lens
+from vesmaro.manager import MemoryManager
+from vesmaro.models import (
+    Memory,
+    MemoryCreate,
+    MemorySource,
+    MemoryStatus,
+    MemoryUpdate,
+    build_doc_grouping_metadata,
+)
+
+PROJECT = "s2-proj"
+PROJECT_B = "s2-other"
+AGENT = "s2-agent"
+SESSION = "s2-session"
+
+#: Content the ingest classifier stamps ``content_type="code"`` on
+#: (three code-pattern lines for ``detect_profile``).
+CODE_CONTENT = (
+    "def load_settings():\n    import json\n    const cache = {}\n    return json.loads(raw)"
+)
+#: Prose counterpart — classified "prose" by the binary partition.
+PROSE_CONTENT = (
+    "The deploy pipeline uses hybrid search with rank fusion and "
+    "provenance wrappers for every recalled block."
+)
+
+#: A query that lexically hits both rows AND carries a code signal
+#: (``load_settings()`` — call-expression), so the CODE lens activates.
+CODE_QUERY = "how does load_settings() parse the config"
+
+
+class _HashEmbedder:
+    """Deterministic test embedder: hashed bag-of-tokens vectors (slice-1 twin)."""
+
+    DIM = 256
+
+    def embed(self, text: str) -> list[float]:
+        vec = [0.0] * self.DIM
+        for tok in re.findall(r"[a-z0-9]+", text.lower()):
+            h = int(hashlib.md5(tok.encode()).hexdigest(), 16)
+            vec[h % self.DIM] += 1.0
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]
+
+
+def _settings(tmp: Path, *, lanes_enabled: bool = False) -> Settings:
+    settings = Settings(
+        mnemos={
+            "vault_path": str(tmp / "vault"),
+            "data_dir": str(tmp / "data"),
+            "db_name": "test.db",
+        },
+        scanner={"enabled": False},  # type: ignore[arg-type]
+        lanes={"enabled": lanes_enabled},  # type: ignore[arg-type]
+    )
+    settings.resolve_paths()
+    return settings
+
+
+@pytest.fixture
+def mgr(tmp_path: Path) -> Iterator[MemoryManager]:
+    manager = MemoryManager(_settings(tmp_path))
+    manager._embedder = _HashEmbedder()
+    yield manager
+    manager.close()
+
+
+@pytest.fixture
+def lanes_mgr(tmp_path: Path) -> Iterator[MemoryManager]:
+    manager = MemoryManager(_settings(tmp_path, lanes_enabled=True))
+    manager._embedder = _HashEmbedder()
+    yield manager
+    manager.close()
+
+
+def _row(
+    manager: MemoryManager,
+    content: str,
+    *,
+    project: str = PROJECT,
+    agent: str = AGENT,
+    task: str | None = None,
+    subtype: str = "mnemos:learning",
+    title: str | None = None,
+) -> Memory:
+    """Add one published row with an explicit scope triple (+ task)."""
+    tags = [f"project:{project}", f"agent:{agent}", subtype]
+    if task is not None:
+        tags.append(f"task:{task}")
+    return manager.add(
+        MemoryCreate(
+            content=content,
+            title=title,
+            tags=tags,
+            source=MemorySource.MCP,
+            status=MemoryStatus.PUBLISHED,
+        ),
+        project=project,
+        agent=agent,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1a. Lens — unit semantics (resolve / activate / admit)
+# ---------------------------------------------------------------------------
+
+
+class TestLensUnit:
+    def test_resolve_none_is_none(self) -> None:
+        """Default = absent: None resolves to None (no lens, no projection)."""
+        assert resolve_lens(None) is None
+
+    @pytest.mark.parametrize("value", ["code", Lens.CODE])
+    def test_resolve_members(self, value: str | Lens) -> None:
+        assert resolve_lens(value) is Lens.CODE
+
+    @pytest.mark.parametrize("bad", ["wide", "", "CODE", "prose", "code-lens"])
+    def test_resolve_unknown_raises(self, bad: str) -> None:
+        """Lens definitions are CODE under review — any other name is a
+        boundary error (a named lens is an injection vector; fail loud)."""
+        with pytest.raises(ValueError, match="unknown lens"):
+            resolve_lens(bad)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "def run(self):",
+            "call parse_args() first",
+            "check src/vesmaro/manager.py search",
+            "rewrite fetch(url) => Result",
+            "class SettingsLoader: what fields",
+            "obj.method(x) returns what",
+            "what does std::vector hold",
+        ],
+    )
+    def test_code_shaped_queries_activate(self, query: str) -> None:
+        assert lens_active(Lens.CODE, query=query) is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "how does the retry loop work",
+            "deploy notes for the pipeline",
+            "parse",
+            "remember the quokka habitat survey",
+            "class attendance was low",  # 'class' without definition syntax
+            "import the CSV data",  # bare-word import is prose-ambiguous
+            "import vesmaro.manager",  # dotted import: no code-extension path
+            "define the function area for review",
+        ],
+    )
+    def test_prose_queries_do_not_activate(self, query: str) -> None:
+        """Query-conditioned (E3 class ban): a prose question about code
+        keeps the identity projection — its corpus legitimately includes
+        prose notes about code."""
+        assert lens_active(Lens.CODE, query=query) is False
+
+    def test_admit_identity_when_inactive(self) -> None:
+        assert lens_admits(Lens.CODE, query="deploy notes", content_type="prose") is True
+        assert lens_admits(Lens.CODE, query="deploy notes", content_type="code") is True
+
+    def test_admit_narrows_when_active(self) -> None:
+        assert lens_admits(Lens.CODE, query="def f():", content_type="code") is True
+        assert lens_admits(Lens.CODE, query="def f():", content_type="prose") is False
+
+
+# ---------------------------------------------------------------------------
+# 1b. Lens — assembly-level semantics
+# ---------------------------------------------------------------------------
+
+
+class TestLensAssembly:
+    def _seed(self, manager: MemoryManager) -> dict[str, Memory]:
+        return {
+            "code": _row(manager, CODE_CONTENT, title="loader"),
+            "code_b": _row(manager, CODE_CONTENT + "\n# second loader", title="loader b"),
+            "prose": _row(manager, PROSE_CONTENT, title="deploy notes"),
+        }
+
+    def test_lens_projection_is_subset_and_order_preserving(self, mgr: MemoryManager) -> None:
+        """ONLY NARROWS: the lens output is an ORDER-PRESERVING SUBSET of
+        the lens-less corpus — no reordering, no promotion (M3 pin; the
+        two code survivors make the order assertion non-vacuous)."""
+        rows = self._seed(mgr)
+        unlensed = mgr.assemble_context(session=SESSION, project=PROJECT, query=CODE_QUERY)
+        lensed = mgr.assemble_context(
+            session=SESSION, project=PROJECT, query=CODE_QUERY, lens="code"
+        )
+        unlensed_ids = [b["memory_id"] for b in unlensed["blocks"]]
+        lensed_ids = [b["memory_id"] for b in lensed["blocks"]]
+        # Subset: every lensed block was in the unlensed output.
+        assert set(lensed_ids) <= set(unlensed_ids)
+        # Order-preserving: the kept blocks keep their unlensed relative order.
+        assert lensed_ids == [mid for mid in unlensed_ids if mid in set(lensed_ids)]
+        # The narrowing actually fired on this fixture (not a vacuous pin):
+        # BOTH code rows survive (order pin has two survivors), prose drops.
+        assert rows["prose"].id in set(unlensed_ids)
+        assert rows["prose"].id not in set(lensed_ids)
+        assert {rows["code"].id, rows["code_b"].id} <= set(lensed_ids)
+        # Telemetry: additive-only, present because the lens was selected.
+        assert lensed["lens"] == "code"
+        assert lensed["stats"]["recall"]["lens"] == {
+            "name": "code",
+            "active": True,
+            "filtered": 1,
+        }
+
+    def test_inactive_lens_is_identity_projection(self, mgr: MemoryManager) -> None:
+        """A prose query under the CODE lens narrows nothing: same blocks
+        as the lens-less assembly (query-conditioned, E3 class ban)."""
+        self._seed(mgr)
+        unlensed = mgr.assemble_context(
+            session=SESSION, project=PROJECT, query="deploy pipeline notes"
+        )
+        lensed = mgr.assemble_context(
+            session=SESSION, project=PROJECT, query="deploy pipeline notes", lens="code"
+        )
+        assert [b["memory_id"] for b in lensed["blocks"]] == [
+            b["memory_id"] for b in unlensed["blocks"]
+        ]
+        assert lensed["lens"] == "code"  # echoed — the caller sees what they asked
+        assert lensed["stats"]["recall"]["lens"] == {
+            "name": "code",
+            "active": False,
+            "filtered": 0,
+        }
+
+    def test_lens_absent_default_is_byte_identical(self, mgr: MemoryManager) -> None:
+        """DEFAULT = ABSENT (M1 pin): without the parameter no ``lens``
+        key exists anywhere in the result — the default result dict shape
+        is the pre-Phase-0 shape, byte-identical."""
+        self._seed(mgr)
+        out = mgr.assemble_context(session=SESSION, project=PROJECT, query=CODE_QUERY)
+        assert "lens" not in out
+        assert "lens" not in out["stats"]["recall"]
+        # Explicit None is the same default.
+        out_none = mgr.assemble_context(
+            session=SESSION, project=PROJECT, query=CODE_QUERY, lens=None
+        )
+        assert out_none == out
+
+    def test_unknown_lens_rejected_at_boundary(self, mgr: MemoryManager) -> None:
+        with pytest.raises(ValueError, match="unknown lens"):
+            mgr.assemble_context(session=SESSION, project=PROJECT, lens="wide")
+
+
+# ---------------------------------------------------------------------------
+# 2a. task parameter — boundary validation
+# ---------------------------------------------------------------------------
+
+
+class TestTaskParamValidation:
+    @pytest.mark.parametrize("bad", ["Bad!", "", "  ", "task:t1", "t1 t2", "x" * 65, "рефакторинг"])
+    def test_invalid_task_rejected(self, mgr: MemoryManager, bad: str) -> None:
+        with pytest.raises(ValueError, match="task must"):
+            mgr.assemble_context(session=SESSION, project=PROJECT, task=bad)
+
+    def test_prefixed_task_gets_actionable_error(self, mgr: MemoryManager) -> None:
+        """The prefix is the boundary's job — point the caller at the slug."""
+        with pytest.raises(ValueError, match="pass 't1'"):
+            mgr.assemble_context(session=SESSION, project=PROJECT, task="task:t1")
+
+    def test_valid_slugs_accepted(self, mgr: MemoryManager) -> None:
+        """Boundary alphabet == the tag contract's (TASK_SLUG_RE shares the
+        task: tag pattern): 1..64 chars of [a-z0-9_-]."""
+        _row(mgr, "boundary slug probe content", task="a")
+        out = mgr.assemble_context(session=SESSION, project=PROJECT, task="a", query="boundary")
+        assert out["task"] == "a"
+
+
+# ---------------------------------------------------------------------------
+# 2b. task parameter — assembly semantics (intersection doctrine)
+# ---------------------------------------------------------------------------
+
+
+class TestTaskScopedAssembly:
+    def _seed(self, manager: MemoryManager) -> dict[str, Memory]:
+        rows = {
+            "in_task": _row(manager, "quokka habitat survey field notes", task="t1"),
+            "other_task": _row(manager, "quokka habitat survey field notes", task="t2"),
+            "no_task": _row(manager, "quokka habitat survey field notes"),
+            "foreign_project": _row(
+                manager, "quokka habitat survey field notes", project=PROJECT_B, task="t1"
+            ),
+        }
+        manager.vectors.wipe()  # FTS-only: the scope gates are the decider
+        return rows
+
+    def test_task_scoped_assembly_intersects_every_scope(self, mgr: MemoryManager) -> None:
+        """M2 pin: the task tail narrows through the WHOLE pipeline — only
+        same-project rows carrying the task tag surface (never the other
+        task, never task-less rows, never foreign projects)."""
+        rows = self._seed(mgr)
+        out = mgr.assemble_context(
+            session=SESSION, project=PROJECT, task="t1", query="quokka habitat"
+        )
+        ids = {b["memory_id"] for b in out["blocks"]}
+        assert ids == {rows["in_task"].id}
+        # Echo + telemetry: additive-only, present because the task was given.
+        assert out["task"] == "t1"
+        assert out["stats"]["recall"]["task_scoped"] is True
+
+    def test_task_absent_default_is_byte_identical(self, mgr: MemoryManager) -> None:
+        """Same discipline as the lens (M1 twin): no task → no ``task``
+        keys anywhere; explicit None == omitted."""
+        self._seed(mgr)
+        out = mgr.assemble_context(session=SESSION, project=PROJECT, query="quokka habitat")
+        assert "task" not in out
+        assert "task_scoped" not in out["stats"]["recall"]
+        out_none = mgr.assemble_context(
+            session=SESSION, project=PROJECT, query="quokka habitat", task=None
+        )
+        assert out_none == out
+
+    def test_task_tail_only_prefixes_untouched(self, mgr: MemoryManager) -> None:
+        """ADR-0027 invariant 1 (tail-only): the task parameter changes
+        WHICH blocks enter the per-call tail and NOTHING about the prefix
+        contract — every block keeps the canonical provenance shape, and
+        the session-scoped ``retrieved=`` stamp is IDENTICAL across the
+        task and default assemblies of one session (byte-stable prefixes
+        for harness-side KV caching)."""
+        self._seed(mgr)
+        default_out = mgr.assemble_context(session=SESSION, project=PROJECT, query="quokka habitat")
+        task_out = mgr.assemble_context(
+            session=SESSION, project=PROJECT, task="t1", query="quokka habitat"
+        )
+        prov_re = re.compile(
+            r"^\[mnemos:[0-9a-f-]{36} project=\S+ status=\S+ origin=\S+ "
+            r"(pipeline=\S+ )?v=\d+ retrieved=(\S+)\]$"
+        )
+        stamps: set[str] = set()
+        for out in (default_out, task_out):
+            for line in out["text"].splitlines():
+                if line.startswith("[mnemos:"):
+                    m = prov_re.match(line)
+                    assert m is not None, f"provenance shape drift: {line}"
+                    stamps.add(m.group(2))
+        assert len(stamps) == 1  # one session → one first-assembly stamp
+
+    def test_task_scoped_assembly_stable_across_calls(self, mgr: MemoryManager) -> None:
+        """Per-call tail determinism: two identical task-scoped assemblies
+        of one session produce byte-identical text (retrieved= is
+        session-scoped, uuids fixed by the seeded store)."""
+        self._seed(mgr)
+        t1 = mgr.assemble_context(
+            session=SESSION, project=PROJECT, task="t1", query="quokka habitat"
+        )["text"]
+        t2 = mgr.assemble_context(
+            session=SESSION, project=PROJECT, task="t1", query="quokka habitat"
+        )["text"]
+        assert t1 == t2
+
+
+# ---------------------------------------------------------------------------
+# 2c. task x lanes composition (intersection binds the governance leg)
+# ---------------------------------------------------------------------------
+
+
+class TestTaskLanesComposition:
+    def test_task_narrows_governance_lanes_too(self, lanes_mgr: MemoryManager) -> None:
+        """Symmetric narrowing: with lanes ON, a governance row without
+        the assembly's task tag is OUTSIDE the task's admissibility set
+        (intersection doctrine — a task-scoped assembly never surfaces a
+        row the task-less assembly would not)."""
+        tagged_rule = _row(
+            lanes_mgr,
+            "Tagged rule: run the migration linter before merge",
+            task="t1",
+            subtype="mnemos:rule",
+        )
+        untagged_rule = _row(
+            lanes_mgr,
+            "Untagged rule: keep CHANGELOG entries imperative",
+            subtype="mnemos:rule",
+        )
+        out = lanes_mgr.assemble_context(
+            session=SESSION, project=PROJECT, task="t1", query="migration linter"
+        )
+        ids = {b["memory_id"] for b in out["blocks"]}
+        assert tagged_rule.id in ids
+        assert untagged_rule.id not in ids
+        # Control: task-less assembly surfaces BOTH rules (the narrowing
+        # is the task gate, not a broken lane).
+        control = lanes_mgr.assemble_context(
+            session=SESSION, project=PROJECT, query="migration linter"
+        )
+        control_ids = {b["memory_id"] for b in control["blocks"]}
+        assert {tagged_rule.id, untagged_rule.id} <= control_ids
+        # Lane telemetry carries the task filter count (additive key).
+        assert out["stats"]["recall"]["lanes"]["task_filtered"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# 2d. task — harness carriers (hooks / dispatch / REST)
+# ---------------------------------------------------------------------------
+
+
+class TestTaskHarnessCarriers:
+    def test_pre_llm_call_threads_task(self, mgr: MemoryManager) -> None:
+        """ADR-0027: 'the harness passes the task identifier' — the
+        pre_llm_call hook is that carrier."""
+        rows = {
+            "in": _row(mgr, "carrier probe content about zebras", task="t1"),
+            "out": _row(mgr, "carrier probe content about zebras", task="t2"),
+        }
+        mgr.vectors.wipe()
+        out = pre_llm_call(
+            mgr,
+            session=SESSION,
+            project=PROJECT,
+            agent=AGENT,
+            context_hint="carrier probe zebras",
+            task="t1",
+        )
+        ids = {b["memory_id"] for b in out["blocks"]}
+        assert ids == {rows["in"].id}
+        assert out["task"] == "t1"
+
+    def test_pre_llm_call_without_task_unchanged(self, mgr: MemoryManager) -> None:
+        _row(mgr, "carrier probe content about zebras", task="t1")
+        out = pre_llm_call(
+            mgr, session=SESSION, project=PROJECT, agent=AGENT, context_hint="zebras"
+        )
+        assert "task" not in out
+
+    def test_dispatch_hook_routes_task(self, mgr: MemoryManager) -> None:
+        out = dispatch_hook(
+            mgr,
+            action="pre_llm_call",
+            session=SESSION,
+            project=PROJECT,
+            agent=AGENT,
+            context_hint="zebras",
+            task="t1",
+        )
+        assert out["task"] == "t1"
+
+    def test_rest_hooks_pre_llm_call_accepts_task(self, tmp_path: Path) -> None:
+        """The HTTP harness twin: POST /hooks/pre_llm_call with ``task``
+        narrows the assembly; an invalid slug maps to 422."""
+        manager = MemoryManager(_settings(tmp_path))
+        manager._embedder = _HashEmbedder()
+        try:
+            in_row = _row(manager, "rest carrier content about zebras", task="t1")
+            out_row = _row(manager, "rest carrier content about zebras", task="t2")
+            manager.vectors.wipe()
+            api_main._manager = manager
+            test_app = FastAPI(title="s2-test", version="0.1.0", lifespan=lifespan)
+            for route in real_app.routes:
+                test_app.routes.append(route)
+            with TestClient(test_app) as client:
+                body: dict[str, Any] = {
+                    "session": SESSION,
+                    "project": PROJECT,
+                    "agent": AGENT,
+                    "context_hint": "rest carrier zebras",
+                    "task": "t1",
+                }
+                resp = client.post("/hooks/pre_llm_call", json=body)
+                assert resp.status_code == 200
+                payload = resp.json()
+                assert payload["task"] == "t1"
+                ids = {b["memory_id"] for b in payload["blocks"]}
+                assert in_row.id in ids
+                assert out_row.id not in ids
+                bad = dict(body, task="Bad!")
+                bad_resp = client.post("/hooks/pre_llm_call", json=bad)
+                assert bad_resp.status_code == 422
+        finally:
+            api_main._manager = None
+            manager.close()
+
+
+# ---------------------------------------------------------------------------
+# 3. Write-side doc-grouping validation (slice-1 review item 1)
+# ---------------------------------------------------------------------------
+
+
+PARTIAL_TRIPLES: list[dict[str, Any]] = [
+    {"doc_id": "d"},
+    {"doc_id": "d", "chunk_idx": 0},
+    {"chunk_idx": 0, "heading_path": []},
+    {"doc_id": "d", "heading_path": []},
+    {"heading_path": ["A"]},
+]
+MALFORMED_FULL: list[dict[str, Any]] = [
+    {"doc_id": "", "chunk_idx": 0, "heading_path": []},
+    {"doc_id": "d", "chunk_idx": -1, "heading_path": []},
+    {"doc_id": "d", "chunk_idx": "3", "heading_path": []},
+    {"doc_id": "d", "chunk_idx": 0, "heading_path": "Context"},
+]
+
+
+class TestDocMetadataCreateValidation:
+    @pytest.mark.parametrize("partial", PARTIAL_TRIPLES)
+    def test_memory_create_rejects_partial_triple(self, partial: dict[str, Any]) -> None:
+        """DTO boundary: construction fails — the convention is
+        all-or-nothing, a persisted half-triple would split a document
+        silently once the Phase-3 reader groups by doc_id."""
+        with pytest.raises(ValidationError, match="doc grouping"):
+            MemoryCreate(content="x", metadata=partial)
+
+    @pytest.mark.parametrize("malformed", MALFORMED_FULL)
+    def test_memory_create_rejects_malformed_triple(self, malformed: dict[str, Any]) -> None:
+        """Full but ill-shaped triples fail with the builder's own shape
+        error (raw values are never silently coerced)."""
+        with pytest.raises(ValidationError):
+            MemoryCreate(content="x", metadata=malformed)
+
+    def test_memory_create_accepts_full_triple_and_plain_dicts(self) -> None:
+        triple = build_doc_grouping_metadata("doc-1", 0, ["A", "B"])
+        MemoryCreate(content="x", metadata=dict(triple))
+        MemoryCreate(content="x", metadata={"unrelated": "value"})
+        MemoryCreate(content="x")  # default empty dict
+
+
+class TestDocMetadataManagerGate:
+    def test_manager_add_rejects_bypassed_partial_triple(self, mgr: MemoryManager) -> None:
+        """M4 pin — belt-and-suspenders: ``model_construct`` bypasses the
+        pydantic validators, the MANAGER gate is the store-boundary
+        defence every write path (MCP/REST/SDK/CLI) funnels through."""
+        bypassed = MemoryCreate.model_construct(
+            content="bypassed",
+            tags=["project:p", "agent:a", "mnemos:rule"],
+            metadata={"doc_id": "d"},
+        )
+        with pytest.raises(ValueError, match="all-or-nothing"):
+            mgr.add(bypassed, project="p", agent="a")
+
+    def test_manager_add_accepts_full_triple(self, mgr: MemoryManager) -> None:
+        triple = build_doc_grouping_metadata("doc-2", 4, ["Install"])
+        memory = mgr.add(
+            MemoryCreate(
+                content="full triple",
+                tags=["project:p", "agent:a", "mnemos:rule"],
+                metadata=dict(triple),
+            ),
+            project="p",
+            agent="a",
+        )
+        stored = mgr.sqlite.get(memory.id)
+        assert stored is not None
+        assert stored.metadata["doc_id"] == "doc-2"
+
+    def test_manager_update_rejects_bypassed_partial_triple(self, mgr: MemoryManager) -> None:
+        memory = _row(mgr, "update gate probe")
+        bypassed = MemoryUpdate.model_construct(metadata={"doc_id": "d", "chunk_idx": 7})
+        with pytest.raises(ValueError, match="all-or-nothing"):
+            mgr.update(memory.id, bypassed)
+        # Fail-loud BEFORE any write: the row's metadata is unchanged.
+        stored = mgr.sqlite.get(memory.id)
+        assert stored is not None
+        assert "doc_id" not in stored.metadata
+
+    def test_manager_update_accepts_full_triple_replacement(self, mgr: MemoryManager) -> None:
+        memory = _row(mgr, "update gate probe")
+        triple = build_doc_grouping_metadata("doc-3", 1, ["Run"])
+        updated = mgr.update(memory.id, MemoryUpdate(metadata=dict(triple)))
+        assert updated is not None
+        assert updated.metadata["doc_id"] == "doc-3"
+
+    def test_update_without_metadata_leaves_legacy_rows_alone(self, mgr: MemoryManager) -> None:
+        """Write-side validation only: an update that does not touch
+        metadata never re-validates historical rows (zero migration, no
+        backfill semantics change)."""
+        memory = _row(mgr, "legacy row")
+        updated = mgr.update(memory.id, MemoryUpdate(title="retitled"))
+        assert updated is not None
+        assert updated.title == "retitled"
+
+    def test_rest_create_maps_partial_triple_to_422(self, tmp_path: Path) -> None:
+        """REST /memories parses MemoryCreate — the DTO validator makes a
+        partial triple a 422 (client error), not a 500 or a silent write."""
+        manager = MemoryManager(_settings(tmp_path))
+        manager._embedder = _HashEmbedder()
+        try:
+            api_main._manager = manager
+            test_app = FastAPI(title="s2-test", version="0.1.0", lifespan=lifespan)
+            for route in real_app.routes:
+                test_app.routes.append(route)
+            with TestClient(test_app) as client:
+                body = {
+                    "content": "chunk text",
+                    "tags": ["project:s2-proj", "agent:s2-agent", "mnemos:learning"],
+                    "metadata": {"doc_id": "d"},
+                }
+                resp = client.post("/memories", json=body)
+                assert resp.status_code == 422
+                assert "doc grouping" in resp.text
+        finally:
+            api_main._manager = None
+            manager.close()

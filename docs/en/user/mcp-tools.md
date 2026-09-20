@@ -1390,7 +1390,7 @@ Semantics (ADR-0018, verbatim):
 
 **Lifecycle hooks (ADR-0017 D1 / ADR-0018, mnemos #125 Wave 3)** — the automation integration points, grouped behind `action:enum` (the mnemos #97 grouped-tool pattern). Three actions, one tool:
 
-- **`pre_llm_call`** — assemble the context block to **inject before a model call** (thin wrapper over `mnemos_assemble_context`, delivery pinned to sync). `context_hint` (what the upcoming call is about) is used as the recall query instead of the derived project/file term. The ADR-0018 entry invariant — secret scan, provenance, status gate — runs inside the assemble pipeline; the hook adds nothing to it.
+- **`pre_llm_call`** — assemble the context block to **inject before a model call** (thin wrapper over `mnemos_assemble_context`, delivery pinned to sync). `context_hint` (what the upcoming call is about) is used as the recall query instead of the derived project/file term. `task` (ADR-0027 Phase 0, epic #308) is the harness-passed task identifier — the bare task slug: it narrows recall to entries tagged `task:<slug>` (intersection doctrine — a task condition only narrows, never widens) and composes the per-call assembled tail only; pinned prefixes and the provenance format are untouched. The ADR-0018 entry invariant — secret scan, provenance, status gate — runs inside the assemble pipeline; the hook adds nothing to it.
 - **`on_session_start`** — recall recent checkpoints for session bootstrap (thin wrapper over the recall path; the echoed content is scanned at issuance on this channel, mirroring `mnemos_recall_context`).
 - **`post_tool_call`** — the **autocompression entry point** (ADR-0018): when `auto_compress` resolves true (per-call argument, else the `hooks.auto_compress` config knob, default `false`), the tool output is compressed via CCR and the marker-headed `compressed_text` is returned — the caller **substitutes** it for the raw output in its window. Off by default: the envelope says so and nothing is written.
 
@@ -1406,6 +1406,7 @@ Semantics (ADR-0018, verbatim):
 | `agent` | string | **yes** | — | Caller agent slug (issuer identity). |
 | `context_hint` | string | no | — | `pre_llm_call`: what the upcoming model call is about — the explicit recall query. FTS5 whole-phrase semantics: the hint is matched as ONE quoted phrase (adjacent tokens in order), not a keyword set. |
 | `file` | string | no | — | `pre_llm_call`: optional file path (recall terms + applyTo rule pinning). |
+| `task` | string | no | — | `pre_llm_call` (ADR-0027 Phase 0): optional task scope — the bare task slug (`[a-z0-9_-]{1,64}`, no `task:` prefix). Narrows recall to entries tagged `task:<slug>`; tail-only. |
 | `budget` | integer | no | `2048` | `pre_llm_call`: token budget. |
 | `limit` | integer | no | `5` | `on_session_start`: checkpoint count. |
 | `tool_name` | string | `post_tool_call` | — | The tool that produced the output. |

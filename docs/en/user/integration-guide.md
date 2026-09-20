@@ -319,7 +319,9 @@ Mnemos ships two dedicated surfaces for harness/automation integrations
 - **Lifecycle hooks** — the grouped `mnemos_hooks` MCP tool and the REST
   twin `POST /hooks/{action}` with three actions: `pre_llm_call`
   (assemble the context block to inject before a model call — pass
-  `context_hint` = what the call is about), `on_session_start` (recall
+  `context_hint` = what the call is about, and optionally `task` = the
+  bare task slug to scope the assembly to one task's entries, ADR-0027
+  Phase 0), `on_session_start` (recall
   recent checkpoints), and `post_tool_call` (autocompression: with
   `hooks.auto_compress: true` in the config — or a per-call
   `auto_compress: true` — the tool output is compressed via CCR and the

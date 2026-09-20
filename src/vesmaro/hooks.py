@@ -117,6 +117,7 @@ def pre_llm_call(
     context_hint: str | None = None,
     file: str | None = None,
     budget: int = 2048,
+    task: str | None = None,
     include_awareness: bool = False,
 ) -> dict[str, Any]:
     """Assemble the context block to inject before the model call (sync).
@@ -128,6 +129,12 @@ def pre_llm_call(
     model call is about, so recall finds semantically relevant entries
     instead of deriving a query from the project slug. Delivery is
     pinned to sync (see the module docstring).
+
+    ``task`` (ADR-0027 Phase 0, epic #308) is the harness-passed task
+    identifier — the bare task slug. It narrows recall to rows carrying
+    ``task:<slug>`` (intersection doctrine; tail-only — every pinned
+    prefix and the provenance format are untouched). ``None`` (default)
+    keeps the pre-Phase-0 output byte-identical: no ``task`` key.
 
     The returned ``text`` is the injection suggestion: provenance-
     wrapped, filter-cleaned, secret-scanned, budget-bounded. The
@@ -155,6 +162,7 @@ def pre_llm_call(
         mode="sync",
         agent=agent,
         query=context_hint,
+        task=task,
     )
     result["hook"] = "pre_llm_call"
     result["injection"] = "prepend result['text'] to the model call prompt"
@@ -395,6 +403,7 @@ def dispatch_hook(
     context_hint: str | None = None,
     file: str | None = None,
     budget: int = 2048,
+    task: str | None = None,
     limit: int = SESSION_START_LIMIT,
     tool_name: str | None = None,
     output_text: str | None = None,
@@ -407,6 +416,8 @@ def dispatch_hook(
     Single authority for the action surface shared by the MCP tool and
     the REST route; per-action arguments are validated inside each hook
     (``ValueError`` → MCP ``{"error": …}`` / REST 422 at the callers).
+    ``task`` (ADR-0027 Phase 0) is a ``pre_llm_call``-only argument —
+    irrelevant fields for the requested action are simply ignored.
     """
     if action == "pre_llm_call":
         return pre_llm_call(
@@ -417,6 +428,7 @@ def dispatch_hook(
             context_hint=context_hint,
             file=file,
             budget=budget,
+            task=task,
             include_awareness=include_awareness,
         )
     if action == "on_session_start":

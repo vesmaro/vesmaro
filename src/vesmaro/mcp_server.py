@@ -1169,6 +1169,18 @@ async def _canonical_tools() -> list[Tool]:
                             "terms + applyTo rule pinning)."
                         ),
                     },
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "pre_llm_call only (ADR-0027 Phase 0): optional "
+                            "task scope — the bare task slug "
+                            "([a-z0-9_-]{1,64}, no 'task:' prefix). Narrows "
+                            "recall to rows tagged task:<slug> (intersection "
+                            "doctrine: a task condition only narrows, never "
+                            "widens; tail-only — pinned prefixes and the "
+                            "provenance format are untouched)."
+                        ),
+                    },
                     "budget": {
                         "type": "integer",
                         "default": 2048,
@@ -2307,6 +2319,7 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
         hk_optional_strs = (
             ("context_hint", args.get("context_hint")),
             ("file", args.get("file")),
+            ("task", args.get("task")),
             ("tool_name", args.get("tool_name")),
             ("output_text", args.get("output_text")),
             ("profile", args.get("profile")),
@@ -2336,6 +2349,7 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
                 context_hint=args.get("context_hint"),
                 file=args.get("file"),
                 budget=hk_budget,
+                task=args.get("task"),
                 limit=hk_limit,
                 tool_name=args.get("tool_name"),
                 output_text=args.get("output_text"),

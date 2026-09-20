@@ -54,6 +54,7 @@ from vesmaro.models import (
     MemoryUpdate,
     PipelineState,
     SearchResult,
+    doc_grouping_from_metadata,
     is_context_admissible,
     is_quarantined,
     render_retraction,
@@ -751,6 +752,18 @@ class MemoryManager:
         the row RAW+pending until the refine cycle gates the refined
         projection. An explicit ``status=`` keeps the pre-B2b contract.
         """
+        # ── ADR-0027 Phase 0 (epic #308, slice-1 review item 1): ────────
+        # write-side doc-grouping validation, the AUTHORITATIVE gate.
+        # MemoryCreate already validates at the DTO boundary (REST gets a
+        # 422 there); this second check is the store-boundary defence that
+        # catches every remaining add() caller — a partial
+        # ``{doc_id, chunk_idx, heading_path}`` triple must never persist,
+        # because the Phase-3 docs-as-memory reader groups by ``doc_id``
+        # and a silent split would be untraceable. No convention keys →
+        # no-op (the metadata column stays free-form for everything
+        # else). Raises ValueError (fail-loud, never normalizes).
+        doc_grouping_from_metadata(data.metadata)
+
         # ── mnemos #251 review P1: strip client-forgeable stamps ────────
         if not trusted_checkpoint_stamps:
             forged = sorted(k for k in CHECKPOINT_STAMP_KEYS if k in data.metadata)
@@ -996,6 +1009,14 @@ class MemoryManager:
                 k: previous_metadata[k] for k in INTERNAL_METADATA_KEYS if k in previous_metadata
             }
             memory.metadata = {**memory.metadata, **internal}
+            # ADR-0027 Phase 0 (slice-1 review item 1) — the update twin
+            # of the add() gate: the REPLACEMENT metadata dict must not
+            # persist a partial doc-grouping triple. Validated AFTER the
+            # merge-back so the final row state is what passes (internal
+            # keys never overlap the convention keys — the check is about
+            # the caller's dict, but the row is what would lie to the
+            # Phase-3 reader). Raises ValueError before any write.
+            doc_grouping_from_metadata(memory.metadata)
 
         # ── Layer 1: write-path secrets scanner (update path) ──────────────
         # Re-run the scanner when the update payload includes new content so
@@ -4447,6 +4468,8 @@ class MemoryManager:
         async_handle: str | None = None,
         agent: str | None = None,
         query: str | None = None,
+        task: str | None = None,
+        lens: str | None = None,
     ) -> dict[str, Any]:
         """Assemble the model-facing context block (ADR-0017 D1 contract).
 
@@ -4457,9 +4480,14 @@ class MemoryManager:
         ``agent`` (A2 review F2) pairs with ``session`` as the issuer
         context for the strict-mode CCR expansion gate. ``query`` (W3)
         overrides the derived recall term — the ``pre_llm_call`` hook's
-        ``context_hint``. Raises ``ValueError`` on invalid ``session`` /
-        ``project`` / ``mode`` / ``budget`` / ``query`` or an unknown
-        ``async_handle``.
+        ``context_hint``. ``task`` / ``lens`` (ADR-0027 Phase 0, epic
+        #308) are the multi-context parameters: the bare task slug
+        (intersection-doctrine recall narrowing) and the code-defined
+        lens preset name (query-conditioned, narrowing-only projection)
+        — both optional, both tail-only, both absent from the result
+        dict unless given. Raises ``ValueError`` on invalid ``session`` /
+        ``project`` / ``mode`` / ``budget`` / ``query`` / ``task`` /
+        ``lens`` or an unknown ``async_handle``.
         """
         from vesmaro.assemble import assemble_context as _assemble
 
@@ -4474,6 +4502,8 @@ class MemoryManager:
             async_handle=async_handle,
             agent=agent,
             query=query,
+            task=task,
+            lens=lens,
         )
 
     # ── ADR-0018: on_context_rewrite lifecycle event (#125, Wave 2) ────────
