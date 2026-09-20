@@ -1,0 +1,85 @@
+# v4.3.4-mesh.2 — main @ 3c8f270 (#377 link canonicalization) = origin/main.
+# Hotfix for mesh#44: v4.3.4-mesh.1 shipped STALE python stubs (no
+# ListMemoriesRequest.resume_cursor / ListMemoriesResponse.cursor /
+# PullRequest.cursor) → every cluster pull died server-side with
+# AttributeError in mesh_server.py.
+#
+# PROVENANCE (the #44 fix): the build context is a `git archive 3c8f270`
+# extraction — NOT a source checkout. Gitignored gencode cannot leak in;
+# the stubs below are generated from the .proto AT the build commit.
+# Pre-push gate (run before podman push, fail = abort):
+#   distrobox-host-exec podman run --rm --entrypoint python \
+#     ghcr.io/korrnals/mnemos:v4.3.4-mesh.2 /gate.py
+# checks field presence on the shipped stubs.
+#
+# Build (host-built, GH Actions billing-locked — recipe #354/#374):
+#   distrobox-host-exec podman build -f /tmp/v4342-image/Dockerfile.mesh \
+#     -t ghcr.io/korrnals/mnemos:v4.3.4-mesh.2 /tmp/v4342-image
+
+# ── gencode builder (#354) ────────────────────────────────────────────
+# The gRPC stubs (federation/gen/python/) are gitignored; generate them
+# from the contract .proto so the image builds from a clean tree. The
+# runtime shim src/vesparo/_mesh_gen.py resolves
+# ../../../federation/gen/python relative to site-packages → the stubs
+# must land at /usr/local/lib/python3.12/federation/gen/python/.
+FROM docker.io/library/python:3.12-slim AS gencode
+RUN pip install --no-cache-dir "grpcio-tools>=1.62,<2"
+WORKDIR /proto
+COPY federation/proto/ ./
+RUN mkdir -p /gen && python -m grpc_tools.protoc -I. \
+      --python_out=/gen --pyi_out=/gen --grpc_python_out=/gen \
+      federation.proto mnemos_core_api.proto
+
+# ── base image (identical to repo Dockerfile) ─────────────────────────
+FROM docker.io/library/python:3.12-slim AS base
+
+LABEL maintainer="abyss"
+LABEL description="Mnemos: hybrid long-term memory system for AI agents"
+LABEL org.opencontainers.image.source="https://github.com/vesmaro/vesmaro"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.revision="3c8f270"
+LABEL org.opencontainers.image.version="v4.3.4-mesh.2"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# System deps
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the package (the MCP sdk rides in core since 4.1.0 — ADR-0023;
+# the bundled mnema-embed-v1 model ships inside the wheel, so vector
+# search works offline out of the box with no downloads).
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+# integrations/ and scripts/ are force-included into the wheel via
+# pyproject.toml [tool.hatch.build.targets.wheel.force-include].
+COPY integrations/ ./integrations/
+COPY scripts/ ./scripts/
+COPY NOTICE LICENSE ./
+RUN pip install --no-cache-dir "."
+
+# ── #354: ship the gRPC stubs where _mesh_gen.py expects them ─────────
+COPY --from=gencode /gen/ /usr/local/lib/python3.12/federation/gen/python/
+
+# Entrypoint
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Default directories (/data and /vault are volume mounts at runtime)
+RUN mkdir -p /data /vault
+
+# Container config (0.0.0.0 bind + auth + CORS; TOTP master key via env)
+COPY config.container.yaml /app/config.yaml
+ENV MNEMOS_CONFIG=/app/config.yaml
+
+EXPOSE 8787
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["mnemos", "serve"]
