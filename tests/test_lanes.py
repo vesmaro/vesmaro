@@ -34,6 +34,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests._seeded_ids import seeded_memory_ids
 from vesmaro.assemble import _budget_stage, _Candidate
 from vesmaro.config import Settings
 from vesmaro.lanes import (
@@ -55,7 +56,6 @@ from vesmaro.models import (
     MemoryStatus,
     PipelineState,
 )
-from tests._seeded_ids import seeded_memory_ids
 
 PROJECT = "asm-proj"
 AGENT = "asm-agent"

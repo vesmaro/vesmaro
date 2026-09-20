@@ -106,10 +106,14 @@ def _add(
 
 
 def _rows(mgr: MemoryManager) -> list[sqlite3.Row]:
-    return mgr.sqlite._get_conn().execute(
-        "SELECT event_id, memory_id, kind, project, agent, created_at"
-        " FROM edge_stats ORDER BY created_at, event_id"
-    ).fetchall()
+    return (
+        mgr.sqlite._get_conn()
+        .execute(
+            "SELECT event_id, memory_id, kind, project, agent, created_at"
+            " FROM edge_stats ORDER BY created_at, event_id"
+        )
+        .fetchall()
+    )
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> dict[str, dict[str, object]]:
@@ -121,8 +125,7 @@ def _columns(conn: sqlite3.Connection, table: str) -> dict[str, dict[str, object
 
 def _object_exists(conn: sqlite3.Connection, name: str) -> bool:
     return (
-        conn.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (name,)).fetchone()
-        is not None
+        conn.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (name,)).fetchone() is not None
     )
 
 
@@ -155,15 +158,13 @@ class TestSchema:
         conn = store._get_conn()
         for kind in _EDGE_STATS_KINDS:
             conn.execute(
-                "INSERT INTO edge_stats (event_id, memory_id, kind, created_at)"
-                " VALUES (?,?,?,?)",
+                "INSERT INTO edge_stats (event_id, memory_id, kind, created_at) VALUES (?,?,?,?)",
                 (f"ev-{kind}", "m-x", kind, "2026-09-16T00:00:00+00:00"),
             )
         assert conn.execute("SELECT COUNT(*) FROM edge_stats").fetchone()[0] == 2
         with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
             conn.execute(
-                "INSERT INTO edge_stats (event_id, memory_id, kind, created_at)"
-                " VALUES (?,?,?,?)",
+                "INSERT INTO edge_stats (event_id, memory_id, kind, created_at) VALUES (?,?,?,?)",
                 ("ev-bad", "m-x", "maybe", "2026-09-16T00:00:00+00:00"),
             )
 
@@ -220,15 +221,12 @@ class TestAppendOnly:
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             conn.execute("DELETE FROM edge_stats WHERE event_id = 'e1'")
 
-    def test_memory_deletion_neither_fails_nor_rewrites(
-        self, manager_on: MemoryManager
-    ) -> None:
+    def test_memory_deletion_neither_fails_nor_rewrites(self, manager_on: MemoryManager) -> None:
         """Audit rows outlive their subject: deleting the cited memory
         succeeds and the event row stays (no FK, no cascade)."""
         m = _add(manager_on, "cited once, deleted later")
         assert (
-            manager_on.report_search_feedback([m.id], kind="used", project=PROJECT)["captured"]
-            == 1
+            manager_on.report_search_feedback([m.id], kind="used", project=PROJECT)["captured"] == 1
         )
         manager_on.sqlite.delete(m.id)
         assert len(_rows(manager_on)) == 1
@@ -246,9 +244,11 @@ class TestStoreRecord:
 
     def test_scope_fields_recorded_from_first_event(self, store: SQLiteStore) -> None:
         store.record_edge_stat_event("e1", "m-a", kind="used", project="p1", agent="ag1")
-        row = store._get_conn().execute(
-            "SELECT memory_id, kind, project, agent, created_at FROM edge_stats"
-        ).fetchone()
+        row = (
+            store._get_conn()
+            .execute("SELECT memory_id, kind, project, agent, created_at FROM edge_stats")
+            .fetchone()
+        )
         assert tuple(row) == ("m-a", "used", "p1", "ag1", row["created_at"])
         assert row["created_at"]  # timestamped
 
@@ -370,9 +370,7 @@ class TestCaptureHappyPath:
         )
         assert later["captured"] == 1
 
-    def test_duplicate_ids_within_one_report_are_one_event(
-        self, manager_on: MemoryManager
-    ) -> None:
+    def test_duplicate_ids_within_one_report_are_one_event(self, manager_on: MemoryManager) -> None:
         m = _add(manager_on, "same citation twice in one batch")
         outcome = manager_on.report_search_feedback(
             [m.id, m.id], kind="used", project=PROJECT, event_id="report-1"
@@ -383,15 +381,9 @@ class TestCaptureHappyPath:
 
     def test_counters_reflect_capture(self, manager_on: MemoryManager) -> None:
         m = _add(manager_on, "counted citation")
-        manager_on.report_search_feedback(
-            [m.id], kind="used", project=PROJECT, event_id="r1"
-        )
-        manager_on.report_search_feedback(
-            [m.id], kind="used", project=PROJECT, event_id="r2"
-        )
-        manager_on.report_search_feedback(
-            [m.id], kind="rejected", project=PROJECT, event_id="r3"
-        )
+        manager_on.report_search_feedback([m.id], kind="used", project=PROJECT, event_id="r1")
+        manager_on.report_search_feedback([m.id], kind="used", project=PROJECT, event_id="r2")
+        manager_on.report_search_feedback([m.id], kind="rejected", project=PROJECT, event_id="r3")
         assert manager_on.sqlite.get_edge_stats_counters(m.id) == {"used": 2, "rejected": 1}
 
 
@@ -446,9 +438,7 @@ class TestScopingAndUniform404:
 
         outcomes = [
             manager_on.report_search_feedback([mid], kind="used", project=PROJECT, event_id=f"r{i}")
-            for i, mid in enumerate(
-                ["no-such-id", foreign.id, raw.id, q.id], start=1
-            )
+            for i, mid in enumerate(["no-such-id", foreign.id, raw.id, q.id], start=1)
         ]
         assert len(outcomes) == 4
         first = outcomes[0]
@@ -546,9 +536,7 @@ class TestTelemetry:
 
 
 class TestSearchIntegration:
-    def test_search_citations_report_used_lands_with_scope(
-        self, manager_on: MemoryManager
-    ) -> None:
+    def test_search_citations_report_used_lands_with_scope(self, manager_on: MemoryManager) -> None:
         """The canonical flow: search → citation ids ride the response →
         the harness reports the consumed subset with a retry-stable
         event id → one row per citation, scoped, and the duplicate
@@ -578,9 +566,7 @@ class TestSearchIntegration:
             assert (row["kind"], row["project"], row["agent"]) == ("used", PROJECT, AGENT)
             assert row["memory_id"] in used_ids
 
-    def test_zero_behavior_change_flag_off(
-        self, manager: MemoryManager
-    ) -> None:
+    def test_zero_behavior_change_flag_off(self, manager: MemoryManager) -> None:
         """Flag off: search + a stray report change nothing — zero rows,
         zero ranking influence (this slice has none by construction),
         search results identical to a manager that never heard of

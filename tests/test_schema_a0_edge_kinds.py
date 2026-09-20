@@ -221,9 +221,7 @@ class TestFreshInstallSchema:
 
     # ── weight validation (#324 scope-addition from the #336 review) ──────
 
-    def test_weight_validation_rejects_nonfinite_and_nonpositive(
-        self, store: SQLiteStore
-    ) -> None:
+    def test_weight_validation_rejects_nonfinite_and_nonpositive(self, store: SQLiteStore) -> None:
         """Negative / 0 / +inf / NaN weights are rejected at the write
         boundary with a caller-actionable ValueError. The NaN case is the
         motivating one: sqlite3 binds float('nan') to SQL NULL, so without
@@ -238,9 +236,7 @@ class TestFreshInstallSchema:
                 store.add_memory_edge("m-a", "m-b", weight=bad)
         assert store._get_conn().execute("SELECT COUNT(*) FROM memory_edges").fetchone()[0] == 0
 
-    def test_weight_validation_subthreshold_positive_accepted(
-        self, store: SQLiteStore
-    ) -> None:
+    def test_weight_validation_subthreshold_positive_accepted(self, store: SQLiteStore) -> None:
         """I3 companion: a positive weight below 1.0 is a VALID edge — the
         validation must not become an eligibility pre-filter (weights never
         remove eligibility, only scale ranking post-gate in A1)."""

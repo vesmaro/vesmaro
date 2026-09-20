@@ -78,12 +78,11 @@ import time
 from typing import Any
 
 from agent.memory_provider import MemoryProvider
-from tools.registry import tool_error
-
 from mnemos.adapters.hermes import HermesMemoryAdapter
 from mnemos.config import Settings
 from mnemos.models import MemoryType
 from mnemos.sdk import MnemosSDK
+from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +95,7 @@ _REMIND_SECS = 480
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
+
 
 def _load_config() -> dict:
     """Load config from env vars, with config.yaml ``memory.mnemos`` overrides.
@@ -186,8 +186,7 @@ MNEMOS_ADD_SCHEMA: dict[str, Any] = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    'Required: ["project:<slug>", "agent:<slug>", '
-                    '"mnemos:<subtype>"].'
+                    'Required: ["project:<slug>", "agent:<slug>", "mnemos:<subtype>"].'
                 ),
             },
             "title": {"type": "string", "description": "Short title (optional)."},
@@ -386,6 +385,7 @@ MNEMOS_WATCH_STATUS_SCHEMA: dict[str, Any] = {
 
 # ── Provider ──────────────────────────────────────────────────────────────────
 
+
 class MnemosMemoryProvider(MemoryProvider):
     """Hermes MemoryProvider shim over the Mnemos contract adapter.
 
@@ -537,9 +537,7 @@ class MnemosMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("Mnemos prefetch failed: %s", e)
 
-        self._prefetch_thread = threading.Thread(
-            target=_run, daemon=True, name="mnemos-prefetch"
-        )
+        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="mnemos-prefetch")
         self._prefetch_thread.start()
 
     # -- Lifecycle (all on the contract adapter; never block the harness) --
@@ -666,13 +664,15 @@ class MnemosMemoryProvider(MemoryProvider):
                 title=args.get("title"),
                 memory_type=MemoryType(args.get("memory_type", "note")),
             )
-            return json.dumps({
-                "result": "Memory stored.",
-                "id": memory.id,
-                "title": memory.title or memory.auto_title(),
-                "tags": memory.tags,
-                "status": memory.status,
-            })
+            return json.dumps(
+                {
+                    "result": "Memory stored.",
+                    "id": memory.id,
+                    "title": memory.title or memory.auto_title(),
+                    "tags": memory.tags,
+                    "status": memory.status,
+                }
+            )
 
         if tool_name == "mnemos_recall_context":
             checkpoints = adapter.recall_checkpoints(
@@ -693,11 +693,13 @@ class MnemosMemoryProvider(MemoryProvider):
             )
             self._tool_call_counter = 0
             self._last_checkpoint_time = time.time()
-            return json.dumps({
-                "result": "Checkpoint saved.",
-                "id": memory.id,
-                "title": memory.title or memory.auto_title(),
-            })
+            return json.dumps(
+                {
+                    "result": "Checkpoint saved.",
+                    "id": memory.id,
+                    "title": memory.title or memory.auto_title(),
+                }
+            )
 
         if tool_name == "mnemos_agent_recall":
             items = adapter.agent_recall(
@@ -717,13 +719,15 @@ class MnemosMemoryProvider(MemoryProvider):
                 scan = mgr.scan_issuance_item(None, title=m.auto_title(), context=f"hermes:{m.id}")
                 if scan.refused:
                     continue
-                items.append({
-                    "id": m.id,
-                    "title": scan.title,
-                    "tags": m.tags,
-                    "status": m.status,
-                    "created_at": m.created_at.isoformat(),
-                })
+                items.append(
+                    {
+                        "id": m.id,
+                        "title": scan.title,
+                        "tags": m.tags,
+                        "status": m.status,
+                        "created_at": m.created_at.isoformat(),
+                    }
+                )
             return json.dumps({"results": items, "count": len(items)})
 
         if tool_name == "mnemos_list_tags":
@@ -739,14 +743,16 @@ class MnemosMemoryProvider(MemoryProvider):
                 if self._tool_call_counter >= _REMIND_CALLS or elapsed >= _REMIND_SECS
                 else "ok"
             )
-            return json.dumps({
-                "auto_collect_enabled": True,
-                "signals": {
-                    "call_counter": {"calls_since_save": self._tool_call_counter},
-                    "elapsed_secs": {"since_last_save": round(elapsed, 1)},
-                },
-                "recommendation": recommendation,
-            })
+            return json.dumps(
+                {
+                    "auto_collect_enabled": True,
+                    "signals": {
+                        "call_counter": {"calls_since_save": self._tool_call_counter},
+                        "elapsed_secs": {"since_last_save": round(elapsed, 1)},
+                    },
+                    "recommendation": recommendation,
+                }
+            )
 
         if tool_name == "mnemos_compress":
             # N2 identity mandate: agent+session threaded onto the cache
@@ -785,9 +791,7 @@ class MnemosMemoryProvider(MemoryProvider):
             )
             if title_scan.refused:
                 return json.dumps({"error": f"issuance refused: {title_scan.reason}"})
-            return json.dumps(
-                {"id": memory.id, "title": title_scan.title, "url": args["url"]}
-            )
+            return json.dumps({"id": memory.id, "title": title_scan.title, "url": args["url"]})
 
         if tool_name == "mnemos_watch_start":
             paths = args.get("paths") or []
@@ -900,6 +904,7 @@ class MnemosMemoryProvider(MemoryProvider):
 
 
 # ── Registration ──────────────────────────────────────────────────────────────
+
 
 def register(ctx) -> None:
     """Register Mnemos as a Hermes memory provider plugin."""

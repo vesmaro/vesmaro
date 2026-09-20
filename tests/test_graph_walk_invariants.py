@@ -183,9 +183,7 @@ class TestWalkFlagContract:
         assert sibling.id not in ids, "relates_to walked with the flag OFF"
         assert all(not r.via_graph for r in results)
 
-    def test_relates_to_walked_when_flag_on_outgoing(
-        self, walk_manager: MemoryManager
-    ) -> None:
+    def test_relates_to_walked_when_flag_on_outgoing(self, walk_manager: MemoryManager) -> None:
         """Flag ON: the anchor surfaces its outgoing relates_to neighbour
         with via_graph provenance and the decayed slot (the leg extends
         to the second kind; supersedes behaviour is unchanged from #315).
@@ -204,9 +202,7 @@ class TestWalkFlagContract:
         # The decay rule binds the second kind identically: below its anchor.
         assert by_id[sibling.id].score < by_id[anchor.id].score
 
-    def test_relates_to_walked_when_flag_on_incoming(
-        self, walk_manager: MemoryManager
-    ) -> None:
+    def test_relates_to_walked_when_flag_on_incoming(self, walk_manager: MemoryManager) -> None:
         """Flag ON, reverse direction: an incoming relates_to edge (the
         neighbour declared the edge TO the anchor) surfaces the neighbour
         too — the walk is direction-agnostic, like the supersedes leg."""
@@ -233,18 +229,20 @@ class TestWalkFlagContract:
         assert sibling.id in by_id
         assert by_id[sibling.id].via_graph is True
 
-    def test_minted_edge_reaches_search_end_to_end(
-        self, fuel_manager: MemoryManager
-    ) -> None:
+    def test_minted_edge_reaches_search_end_to_end(self, fuel_manager: MemoryManager) -> None:
         """The Product condition: fuel that never reaches search is a
         second dormant leg. With mint + walk ON, the edge the auto-dedupe
         rule minted on write is traversed by the next search — the full
         A0-1 loop (write mints → search walks)."""
         base = _add(fuel_manager, "conveyor belt alignment procedure station seven")
         revision = _add(fuel_manager, "conveyor belt alignment procedure station seven revision")
-        rows = fuel_manager.sqlite._get_conn().execute(
-            "SELECT from_memory_id, to_memory_id FROM memory_edges WHERE kind='relates_to'"
-        ).fetchall()
+        rows = (
+            fuel_manager.sqlite._get_conn()
+            .execute(
+                "SELECT from_memory_id, to_memory_id FROM memory_edges WHERE kind='relates_to'"
+            )
+            .fetchall()
+        )
         assert rows, "fixture: minting produced the edge"
         _fts_only(fuel_manager)
 
@@ -261,9 +259,7 @@ class TestWalkFlagContract:
 
 
 class TestI1WorstLink:
-    def test_i1_strictest_status_governs_not_the_anchor(
-        self, walk_manager: MemoryManager
-    ) -> None:
+    def test_i1_strictest_status_governs_not_the_anchor(self, walk_manager: MemoryManager) -> None:
         """I1 core: the neighbour inherits the STRICTEST status on the
         anchor→neighbour path — its OWN. The anchor is published and
         fused, but a RAW neighbour does not ride that admissibility.
@@ -275,9 +271,7 @@ class TestI1WorstLink:
         """
         anchor = _add(walk_manager, "published anchor about harbour cranes")
         raw_sibling = _add(walk_manager, "raw dormant ledger sibling note", status=MemoryStatus.RAW)
-        walk_manager.add_memory_edge(
-            anchor.id, raw_sibling.id, kind="relates_to", weight=2.0
-        )
+        walk_manager.add_memory_edge(anchor.id, raw_sibling.id, kind="relates_to", weight=2.0)
         control = _add(walk_manager, "published dormant ledger control sibling")
         walk_manager.add_memory_edge(anchor.id, control.id, kind="relates_to")
         _fts_only(walk_manager)
@@ -324,9 +318,7 @@ class TestI1WorstLink:
             "I1/M1a violated: the RAW neighbour leaked into a PUBLISHED drill-down via relates_to"
         )
 
-    def test_i1_gates_bind_to_query_scope_project(
-        self, walk_manager: MemoryManager
-    ) -> None:
+    def test_i1_gates_bind_to_query_scope_project(self, walk_manager: MemoryManager) -> None:
         """I1 scope binding (review F2 extended to the second kind): a
         scoped search never leaks a cross-project relates_to neighbour —
         the edge stores ids only, so the gate must consult the query's
@@ -361,9 +353,7 @@ class TestI1WorstLink:
 
 
 class TestI2AbsorbingQuarantine:
-    def test_i2_quarantined_neighbour_absorbs_every_path(
-        self, walk_manager: MemoryManager
-    ) -> None:
+    def test_i2_quarantined_neighbour_absorbs_every_path(self, walk_manager: MemoryManager) -> None:
         """I2 core: a §5-quarantined relates_to neighbour never surfaces —
         no path, no framing. Three framings, each sufficient on its own:
         (a) the default gate, (b) an explicit ``status=PUBLISHED``
@@ -408,16 +398,14 @@ class TestI2AbsorbingQuarantine:
     def test_i2_absorption_survives_maximal_path_pressure(
         self, walk_manager: MemoryManager
     ) -> None:
-        """"No path of ANY length" at the 1-hop surface: even when the
+        """ "No path of ANY length" at the 1-hop surface: even when the
         quarantined row is the ONLY remaining headroom filler (the fused
         page is one row short and the edge is the only candidate), the
         page ships short rather than absorbing quarantine. Heavy weight
         and both directions pinned — absorption is unconditional."""
         anchor = _add(walk_manager, "lonely anchor about mist valleys")
         quarantined = _add(walk_manager, "quarantined mist valleys sibling")
-        walk_manager.add_memory_edge(
-            quarantined.id, anchor.id, kind="relates_to", weight=1000.0
-        )
+        walk_manager.add_memory_edge(quarantined.id, anchor.id, kind="relates_to", weight=1000.0)
         walk_manager.sqlite.update_fields(
             quarantined.id,
             pipeline_state=PipelineState.QUARANTINED.value,
@@ -436,9 +424,7 @@ class TestI2AbsorbingQuarantine:
 
 
 class TestI3PostGateWeights:
-    def test_i3_weight_never_restores_eligibility(
-        self, walk_manager: MemoryManager
-    ) -> None:
+    def test_i3_weight_never_restores_eligibility(self, walk_manager: MemoryManager) -> None:
         """I3 clause 1: weights enter ranking only AFTER gate filtering —
         a heavy edge (1000.0, the extreme the validation still accepts)
         buys a gated row NOTHING. The RAW sibling is dropped by the
@@ -450,9 +436,7 @@ class TestI3PostGateWeights:
         when the walked edge is heavy.
         """
         anchor = _add(walk_manager, "published anchor about windmills")
-        raw_heavy = _add(
-            walk_manager, "raw dormant ledger sibling heavy", status=MemoryStatus.RAW
-        )
+        raw_heavy = _add(walk_manager, "raw dormant ledger sibling heavy", status=MemoryStatus.RAW)
         walk_manager.add_memory_edge(anchor.id, raw_heavy.id, kind="relates_to", weight=1000.0)
         quarantined_heavy = _add(walk_manager, "quarantined dormant ledger sibling heavy")
         walk_manager.add_memory_edge(
@@ -484,9 +468,7 @@ class TestI3PostGateWeights:
             "I3 violated: a 1000-weight edge walked a quarantined row into a drill-down"
         )
 
-    def test_i3_weight_never_removes_eligibility(
-        self, walk_manager: MemoryManager
-    ) -> None:
+    def test_i3_weight_never_removes_eligibility(self, walk_manager: MemoryManager) -> None:
         """I3 clause 2: eligibility cuts the OTHER way too — a LIGHT edge
         (0.25, valid per the write validation) must not pre-filter an
         eligible neighbour out of the walk. Weights scale ranking (A1),
@@ -507,9 +489,7 @@ class TestI3PostGateWeights:
         )
         assert by_id[light_sibling.id].via_graph is True
 
-    def test_i3_ranking_deterministic_id_tiebreak(
-        self, walk_manager: MemoryManager
-    ) -> None:
+    def test_i3_ranking_deterministic_id_tiebreak(self, walk_manager: MemoryManager) -> None:
         """I3 clause 3: the ADR-0028 determinism line — the appended
         block is a pure function of the fused ranking + the edge table.
         Two eligible neighbours of the SAME anchor (equal decay: same
@@ -561,9 +541,7 @@ class TestWalkAcceptanceTelemetry:
         measures default semantics); live-flag measurement belongs to
         the A0-review, not the stand."""
         base = _add(fuel_manager, "conveyor belt alignment procedure station seven")
-        revision = _add(
-            fuel_manager, "conveyor belt alignment procedure station seven revision"
-        )
+        revision = _add(fuel_manager, "conveyor belt alignment procedure station seven revision")
         dormant = _add(fuel_manager, "quarterly reconciliation figures dormant ledger")
         fuel_manager.add_memory_edge(base.id, dormant.id, kind="relates_to")
         _fts_only(fuel_manager)
@@ -599,9 +577,7 @@ class TestWalkAcceptanceTelemetry:
         assert dashboard["search"]["graph_walk_enriched_requests_total"] >= 1
         assert dashboard["search"]["graph_supersedes_enriched_requests_total"] == 0
 
-    def test_walk_share_zero_flag_off_supersedes_moves(
-        self, plain_manager: MemoryManager
-    ) -> None:
+    def test_walk_share_zero_flag_off_supersedes_moves(self, plain_manager: MemoryManager) -> None:
         """#324 review fix regression — the SEPARATION proof on a default
         deployment: the fixture carries BOTH a supersedes edge (which
         enriches the page unconditionally, flag off — the v1 leg) and a
@@ -613,9 +589,7 @@ class TestWalkAcceptanceTelemetry:
         A0-review's acceptance share reads an honest 0 until the flag
         is on. (The pre-fix conflated counter would have read 1 here.)"""
         anchor = _add(plain_manager, "anchor note about tide schedules")
-        supersedes_sibling = _add(
-            plain_manager, "superseded dormant ledger reconciliation note"
-        )
+        supersedes_sibling = _add(plain_manager, "superseded dormant ledger reconciliation note")
         relates_sibling = _add(plain_manager, "quarterly figures dormant ledger sibling")
         plain_manager.add_memory_edge(anchor.id, supersedes_sibling.id, kind="supersedes")
         plain_manager.add_memory_edge(anchor.id, relates_sibling.id, kind="relates_to")

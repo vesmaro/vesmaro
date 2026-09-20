@@ -4531,6 +4531,11 @@ training = [
     { name = "transformers" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "vesmaro", extra = ["dev"] },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.3,<4.0" },
@@ -4590,6 +4595,9 @@ requires-dist = [
     { name = "watchdog", specifier = ">=4.0" },
 ]
 provides-extras = ["anthropic", "openai", "gemini", "azure", "ollama", "sentence-transformers", "training", "openvino", "mcp", "pdf", "docx", "dev", "all"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "vesmaro", extras = ["dev"] }]
 
 [[package]]
 name = "watchdog"

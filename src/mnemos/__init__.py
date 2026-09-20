@@ -17,7 +17,9 @@ import importlib
 import importlib.abc
 import importlib.machinery
 import sys
+import types
 import warnings
+from typing import Any
 
 __all__: list[str] = []
 
@@ -39,7 +41,7 @@ def _warn_once() -> None:
 _warn_once()
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     """Proxy unknown attributes (e.g. ``__version__``) to ``vesmaro``."""
     return getattr(importlib.import_module("vesmaro"), name)
 
@@ -59,7 +61,9 @@ class _VesmaroAliasFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     def __init__(self) -> None:
         self._pending: dict[str, str] = {}
 
-    def find_spec(self, fullname: str, path: object = None, target: object = None):
+    def find_spec(
+        self, fullname: str, path: object = None, target: object = None
+    ) -> importlib.machinery.ModuleSpec | None:
         if not fullname.startswith("mnemos."):
             return None
         if fullname == "mnemos":
@@ -72,11 +76,12 @@ class _VesmaroAliasFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                 f"mnemos shim: cannot resolve {fullname!r} "
                 f"(vesmaro module {vesmaro_name!r} failed: {exc})"
             ) from exc
-        vesmaro_mod = sys.modules[vesmaro_name]
+        # import_module() succeeded → sys.modules[vesmaro_name] exists;
+        # create_module() re-fetches it from sys.modules (no local var needed).
         self._pending[fullname] = vesmaro_name
         return importlib.machinery.ModuleSpec(fullname, self)
 
-    def create_module(self, spec):
+    def create_module(self, spec: importlib.machinery.ModuleSpec) -> types.ModuleType | None:
         # Return the ORIGINAL vesmaro module object — import machinery will
         # register it under the mnemos name (true alias, same object).
         vesmaro_name = self._pending.pop(spec.name, None)
@@ -84,7 +89,7 @@ class _VesmaroAliasFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             raise ImportError(f"mnemos shim: unexpected spec {spec.name!r}")
         return sys.modules[vesmaro_name]
 
-    def exec_module(self, module) -> None:
+    def exec_module(self, module: types.ModuleType) -> None:
         return None  # already fully executed as vesmaro
 
 

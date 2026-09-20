@@ -143,7 +143,9 @@ from benchmarks.strata.e2_d.scenarios import (  # noqa: E402
     StaleClaim,
 )
 from benchmarks.strata.e2_d.stale_claims import STALE_CLAIMS  # noqa: E402
-from vesmaro import __version__ as mnemos_version  # noqa: F401 — variable name kept for the dual-period  # noqa: E402
+
+# `mnemos_version` spelling kept for manifest compatibility (recorded verbatim in run manifests).
+from vesmaro import __version__ as mnemos_version  # noqa: E402
 from vesmaro import awareness as awareness_mod  # noqa: E402
 from vesmaro.awareness import DELTA_MAX_WINDOW_SEC, PRESENCE_WINDOW_SEC  # noqa: E402
 from vesmaro.config import Settings  # noqa: E402

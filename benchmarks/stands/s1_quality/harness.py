@@ -440,8 +440,9 @@ def measure_rewrite(mgr: MemoryManager) -> RewriteMetrics:
     every follow-up runs through the real ``retrieve_content`` channel
     (snippet mode for detail needs, full mode for whole needs).
     """
-    from benchmarks.corpus.corpus import PLANTED_SECRETS as SECRETS
     from mnemos.context_rewrite import context_rewrite
+
+    from benchmarks.corpus.corpus import PLANTED_SECRETS as SECRETS
 
     metrics = RewriteMetrics()
     hash_by_slug: dict[str, str] = {}

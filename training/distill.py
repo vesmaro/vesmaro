@@ -160,11 +160,7 @@ def detect_teacher_pooling(model: Any, model_id: str) -> str:
     cfg = getattr(model, "config", None)
     model_type = str(getattr(cfg, "model_type", "") or "")
     archs = [str(a) for a in (getattr(cfg, "architectures", None) or [])]
-    if (
-        model_type == "qwen3"
-        or "Qwen3ForCausalLM" in archs
-        or "Qwen3-Embedding" in model_id
-    ):
+    if model_type == "qwen3" or "Qwen3ForCausalLM" in archs or "Qwen3-Embedding" in model_id:
         return "last_token"
     return "mean"
 
@@ -283,8 +279,7 @@ def mrl_kd_loss(
         total = sum(weights)
         weights = [w / total for w in weights]
     per_dim = [
-        kd_cosine_loss(student_emb[..., :d], teacher_emb[..., :d], temperature)
-        for d in dims
+        kd_cosine_loss(student_emb[..., :d], teacher_emb[..., :d], temperature) for d in dims
     ]
     return aggregate_mrl_losses(per_dim, weights)
 
@@ -419,7 +414,10 @@ def evaluate_cosine(
         enc_s = {k: v.to(device) for k, v in enc_s.items()}
         teacher_texts = [format_teacher_input(t, teacher_template) for t in chunk]
         enc_t = tokenizer_t(
-            teacher_texts, padding=True, truncation=True, max_length=max_length,
+            teacher_texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
             return_tensors="pt",
         )
         enc_t = {k: v.to(device) for k, v in enc_t.items()}
@@ -449,8 +447,7 @@ def evaluate_cosine(
     }
     if len(per_dim_sims) > 1:
         stats["by_dim"] = {
-            str(d): float(np.asarray(v, dtype=np.float64).mean())
-            for d, v in per_dim_sims.items()
+            str(d): float(np.asarray(v, dtype=np.float64).mean()) for d, v in per_dim_sims.items()
         }
     return stats
 
@@ -659,9 +656,7 @@ def main(argv: list[str] | None = None) -> int:
             # Teacher leg: corpus texts take the teacher's QUERY side
             # (instruct template) and the teacher's native pooling.
             teacher_texts = [format_teacher_input(t, args.teacher_instruct_template) for t in chunk]
-            ht, mask_t = encode_batch(
-                teacher, tokenizer_t, teacher_texts, device, args.max_length
-            )
+            ht, mask_t = encode_batch(teacher, tokenizer_t, teacher_texts, device, args.max_length)
             with torch.no_grad():
                 teacher_pooled = pool_teacher(ht, mask_t, teacher_pool)
                 # KD target: the teacher vector in the student's embed
@@ -712,9 +707,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         by_dim = eval_stats.get("by_dim")
         dim_note = (
-            " " + " ".join(f"dim{d}={v:.4f}" for d, v in sorted(by_dim.items()))
-            if by_dim
-            else ""
+            " " + " ".join(f"dim{d}={v:.4f}" for d, v in sorted(by_dim.items())) if by_dim else ""
         )
         with metrics_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, sort_keys=True) + "\n")

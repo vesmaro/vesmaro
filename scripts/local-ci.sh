@@ -202,19 +202,19 @@ echo ""
 # the script to exit non-zero (via the summary's `failed` counter).
 
 set +e
-run_step 1 $TOTAL_STEPS "Lint (ruff check)" ruff check src/ tests/
+run_step 1 $TOTAL_STEPS "Lint (ruff check)" ruff check .
 step_rc=$?
 set -e
 if [[ $step_rc -ne 0 ]]; then print_summary_and_exit; fi
 
 set +e
-run_step 2 $TOTAL_STEPS "Format check (ruff format --check)" ruff format --check src/ tests/
+run_step 2 $TOTAL_STEPS "Format check (ruff format --check)" ruff format --check .
 step_rc=$?
 set -e
 if [[ $step_rc -ne 0 ]]; then print_summary_and_exit; fi
 
 set +e
-run_step 3 $TOTAL_STEPS "Type check (mypy --strict)" mypy --strict src/mnemos/
+run_step 3 $TOTAL_STEPS "Type check (mypy --strict)" mypy --strict src/vesmaro/ src/mnemos/
 step_rc=$?
 set -e
 if [[ $step_rc -ne 0 ]]; then print_summary_and_exit; fi
@@ -275,7 +275,7 @@ set -e
 if [[ $step_rc -ne 0 ]]; then print_summary_and_exit; fi
 
 set +e
-run_step 7 $TOTAL_STEPS "Coverage gate (≥80%)" pytest --cov=src/mnemos --cov-fail-under=80 --cov-report=term-missing --cov-report=xml tests/ -q
+run_step 7 $TOTAL_STEPS "Coverage gate (≥80%)" pytest --cov=src/vesmaro --cov-fail-under=80 --cov-report=term-missing --cov-report=xml tests/ -q
 step_rc=$?
 set -e
 if [[ $step_rc -ne 0 ]]; then print_summary_and_exit; fi

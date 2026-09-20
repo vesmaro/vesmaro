@@ -340,7 +340,8 @@ class TestCompletionCommand:
         rc = fake_home / ".bashrc"
         rc.write_text(
             "# Added by `mnemos completion` (bash)\n"
-            "#[ -f ~/.mnemos/completion/vesmaro.bash ] && source ~/.mnemos/completion/vesmaro.bash\n",
+            "#[ -f ~/.mnemos/completion/vesmaro.bash ] "
+            "&& source ~/.mnemos/completion/vesmaro.bash\n",
             encoding="utf-8",
         )
         assert not _is_installed("bash", rc)
@@ -356,7 +357,8 @@ class TestCompletionCommand:
         monkeypatch.setenv("HOME", str(fake_home))
         rc = fake_home / ".bashrc"
         rc.write_text(
-            "[ -f ~/.mnemos/completion/vesmaro.bash ] && source ~/.mnemos/completion/vesmaro.bash\n",
+            "[ -f ~/.mnemos/completion/vesmaro.bash ] "
+            "&& source ~/.mnemos/completion/vesmaro.bash\n",
             encoding="utf-8",
         )
         assert _is_installed("bash", rc)
