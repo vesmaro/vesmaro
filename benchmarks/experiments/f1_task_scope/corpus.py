@@ -38,8 +38,15 @@ the generator is the declarer, never an outcome consumer):
   through a plain project-scoped assembly, the honest cross-task
   world); 6 prose + 6 code records per half x 2 phrasings; exactly
   3 X-gold pairs per task (the G3b session shape, §2.6b).
-* L-neg n = 24: cross-class prose-gold queries carrying the lens.py
-  false-activation trap family — generator-asserted NON-activating.
+* L-neg n = 24: cross-class prose-gold queries, MIXED composition (the
+  G4b falsifiability repair): 16 trap-family queries (code-like tokens
+  in prose shapes the CODE lens must reject — generator-asserted
+  NON-activating, the registered must-not-activate majority) + 8
+  mixed-phrasing queries (4 pairs x 2 phrasings: prose-framed questions
+  carrying genuinely code-shaped call tokens such as ``retry(backoff=5)``
+  — generator-asserted ACTIVATING; the gold stays a task-less prose
+  row, so the active lens's code-only narrowing can drop it: the G4b
+  corridor measures instead of being structurally unfalsifiable).
 
 Replacement pool (§3.4): +25% surplus gold-capable records per stratum
 (3 per task T-side, 3 X-shared, 3 L-neg; the foreign half draws its
@@ -63,20 +70,24 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from vesmaro.filter.pipeline import detect_profile
+from vesmaro.lanes import GOVERNANCE_TAGS
 from vesmaro.lens import Lens, lens_active
 from vesmaro.models import DOC_GROUPING_METADATA_FIELDS, build_doc_grouping_metadata
 
 #: Corpus generator version — bump on ANY shape-semantics change (the
 #: fingerprint changes with the module bytes; this string names the
-#: generation protocol inside the fingerprint).
-GENERATOR_VERSION = "f1-mixed-1"
+#: generation protocol inside the fingerprint). f1-mixed-2: the G4b
+#: falsifiability repair — the L-neg stratum re-cut to the mixed
+#: composition (8 activating + 16 trap queries; §8 entry 13).
+GENERATOR_VERSION = "f1-mixed-2"
 
 #: The committed seed (§4.2: "single corpus build, committed with its
 #: generator, seed, TASK_DISPLAY map, and per-segment counts").
 SEED = 20260920
 
 #: Stratum identity stamped into the manifest and ledger.
-STRATUM_VERSION = "f1-mixed-1"
+STRATUM_VERSION = "f1-mixed-2"
 
 #: The single agent of the corpus (single-agent premise, §2.9).
 AGENT = "atlas"
@@ -173,6 +184,11 @@ class GoldQuery:
     gold_slug: str
     axis: str  # prose | code | doc
     surplus: bool = False  # replacement-pool pair, not analyzed by default
+    #: L-neg mixed-phrasing birth property (the G4b falsifiability
+    #: repair): True on the activating prose-gold queries whose code-
+    #: shaped call token makes the CODE lens narrow — the corridor's
+    #: falsifiable arm. Unused on every other stratum.
+    mixed: bool = False
 
 
 # ── vocabulary pools (all committed content; the rng only picks) ──────────────
@@ -449,83 +465,108 @@ _SHARED_QUALS: tuple[str, ...] = (
     "reviewed at the monthly ops sync",
 )
 
-#: L-neg gold pairs: (gold slug suffix, record topic, phrasing ph, phrasing pr).
-#: Both phrasings carry the lens.py-documented FALSE-ACTIVATION trap
-#: family — code-like tokens in prose shapes the CODE lens must reject.
-_L_NEG_PAIRS: tuple[tuple[str, str, str, str], ...] = (
+#: L-neg gold pairs: (gold slug suffix, record topic, phrasing ph,
+#: phrasing pr, mixed). Trap pairs (mixed=False) carry the
+#: lens.py-documented FALSE-ACTIVATION trap family — code-like tokens in
+#: prose shapes the CODE lens must reject. Mixed pairs (mixed=True, the
+#: G4b falsifiability repair §8/13) are prose-framed questions whose
+#: phrasings carry a genuinely code-shaped call token — under the
+#: current ``_QUERY_CODE_SIGNALS`` they ACTIVATE the lens, while the
+#: gold stays a task-less prose row the active lens's code-only
+#: narrowing can drop: the corridor measures. Spread across both
+#: projects (pairs 0/2 ask from project A, 4/6 from project B).
+_L_NEG_PAIRS: tuple[tuple[str, str, str, str, bool], ...] = (
     (
-        "csv-import-rosters",
-        "CSV data import rosters",
-        "how do we import the CSV data for the weekly rosters?",
-        "the CSV data import rosters — what cadence did the notes record?",
+        "retry-backoff-note",
+        "retry(backoff=5) handoff script",
+        "what did we decide about the retry(backoff=5) call from the handoff thread?",
+        "the retry(backoff=5) mention in the notes — which schedule was recorded?",
+        True,
     ),
     (
         "class-attendance",
         "class attendance tracking sheet",
         "the notes said class attendance was low — what did we record about tracking?",
         "where do the class attendance tracking notes live and what do they conclude?",
+        False,
     ),
     (
-        "onboarding-steps",
-        "step-by-step onboarding walkthrough",
-        "what does the step-by-step onboarding walkthrough cover (and/or alternatives)?",
-        "the onboarding walkthrough is step-by-step — what did the review note say?",
+        "refresh-grace-note",
+        "refresh_token(grace=72) proposal",
+        "how did the refresh_token(grace=72) proposal land in the notes?",
+        "the notes on refresh_token(grace=72) — what window was recorded?",
+        True,
     ),
     (
         "missing-pages",
         "404 pages cleanup list",
         "which 404 pages landed on the cleanup list this quarter?",
         "the cleanup list of 404 pages — who owns the sweep according to the notes?",
+        False,
     ),
     (
-        "billing-clause",
-        "and/or billing clause clarification",
-        "what did the clarification say about the and/or billing clause?",
-        "the billing clause uses and/or — what reading did the notes settle on?",
+        "index-page-note",
+        "index_page(doc.url) question",
+        "what did the notes record on the index_page(doc.url) question?",
+        "the index_page(doc.url) thread from the review — what was the outcome?",
+        True,
     ),
     (
         "server-config",
         "server's config meeting notes",
         "what did the meeting notes say about the server's config refresh?",
         "the server's config notes — which refresh window was recorded?",
+        False,
     ),
     (
-        "slow-runs",
-        "50% of runs latency note",
-        "the latency note covered 50% of runs — what was the recorded threshold?",
-        "what did the notes record for slow runs (50% of runs above which mark)?",
+        "autoscale-pool-note",
+        "autoscale(pool, warm) idea",
+        "what did we conclude about autoscale(pool, warm) in the capacity notes?",
+        "the autoscale(pool, warm) idea — what did the notes settle on?",
+        True,
     ),
     (
         "empty-group",
         "empty group parsing note",
         "why is an empty group rejected in the parsing note?",
         "the parsing note about an empty group — what was the conclusion?",
+        False,
     ),
     (
         "retry-explainer",
         "retry loop explainer with backoff",
         "the retry loop explainer (with backoff) — what schedule does it document?",
         "what backoff schedule does the retry loop explainer give (with backoff notes)?",
+        False,
     ),
     (
         "word-group",
         "word group style rule",
         "what does the style rule say about splitting a word group?",
         "the style rule on word group spacing — what was the recorded decision?",
+        False,
     ),
     (
         "import-duty",
         "import duty policy memo",
         "the memo said import the goods declaration first — what order did it record?",
         "what did the import duty policy memo conclude about the declaration order?",
+        False,
     ),
     (
         "class-diagram",
         "class diagram archive",
         "where does the class diagram archive keep the v1 drawings?",
         "the class diagram archive — which drawings were kept per the notes?",
+        False,
     ),
 )
+
+#: Surplus L-neg pairs draw their appendix topic from TRAP pairs only —
+#: a surplus query re-uses the trap phrasing shape and must stay
+#: non-activating like the pair it replaces (the §3.1 replacement
+#: discipline: same stratum, same shape).
+_L_NEG_SURPLUS_SOURCE: tuple[int, ...] = (1, 3, 5)
 
 #: Checkpoint distractor fragments (the live-store drowning echo, §3.4).
 _CHECKPOINT_STATES: tuple[str, ...] = (
@@ -788,13 +829,33 @@ def _doc_chunk_row(
     )
 
 
-def _l_neg_row(rng: random.Random, slug: str, project: str, topic: str) -> CorpusRow:
+def _l_neg_row(
+    rng: random.Random, slug: str, project: str, topic: str, *, mixed: bool
+) -> CorpusRow:
+    """One L-neg gold row — task-less shared PROSE either way.
+
+    Trap rows (mixed=False) frame a prose topic whose thread carried a
+    code-shaped mention. Mixed rows (mixed=True) record a decision ABOUT
+    a code-shaped call token (``retry(backoff=5)``) discussed in prose —
+    the content stays prose (single declarative sentence, no line-
+    anchored code shapes), so the stored ``content_type`` is prose and
+    the ACTIVE lens's code-only narrowing excludes it: the G4b
+    falsifiable arm.
+    """
     qual = rng.choice(_SHARED_QUALS)
-    content = (
-        f"Platform note: the {topic} follow the weekly cadence {qual}; "
-        f"the code-shaped mention in the thread was prose, not code. "
-        f"Owner {AGENT}; kept with the meeting summaries."
-    )
+    if mixed:
+        content = (
+            f"Platform note: the {topic} change came up at the sync — we kept "
+            f"the existing default {qual}; the thread mention was prose "
+            f"discussion of code, not a shipped patch. Owner {AGENT}; kept "
+            f"with the meeting summaries."
+        )
+    else:
+        content = (
+            f"Platform note: the {topic} follow the weekly cadence {qual}; "
+            f"the code-shaped mention in the thread was prose, not code. "
+            f"Owner {AGENT}; kept with the meeting summaries."
+        )
     return CorpusRow(
         slug=slug,
         segment="shared",
@@ -1074,7 +1135,7 @@ def build_corpus() -> Corpus:
                 )
             )
     for idx in range(3):  # X-shared surplus
-        ask_task = TASKS[_SHARED_ASK[9 + idx]]  # tasks 5/6/7, project B except idx 2
+        ask_task = TASKS[_SHARED_ASK[9 + idx]]  # tasks 5/6/7 — all three project B
         project = TASK_PROJECTS[ask_task]
         rows.append(
             _prose_row(
@@ -1087,13 +1148,13 @@ def build_corpus() -> Corpus:
                 action=rng.choice(_ACTIONS),
             )
         )
-    for k, (_slug_tail, topic, _ph, _pr) in enumerate(_L_NEG_PAIRS):
+    for k, (_slug_tail, topic, _ph, _pr, mixed) in enumerate(_L_NEG_PAIRS):
         asking = TASKS[k % 8]
-        rows.append(_l_neg_row(rng, f"ln-{k:02d}", TASK_PROJECTS[asking], topic))
-    for k in range(3):  # L-neg surplus
+        rows.append(_l_neg_row(rng, f"ln-{k:02d}", TASK_PROJECTS[asking], topic, mixed=mixed))
+    for k, source in enumerate(_L_NEG_SURPLUS_SOURCE):  # L-neg surplus (trap topics)
         asking = TASKS[(k + 4) % 8]
-        topic = _L_NEG_PAIRS[k][1] + " appendix"
-        rows.append(_l_neg_row(rng, f"ln-{12 + k:02d}", TASK_PROJECTS[asking], topic))
+        topic = _L_NEG_PAIRS[source][1] + " appendix"
+        rows.append(_l_neg_row(rng, f"ln-{12 + k:02d}", TASK_PROJECTS[asking], topic, mixed=False))
     for doc_idx in range(2):  # 2 shared chunked docs, 5 chunks each
         project = PROJECT_A if doc_idx == 0 else PROJECT_B
         for chunk_idx in range(5):
@@ -1158,8 +1219,8 @@ def build_corpus() -> Corpus:
             queries, f"fx-s{idx:03d}", f"sh-x{idx:02d}", noun, "prose", ask_task, surplus=True
         )
 
-    # ── L-neg queries (cross-class; lens-inactive by construction) ──────
-    for k, (_slug_tail, _topic, ph, pr) in enumerate(_L_NEG_PAIRS):
+    # ── L-neg queries (cross-class; MIXED composition — the G4b repair) ─
+    for k, (_slug_tail, _topic, ph, pr, mixed) in enumerate(_L_NEG_PAIRS):
         asking = TASKS[k % 8]
         for suffix, text in (("ph", ph), ("pr", pr)):
             queries.append(
@@ -1172,15 +1233,16 @@ def build_corpus() -> Corpus:
                     current_task=asking,
                     gold_slug=f"ln-{k:02d}",
                     axis="prose",
+                    mixed=mixed,
                 )
             )
-    for k in range(3):  # L-neg surplus pairs
+    for k, source in enumerate(_L_NEG_SURPLUS_SOURCE):  # L-neg surplus pairs
         asking = TASKS[(k + 4) % 8]
         for suffix in ("ph", "pr"):
             queries.append(
                 GoldQuery(
                     qid=f"fl-s{k:03d}-{suffix}",
-                    text=f"what changed in the {_L_NEG_PAIRS[k][1]} appendix notes?",
+                    text=f"what changed in the {_L_NEG_PAIRS[source][1]} appendix notes?",
                     stratum="l_neg",
                     query_class="cross",
                     project=TASK_PROJECTS[asking],
@@ -1414,6 +1476,7 @@ def _query_fingerprint_view(query: GoldQuery) -> dict[str, Any]:
         "gold_slug": query.gold_slug,
         "axis": query.axis,
         "surplus": query.surplus,
+        "mixed": query.mixed,
     }
 
 
@@ -1535,15 +1598,50 @@ def _assert_corpus(corpus: Corpus) -> None:
         assert len(t_q) == 24, f"{task}: {len(t_q)} T-gold queries (expected 24)"
         assert len(x_q) == 6, f"{task}: {len(x_q)} X-gold queries (expected 6)"
 
-    # Lens contract (the lens-axis design, generator-pinned):
-    # code-axis queries ACTIVATE the CODE lens; every other axis NEVER
-    # does (the L-neg trap family must stay inert).
+    # Lens contract (the lens-axis design, generator-pinned): code-axis
+    # queries ACTIVATE the CODE lens; L-neg MIXED queries (the G4b
+    # falsifiability repair) ACTIVATE by their code-shaped call token;
+    # every other query NEVER does (the L-neg trap family must stay
+    # inert — the registered must-not-activate majority).
+    l_neg_analyzed = [q for q in analyzed if q.stratum == "l_neg"]
+    l_neg_mixed = [q for q in l_neg_analyzed if q.mixed]
+    assert len(l_neg_mixed) == 8, (
+        f"L-neg mixed composition drifted: {len(l_neg_mixed)} activating of "
+        f"{len(l_neg_analyzed)} (registered: 8 mixed + 16 trap, §8/13)"
+    )
     for q in corpus.queries:
         active = lens_active(Lens.CODE, query=q.text)
-        if q.axis == "code":
-            assert active, f"{q.qid}: code-axis query must activate the CODE lens"
-        else:
-            assert not active, f"{q.qid}: {q.axis}-axis query must NOT activate the lens"
+        expected = q.axis == "code" or (q.stratum == "l_neg" and q.mixed)
+        assert active == expected, (
+            f"{q.qid}: lens activation {active} != birth property {expected} "
+            "(code-axis or L-neg mixed activate; everything else stays inert)"
+        )
+    # The G4b falsifiable arm's gold is cross-class PROSE: the active
+    # lens's code-only narrowing can drop it — that is the corridor's
+    # measurement path, so the gold must never be code-classified.
+    for q in l_neg_mixed:
+        gold = rows_by_slug[q.gold_slug]
+        assert gold.task is None and gold.segment == "shared", (
+            f"{q.qid}: L-neg mixed gold must be a task-less shared (cross-class) row"
+        )
+        assert detect_profile(gold.content) != "code", (
+            f"{q.qid}: L-neg mixed gold must classify prose (a code-typed gold "
+            "would be admitted by the lens and the corridor could not measure)"
+        )
+
+    # Governance-free corpus (repair 2d): no row may carry a governance-
+    # selecting tag. The G4a/V3 probes read the RAW mgr.search order as
+    # "the pre-lens order", while _recall_stage under type_boost=True
+    # re-ranks governance rows by the x10 boost BEFORE the lens — a
+    # governance row would make the probe order diverge from the actual
+    # pre-lens order. Seed hygiene already refuses mnemos: tags; this
+    # assert names the type_boost equivalence it pins.
+    for row in rows:
+        gov = GOVERNANCE_TAGS.intersection(row.tags)
+        assert not gov, (
+            f"{row.slug}: governance tags {sorted(gov)} forbidden — type_boost "
+            "re-ranking would break the G4a/V3 probe-order equivalence"
+        )
 
     # Canaries: unique sentinels, each in exactly one row, no echoes.
     for sentinel in CANARY_SENTINELS:
