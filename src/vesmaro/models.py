@@ -235,8 +235,12 @@ _AGENT_RE = re.compile(r"^agent:[a-z0-9_\-]{1,64}$")
 # against exactly the alphabet the tag contract will accept when the
 # slug is threaded through as ``task:<slug>``.
 _TASK_SLUG_PATTERN = r"[a-z0-9_\-]{1,64}"
-TASK_SLUG_RE: re.Pattern[str] = re.compile(rf"^{_TASK_SLUG_PATTERN}$")
-_TASK_RE = re.compile(rf"^task:{_TASK_SLUG_PATTERN}$")
+# Anchored with ``\Z`` (absolute end), NOT ``$``: a ``$`` anchor also
+# matches just before a trailing newline, so task="t1\n" validated and
+# minted a DEAD tag — the exact-membership tags filter ("task:t1" in
+# row.tags) can never hit "task:t1\n" (Ф1-PREP, #360 review item 2).
+TASK_SLUG_RE: re.Pattern[str] = re.compile(rf"^{_TASK_SLUG_PATTERN}\Z")
+_TASK_RE = re.compile(rf"^task:{_TASK_SLUG_PATTERN}\Z")
 _VESMARO_RE = re.compile(r"^mnemos:[a-z][a-z0-9\-]*$")
 
 

@@ -62,6 +62,7 @@ import pytest
 from vesmaro.config import Settings
 from vesmaro.manager import MemoryManager
 from vesmaro.models import (
+    TASK_SLUG_RE,
     Memory,
     MemoryCreate,
     MemorySource,
@@ -201,6 +202,32 @@ class TestTaskTagValidationLax:
         result = validate_tag_contract([*VALID_BASE, "task:!!!"], strict=False)
         assert not any(t.startswith("task:") for t in result)
         assert "task:unknown" not in result
+
+
+class TestTaskSlugNewlineAnchor:
+    """Ф1-PREP item 2 (#360 review) — the ``$``-anchor flaw.
+
+    ``$`` also matches just before a trailing newline, so ``task:t1\\n``
+    passed validation and could persist as a DEAD tag: the search tags
+    filter is exact membership (``"task:t1" in row.tags``), so the
+    newline-carrying tag is unreachable forever. The ``\\Z`` anchor
+    (TASK_SLUG_RE and _TASK_RE alike) closes it; lax mode still SALVAGES
+    a newline-carrying slug (``_normalize_slug`` strips whitespace).
+    """
+
+    def test_slug_re_rejects_trailing_newline(self) -> None:
+        assert TASK_SLUG_RE.match("t1\n") is None
+        assert TASK_SLUG_RE.match("t1") is not None  # control
+
+    def test_strict_rejects_trailing_newline_tag(self) -> None:
+        with pytest.raises(TagContractError, match="invalid task: tag format"):
+            validate_tag_contract([*VALID_BASE, "task:t1\n"])
+
+    def test_lax_salvages_trailing_newline_tag(self) -> None:
+        """Whitespace is salvageable by design: lax mode normalizes the
+        slug instead of dropping the (optional) task scope."""
+        result = validate_tag_contract([*VALID_BASE, "task:t1\n"], strict=False)
+        assert "task:t1" in result
 
 
 class TestTagContractModel:
