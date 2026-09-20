@@ -11,8 +11,8 @@
 ## Настройка окружения
 
 ```bash
-git clone https://github.com/Korrnals/mnemos.git
-cd mnemos
+git clone https://github.com/vesmaro/vesmaro.git
+cd vesmaro
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 mnemos --help        # проверка, что всё живо
@@ -82,6 +82,6 @@ feat/*  →  dev-<stage>  →  release/X.Y.Z  →  main
 
 ## Сообщение об ошибках
 
-Откройте [GitHub issue](https://github.com/Korrnals/mnemos/issues) с командой, которую
+Откройте [GitHub issue](https://github.com/vesmaro/vesmaro/issues) с командой, которую
 запускали, точным выводом и отчётом `mnemos doctor` (замаскируйте всё, что похоже на
 секрет — issue-трекер публичный).

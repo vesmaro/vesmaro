@@ -2,7 +2,7 @@
 # scripts/install.sh — one-command Mnemos install
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --version 2.0.0 --extra mcp
 #   curl -fsSL .../install.sh | bash -s -- --venv ~/.mnemos-venv --extra mcp,ollama
 #
@@ -219,12 +219,12 @@ fi
 # ── Optional: VS Code MCP integration ─────────────────────────────
 setup_mcp() {
   info "Setting up VS Code MCP integration…"
-  if curl -fsSL "https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/mcp-setup.sh" \
+  if curl -fsSL "https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/mcp-setup.sh" \
        | bash -s -- --command "$MNEMOS_BIN"; then
     ok "VS Code MCP integration ready — reload your VS Code window."
   else
     warn "MCP setup didn't complete. Run it later:"
-    printf "    curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/mcp-setup.sh | bash\n"
+    printf "    curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/mcp-setup.sh | bash\n"
   fi
 }
 
@@ -314,7 +314,7 @@ printf "    mnemos search 'Hello'\n"
 if [[ "$MCP_DONE" == false ]]; then
   echo ""
   info "Enable VS Code MCP integration later:"
-  printf "    curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/mcp-setup.sh | bash\n"
+  printf "    curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/mcp-setup.sh | bash\n"
 fi
 
 if [[ "$INSTRUCTIONS_DONE" == false ]]; then

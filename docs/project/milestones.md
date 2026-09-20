@@ -56,4 +56,4 @@ Mnemos is a fork of [`ai-brain`](../../README.md#source-upstream-license) — se
 
 The M-numbering is the implementation contract; the [ADR set](adr/) is the design contract. When in doubt about *why* a milestone made the choices it made, read the matching ADR. The current architectural shape is captured in [architecture overview](../en/architecture/overview.md); the data model is in §2, the state machines in §3.
 
-A new milestone (M19+) opens only when a senior agent raises a task ticket under [tasks/](https://github.com/Korrnals/mnemos/tree/main/tasks) and the planning session locks the scope.
+A new milestone (M19+) opens only when a senior agent raises a task ticket under [tasks/](https://github.com/vesmaro/vesmaro/tree/main/tasks) and the planning session locks the scope.

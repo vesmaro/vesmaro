@@ -11,8 +11,8 @@ itself, start at the [README](README.md) and the [docs](docs/README.md).
 ## Development setup
 
 ```bash
-git clone https://github.com/Korrnals/mnemos.git
-cd mnemos
+git clone https://github.com/vesmaro/vesmaro.git
+cd vesmaro
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 mnemos --help        # sanity check
@@ -81,6 +81,6 @@ feat/*  →  dev-<stage>  →  release/X.Y.Z  →  main
 
 ## Reporting issues
 
-Open a [GitHub issue](https://github.com/Korrnals/mnemos/issues) with the command you ran, the
+Open a [GitHub issue](https://github.com/vesmaro/vesmaro/issues) with the command you ran, the
 exact output, and your `mnemos doctor` report (mask anything that looks like a secret — the
 issue tracker is public).

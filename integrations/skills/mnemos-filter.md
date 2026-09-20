@@ -53,4 +53,4 @@ token budget.
 
 - Skill `mnemos-write` — writing clean entries in the first place
 - Skill `mnemos-compress` — zero-loss alternative for big blobs
-- [Context filter guide](https://github.com/Korrnals/mnemos/blob/main/docs/en/user/context-filter.md)
+- [Context filter guide](https://github.com/vesmaro/vesmaro/blob/main/docs/en/user/context-filter.md)

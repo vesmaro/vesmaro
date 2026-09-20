@@ -3,7 +3,7 @@ description: "Mnemos — standalone memory & knowledge server for AI agents, emb
 version: "3.0.0"
 author: Korrnals
 license: Apache-2.0
-homepage: https://github.com/Korrnals/mnemos
+homepage: https://github.com/vesmaro/vesmaro
 requires:
   - "the mnemos package importable in the Hermes Python environment (pip install mnemos-memory-server) — no separate `mnemos serve` process is needed"
 config_keys:

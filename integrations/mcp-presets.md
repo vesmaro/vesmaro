@@ -168,7 +168,7 @@ Scripted path — merges into user- or workspace-scope `mcp.json` safely, never
 overwrites your other servers:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/mcp-setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/mcp-setup.sh | bash
 ```
 
 Then **reload the VS Code window** (`Ctrl+Shift+P → Reload Window`).

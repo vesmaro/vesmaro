@@ -29,7 +29,7 @@ pipx install mnemos-memory-server
 опциональная проводка VS Code):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Korrnals/mnemos/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vesmaro/vesmaro/main/scripts/install.sh | bash
 ```
 
 > ⚠️ Имя пакета на PyPI — `mnemos-memory-server`: `pip install mnemos` устанавливает
