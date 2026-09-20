@@ -44,6 +44,7 @@ from unittest.mock import MagicMock
 
 import grpc
 import pytest
+from pydantic import ValidationError
 
 from vesmaro import _mesh_gen
 from vesmaro.compact import CompactRecord
@@ -884,6 +885,29 @@ class TestGetSubscriptionState:
             )
         assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
 
+    def test_subscription_state_ignores_request_peer_id(self, server: MeshServer) -> None:
+        """Review MINOR: ``request.peer_id`` is NOT an identity source.
+
+        Pre-fix the RPC fell back to the caller-asserted
+        ``request.peer_id`` — an ACL oracle over arbitrary peer ids (an
+        unknown id was DENIED, a guessed-valid id passed). Identity now
+        resolves like ListMemories/WriteMemory: metadata or the single
+        configured peer — a spoofed ``request.peer_id`` must not change
+        the outcome for an otherwise-allowed scope.
+        """
+        _wait_for_server(server)
+        stub = _stub(server)
+        response = stub.GetSubscriptionState(
+            _mesh_gen.core_pb2.GetSubscriptionStateRequest(
+                peer_id="mnemos-ghost",
+                project_scope=_PROJECT,
+            ),
+            timeout=2.0,
+        )
+        assert response.cursor == ""
+        assert response.last_rev == 0
+        assert response.last_sync_timestamp == ""
+
 
 # ── ACL hardening (vesmaro#371/#369 family) ───────────────────────────────────
 
@@ -1143,3 +1167,26 @@ class TestAclHardeningFailClosed:
                 timeout=2.0,
             )
         assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_shared_projects_wildcard_rejected_at_config(self, tmp_path: Path) -> None:
+        """Review MAJOR exploit (1): ``shared_projects=['*']`` is a config error.
+
+        Pre-fix the wildcard flowed through the effective-set resolution
+        into ``_intersect_projects`` (wildcard branch → requested
+        verbatim), handing a scoped read ANY project while the write
+        path stayed bounded — a read/write asymmetry. Refused at the
+        config boundary: the server refuses to boot with such a config.
+        """
+        with pytest.raises(ValidationError, match=r"shared_projects.*\*"):
+            _settings_with_peer(tmp_path, allowed=["*"], shared=["*"])
+
+    def test_shared_projects_blank_slug_rejected_at_config(self, tmp_path: Path) -> None:
+        """Review MAJOR exploit (2): ``shared_projects=['']`` is a config error.
+
+        Pre-fix the blank slug became an effective entry of ``''``, and
+        the SQL ``project IN ('')`` matched every UNTAGGED record (the
+        memories column DEFAULTs to ``''``) — asymmetric with the
+        WriteMemory untagged-record deny. Refused at the config boundary.
+        """
+        with pytest.raises(ValidationError, match="blank project slug"):
+            _settings_with_peer(tmp_path, allowed=[_PROJECT], shared=[""])

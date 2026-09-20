@@ -789,8 +789,21 @@ class MnemosCoreServicer:
         :rpc:`Subscribe` stream on (re)connect. The ACL is still
         enforced: a disallowed scope returns ``PERMISSION_DENIED`` and
         an empty response.
+
+        Identity resolution matches ListMemories/WriteMemory (review
+        MINOR): gRPC metadata, or the single configured peer — NEVER the
+        caller-asserted ``request.peer_id`` (kept on the wire for
+        informational correlation only), which was an ACL oracle over
+        arbitrary peer ids.
         """
-        peer_id = self._peer_id_from_context(context) or request.peer_id
+        peer_id = self._peer_id_from_context(context) or self._single_peer_id()
+        if peer_id is None:
+            logger.info("mesh_server: GetSubscriptionState refused — no peer identity")
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("no peer identity and not exactly one peer configured")
+            return _mesh_gen.core_pb2.GetSubscriptionStateResponse(
+                cursor="", last_rev=0, last_sync_timestamp=""
+            )
         if self._check_acl(peer_id, request.project_scope, context) is None:
             return _mesh_gen.core_pb2.GetSubscriptionStateResponse(
                 cursor="", last_rev=0, last_sync_timestamp=""
