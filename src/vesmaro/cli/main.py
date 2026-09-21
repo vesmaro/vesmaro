@@ -953,6 +953,18 @@ def serve(
         mesh_server = MeshServer(settings.mesh.socket_path, mesh_manager, settings)
         mesh_server.start()  # logs: mesh server listening on <path>
 
+    # S2 phase 2: the meta poller starts in the FastAPI lifespan, which
+    # is PER WORKER — with uvicorn workers > 1 every worker polls. The
+    # upsert is idempotent (LWW) so this is wasted fetches, never
+    # corruption, but the operator should know.
+    if settings.federation.meta_poll.enabled and settings.runtime.uvicorn_workers > 1:
+        console.print(
+            "[yellow]warning[/yellow] federation.meta_poll enabled with "
+            f"runtime.uvicorn_workers={settings.runtime.uvicorn_workers}: "
+            "every worker process runs its own poller (idempotent imports, "
+            "redundant fetches)"
+        )
+
     try:
         uvicorn.run(
             "vesmaro.api.main:app",
@@ -967,6 +979,92 @@ def serve(
         # its socket file. Also covers uvicorn startup failures.
         if mesh_server is not None:
             mesh_server.stop(grace=2.0)
+
+
+# ── meta-poll (S2 phase 2) ────────────────────────────────────────────────────
+
+
+@app.command(name="meta-poll")
+def meta_poll(
+    peer: Annotated[
+        str | None,
+        typer.Option("--peer", help="Poll only this peer id (default: all poll targets)."),
+    ] = None,
+    config: str = ConfigOption,
+) -> None:
+    """Run one federation meta-poll pass now (S2 phase 2, manual/diagnostic).
+
+    The same path the background loop runs per tick — the mesh CLI
+    (``mnemos-mesh sync-meta``) per configured peer, pages imported via
+    the gated upsert, watermark persisted — executed once, in the
+    foreground, with a per-peer summary. Metadata-only: touches
+    ``federation_index`` and the poll state, never ``memories``.
+
+    Works regardless of ``federation.meta_poll.enabled`` (an explicit
+    run is an operator decision); requires
+    ``federation.meta_poll.mesh_config_path`` in the config.
+    """
+    import asyncio
+
+    from vesmaro.meta_poller import MetaPoller, PeerPollResult
+
+    settings = load_settings(config)
+    setup_logging(settings, verbose=_verbose)
+    fed = settings.federation
+    if not fed.meta_poll.mesh_config_path.strip():
+        console.print(
+            "[red]✗[/red] federation.meta_poll.mesh_config_path is not set — "
+            "the mesh CLI needs the path to the peer-leg mesh yaml"
+        )
+        raise typer.Exit(1)
+
+    mgr = get_manager(config)
+    poller = MetaPoller(mgr.sqlite, fed)
+    if peer is not None:
+        targets = poller.peer_ids()
+        if peer not in targets:
+            console.print(
+                f"[red]✗[/red] peer {peer!r} is not a meta_poll target "
+                f"(configured: {targets or 'none'})"
+            )
+            raise typer.Exit(1)
+        target_ids = [peer]
+    else:
+        target_ids = poller.peer_ids()
+        if not target_ids:
+            console.print("[yellow]⚠[/yellow] no federation peers configured — nothing to poll")
+            raise typer.Exit(1)
+
+    async def _run() -> list[PeerPollResult]:
+        return [await poller.poll_once(p) for p in target_ids]
+
+    results = asyncio.run(_run())
+    total_fetched = total_accepted = total_rejected = total_stale = 0
+    failed = 0
+    for r in results:
+        if r.ok:
+            console.print(
+                f"[green]✓[/green] peer={r.peer_id} fetched={r.fetched} "
+                f"accepted={r.accepted} rejected_by_gate={r.rejected_by_gate} "
+                f"stale={r.stale} pages={r.pages} latest_rev={r.latest_rev}"
+            )
+        else:
+            failed += 1
+            console.print(
+                f"[red]✗[/red] peer={r.peer_id} error={r.error} "
+                f"(fetched={r.fetched} pages={r.pages} latest_rev={r.latest_rev})"
+            )
+        total_fetched += r.fetched
+        total_accepted += r.accepted
+        total_rejected += r.rejected_by_gate
+        total_stale += r.stale
+    console.print(
+        f"[cyan]summary[/cyan] peers={len(results)} failed={failed} "
+        f"fetched={total_fetched} accepted={total_accepted} "
+        f"rejected_by_gate={total_rejected} stale={total_stale}"
+    )
+    if failed:
+        raise typer.Exit(1)
 
 
 # ── mcp-server ─────────────────────────────────────────────────────────────────

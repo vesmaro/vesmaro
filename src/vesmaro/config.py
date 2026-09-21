@@ -519,6 +519,93 @@ class PeerConfig(BaseModel):
         return value
 
 
+class MetaPollConfig(BaseModel):
+    """S2 phase 2 meta-poller configuration (ADR-0021 Q10.2 poll-first).
+
+    The poller lives in the mnemos process (ArchCom ruling Q10.1:
+    orchestration in MNEMOS, the mesh is transport) and pulls each
+    peer's ``federation_index`` pages by shelling out to the mesh CLI
+    (``mnemos-mesh sync-meta --config <mesh.yaml> --peer <id> --json
+    [--since <rev>]``), then imports the records in-process via
+    :meth:`vesmaro.storage.sqlite_store.SQLiteStore.upsert_index_entries`.
+    Metadata-only by construction: the poller never touches
+    ``memories`` or the pipeline.
+
+    Default OFF (additive): a config without the ``meta_poll`` section
+    parses unchanged and the process behaves bit-for-bit as S2 phase 1.
+
+    Fields:
+        enabled: Master switch. Default ``False`` — the background
+            poller task is only started (in ``vesmaro serve``) when
+            this is explicitly set to ``true``.
+        interval_seconds: Wall-clock seconds between background ticks.
+            Default 300 (5 min). Clamped to ``[60, 86400]`` — below one
+            minute a poller hammers the peers for no freshness gain,
+            above a day it is not a poller any more.
+        peers: Which peers to poll. ``"all"`` (default) = every key in
+            :attr:`FederationConfig.peers`; an explicit list of peer
+            A2A ids = only those (validated at the config boundary
+            against the ``peers`` map — a typo'd id is a startup error,
+            never a silently skipped peer). Blank ids are rejected.
+        mesh_config_path: Path to the mesh ``yaml`` passed to the CLI
+            via ``--config``. REQUIRED when ``enabled`` (the CLI cannot
+            dial the peer leg without it) — enforced here, fail-fast at
+            startup.
+        mesh_bin: The mesh CLI binary to execute. Default
+            ``mnemos-mesh`` (resolved via ``PATH``). An absolute path is
+            the injection point used by tests to substitute a script
+            double.
+    """
+
+    enabled: bool = False
+    interval_seconds: int = 300
+    peers: str | list[str] = "all"
+    mesh_config_path: str = Field(default="", max_length=4096)
+    mesh_bin: str = Field(default="mnemos-mesh", min_length=1, max_length=256)
+
+    @field_validator("interval_seconds")
+    @classmethod
+    def _interval_clamped(cls, value: int) -> int:
+        """Clamp the tick interval into ``[60, 86400]`` (clamp, not reject).
+
+        An operator writing ``interval_seconds: 30`` wants a faster
+        poller, not a crashed process — the value is silently clamped
+        to the floor and the effective value is logged at poller start.
+        """
+        return max(60, min(86_400, value))
+
+    @field_validator("peers")
+    @classmethod
+    def _peers_wellformed(cls, value: str | list[str]) -> str | list[str]:
+        """Reject blank ids and any string form other than ``"all"``."""
+        if isinstance(value, str):
+            if value != "all":
+                raise ValueError(
+                    f"meta_poll.peers: string form must be 'all', got {value!r} "
+                    "(list peer ids explicitly for a subset)"
+                )
+            return value
+        for peer_id in value:
+            if not peer_id.strip():
+                raise ValueError("meta_poll.peers: blank peer id is not a valid A2A id")
+        return value
+
+    @model_validator(mode="after")
+    def _enabled_requires_mesh_config(self) -> MetaPollConfig:
+        """``enabled: true`` without ``mesh_config_path`` is a config error.
+
+        The CLI invocation is built from this path; an empty value would
+        surface as a per-tick subprocess failure loop instead of an
+        operator-actionable message. Fail at the config boundary.
+        """
+        if self.enabled and not self.mesh_config_path.strip():
+            raise ValueError(
+                "meta_poll.enabled requires meta_poll.mesh_config_path — "
+                "the mesh CLI needs the path to the peer-leg mesh yaml"
+            )
+        return self
+
+
 class FederationConfig(BaseModel):
     """Federation (Phase 0 batch sync) configuration.
 
@@ -572,6 +659,10 @@ class FederationConfig(BaseModel):
             surface). Empty list (default) = no title filtering. Each
             pattern must compile — invalid regex fails at the config
             boundary (startup fail-fast, never a silent skip).
+        meta_poll: S2 phase 2 background meta-poller (ADR-0021 Q10.2
+            poll-first, Q10.1 orchestration-in-mnemos ruling). Default
+            OFF; see :class:`MetaPollConfig`. Additive: configs without
+            the key parse unchanged (bit-for-bit S1/phase-1 behaviour).
     """
 
     shared_projects: list[str] = Field(default_factory=list)
@@ -580,6 +671,7 @@ class FederationConfig(BaseModel):
     peers: dict[str, PeerConfig] = Field(default_factory=dict)
     access_log_path: str | None = Field(default=None, max_length=4096)
     index_title_blocklist: list[str] = Field(default_factory=list, max_length=256)
+    meta_poll: MetaPollConfig = Field(default_factory=MetaPollConfig)
 
     @field_validator("shared_projects")
     @classmethod
@@ -617,6 +709,24 @@ class FederationConfig(BaseModel):
                     f"index_title_blocklist: pattern {pattern!r} does not compile: {exc}"
                 ) from exc
         return value
+
+    @model_validator(mode="after")
+    def _meta_poll_peers_known(self) -> FederationConfig:
+        """Explicit ``meta_poll.peers`` ids must exist in the ``peers`` map.
+
+        A typo'd peer id would otherwise be a silently never-polled
+        entry (the poller resolves the list verbatim). The ``"all"``
+        form tracks the map by construction and needs no check.
+        """
+        explicit = self.meta_poll.peers
+        if isinstance(explicit, list):
+            unknown = [p for p in explicit if p not in self.peers]
+            if unknown:
+                raise ValueError(
+                    f"meta_poll.peers: unknown peer id(s) {unknown} — "
+                    f"configured federation.peers keys: {sorted(self.peers)}"
+                )
+        return self
 
 
 class ScannerConfig(BaseModel):

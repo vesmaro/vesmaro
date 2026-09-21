@@ -1140,7 +1140,15 @@ class MnemosCoreServicer:
           page consumed (delivered OR filtered) so a re-poll resumes
           exactly after it — stateless pagination, no server-side cursor
           state (ADR-0020: core keeps no cursor state at all). An empty
-          page echoes ``since_rev`` (the watermark never regresses).
+          page parks ``latest_rev`` at the SCOPE HEAD — the max rowid
+          under the effective-projects filter
+          (:meth:`SQLiteStore.index_head`, mnemos-mesh#46) — instead of
+          echoing ``since_rev``: nothing undelivered exists beyond the
+          head, and a MIN-aggregating poller (the mesh CLI folds the
+          per-scope ``latest_rev`` into one watermark) otherwise sticks
+          at the old checkpoint and re-delivers the data scope every
+          tick. ``max(since_rev, head)`` keeps the never-regress
+          invariant for watermarks minted over a wider scope.
         * ``limit`` (0 = core default 50, clamped to the hard ceiling)
           sizes the page; the wrapper fetches one extra row to detect
           ``has_more`` without a second query.
@@ -1238,6 +1246,19 @@ class MnemosCoreServicer:
                 blocked += 1
                 continue
             records.append(_metadata_to_proto(entry))
+        if not rows:
+            # mnemos-mesh#46: an EMPTY page parks the watermark at the
+            # scope HEAD (max rowid under the effective-projects filter)
+            # instead of echoing since_rev — nothing undelivered exists
+            # beyond the head, and a MIN-aggregating poller (the mesh
+            # CLI folds the per-scope latest_rev into one watermark)
+            # otherwise sticks at the old checkpoint and re-delivers the
+            # data scope every tick. max() keeps the never-regress
+            # invariant when the head sits below a watermark minted over
+            # a wider scope.
+            latest_rev = max(
+                since_rev, self._manager.sqlite.index_head(projects=effective_projects)
+            )
         logger.info(
             "mesh_server: index sync served entries=%d peer=%s since_rev=%d "
             "latest_rev=%d has_more=%s title_blocked=%d",

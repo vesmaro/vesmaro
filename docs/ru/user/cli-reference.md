@@ -41,6 +41,7 @@ mnemos [GLOBAL-OPTIONS] SUBCOMMAND [SUBCOMMAND-OPTIONS] [ARGS]
 | [`import`](export-import.md) | Импорт записей из файла экспорта (отдельная страница) |
 | [`logs`](#logs) | Просмотр трассировок пайплайна |
 | [`sync`](sync.md) | Пакетная federation-синхронизация: export / import (отдельная страница) |
+| [`meta-poll`](#meta-poll) | Опрос метаданных федерации: один проход поллера вручную (S2 фаза 2) |
 | [`scanner`](#scanner) | Фоновый сканер секретов: `run` / `status` |
 
 > Группа `tags` также предоставляет `tags normalize` и `tags rename` (массовое переименование префиксов с dry-run); `migrate tags` — устаревший алиас для `mnemos tags rename --from gcw: --to mnemos: --no-dry-run`.
@@ -516,6 +517,50 @@ mnemos serve --log-file ~/.mnemos/logs/serve.log
 ```
 
 Полная поверхность HTTP API документирована в [http-api.md](http-api.md). Swagger UI доступен по адресу `http://HOST:PORT/docs`.
+
+---
+
+## `meta-poll`
+
+Один проход опроса метаданных федерации (S2 фаза 2, poll-first). Это тот же путь, который фоновый цикл выполняет на каждом тике — но один раз, в foreground, со сводкой по пирам: для ручных запусков и диагностики.
+
+```text
+mnemos meta-poll [OPTIONS]
+```
+
+| Опция | По умолчанию | Описание |
+|-------|--------------|----------|
+| `--peer` | все цели опроса | Опросить только этот пир (должен быть целью `meta_poll`). |
+| `--config / -c` | — | Путь к `config.yaml`. |
+
+По каждому пиру команда вызывает mesh-CLI (`mnemos-mesh sync-meta --config <mesh.yaml> --peer <id> --json [--since <rev>]`), парсит JSON-страницу и импортирует записи in-process через гейтовый upsert (`upsert_index_entries` с `sender_peer_id`): действуют no-federate-тег, title-блоклист, origin-guard и LWW-разрешение конфликтов. **Только метаданные**: путь опроса трогает `federation_index` и таблицу watermark'ов поллера, но никогда `memories` и пайплайн. Успешный проход печатает строку вида:
+
+```text
+✓ peer=mnemos-B fetched=12 accepted=10 rejected_by_gate=1 stale=1 pages=1 latest_rev=47
+```
+
+Код выхода `1`, если хотя бы один опрошенный пир упал (ненулевой exit CLI, битый JSON, таймаут) — ошибка фиксируется в `federation_poll_state.last_error` и повторяется на следующем проходе; watermark (`since_rev`) двигается только при успехе.
+
+### Фоновый цикл (`federation.meta_poll`)
+
+Фоновый поллер работает внутри `mnemos serve` как asyncio-задача и **выключен по умолчанию** — конфиг без ключа `meta_poll` парсится без изменений, поведение процесса бит-в-бит как раньше (S1 / S2 фаза 1).
+
+```yaml
+federation:
+  meta_poll:
+    enabled: true                      # по умолчанию false — явный opt-in
+    interval_seconds: 300              # по умолчанию 300; клэмпится в [60, 86400]
+    peers: all                         # "all" (все ключи federation.peers) или явный список
+    mesh_config_path: /etc/mnemos/mesh.yaml  # ОБЯЗАТЕЛЕН при enabled (передаётся CLI как --config)
+    mesh_bin: mnemos-mesh              # имя бинарника (PATH) или абсолютный путь
+```
+
+Примечания:
+
+- `enabled: true` без `mesh_config_path` — ошибка конфига (fail-fast на старте). Явный список `peers` с неизвестным id — тоже ошибка конфига: опечатка не должна превращаться в молча пропущенный пир.
+- Watermark по пиру персистится после каждой успешно импортированной страницы, поэтому рестарт (или падение) посреди пира возобновляется ровно после последней потреблённой строки; следующий запрос несёт `--since <watermark>`. Страницы с `has_more: true` chained-атся сразу (до 10 страниц на пира за тик).
+- Ошибка одного пира никогда не останавливает цикл: она логируется на INFO, пишется в `federation_poll_state.last_error`, и пир повторяется на следующем тике (интервал и есть backoff).
+- При `runtime.uvicorn_workers > 1` каждый worker-процесс держит свой поллер — импорты идемпотентны (LWW), так что это лишние запросы, но не порча данных; `serve` печатает предупреждение.
 
 ---
 

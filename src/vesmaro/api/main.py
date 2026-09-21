@@ -192,9 +192,24 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     scanner = get_scanner(mgr)
     scanner.start()
 
+    # S2 phase 2 — background federation metadata poller (ADR-0021
+    # Q10.2 poll-first, default-off). asyncio task on the serve loop:
+    # the poller spends its life awaiting the mesh CLI subprocess, so
+    # it must not occupy a thread. No-op when ``meta_poll.enabled`` is
+    # False — without the config key the lifespan is byte-identical to
+    # phase 1.
+    meta_poller = None
+    if settings.federation.meta_poll.enabled:
+        from vesmaro.meta_poller import MetaPoller
+
+        meta_poller = MetaPoller(mgr.sqlite, settings.federation)
+        meta_poller.start()
+
     try:
         yield
     finally:
+        if meta_poller is not None:
+            await meta_poller.stop()
         scanner.stop()
         mgr.stop_background_processor()
         store.close()
