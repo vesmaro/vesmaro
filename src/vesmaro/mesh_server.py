@@ -117,7 +117,9 @@ import ssl
 import time
 from collections.abc import Sequence
 from concurrent import futures
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -199,6 +201,41 @@ class MeshTCPLegError(RuntimeError):
     message names the bind address so the operator can tell port
     collision from misconfiguration at a glance.
     """
+
+
+class CompactImportStatus(Enum):
+    """Outcome of the shared in-process compact-record import path.
+
+    Mirrors the :rpc:`WriteMemory` trigger-code taxonomy so transport
+    callers (:rpc:`WriteMemory` itself) and in-process callers (the S2
+    lazy-fetch command) classify outcomes identically — the Go pull's
+    written/duplicate/gated split maps 1:1 onto these.
+    """
+
+    #: Content persisted via :meth:`MemoryManager.add` (proto: EXHAUSTIVE).
+    WRITTEN = "written"
+    #: #359/#362 duplicate — an existing row already carries this
+    #: ``fed_id``; nothing was re-written (proto: ALREADY_EXHAUSTED).
+    DUPLICATE = "duplicate"
+    #: Refused by the ACL gate (empty effective set / no project tag /
+    #: project not allowed) — proto: REFUSED + PERMISSION_DENIED.
+    REFUSED_ACL = "refused_acl"
+    #: Refused by mnemos-side moderation (proto: REFUSED, no gRPC error).
+    REFUSED_MODERATION = "refused_moderation"
+
+
+@dataclass(frozen=True, slots=True)
+class CompactImportResult:
+    """One :meth:`MnemosCoreServicer.import_compact_record` outcome.
+
+    ``written_id`` carries the storage id on WRITTEN and the EXISTING
+    id on DUPLICATE; ``reason`` is an operator-actionable refusal
+    message (empty unless refused).
+    """
+
+    status: CompactImportStatus
+    written_id: str = ""
+    reason: str = ""
 
 
 #: Prefix on pinned fingerprint strings — the same convention as the
@@ -850,131 +887,72 @@ class MnemosCoreServicer:
 
     # ── RPC: WriteMemory ───────────────────────────────────────────────────
 
-    def WriteMemory(  # noqa: N802 -- gRPC servicer override; name dictated by generated core_pb2_grpc.MnemosCoreServicer
-        self,
-        request: Any,
-        context: grpc.ServicerContext[Any, Any],
-    ) -> Any:
-        """Import a :class:`CompactRecord` from a peer into vesmaro.
+    def import_compact_record(self, compact: CompactRecord, *, peer_id: str) -> CompactImportResult:
+        """Import one :class:`CompactRecord` under a peer identity (shared path).
 
-        Steps (contract §3.1, #86 import validation, #359 idempotency):
+        The transport-free core of :rpc:`WriteMemory`, extracted so the
+        S2 lazy-fetch command (``mnemos fetch``) imports through the
+        VERY SAME mechanism — ACL gate, #359/#362 duplicate gate,
+        moderation, :meth:`MemoryManager.add` (Layer 1 secrets scanner)
+        — without spinning up a gRPC server. The RPC handler resolves
+        the transport concerns (import-mode validation, RESTORE gate,
+        peer identity from gRPC metadata, TLS pinning) and delegates
+        here; callers that classify outcomes map :attr:`status` onto
+        their own counters (the Go pull maps the proto trigger codes
+        1:1 onto written/duplicate/gated — see ``writeOutcome`` there).
 
-        1. Validate the request: ``import_mode`` must be MERGE or
-           RESTORE; RESTORE requires ``confirm=True`` (hard gate).
-        2. Resolve the peer from gRPC metadata (single-peer fallback for
-           tests). Enforce the ACL on the record's project (parsed from
-           its tags): the project must be in the peer's EFFECTIVE allowed
-           set, a record WITHOUT a ``project:`` tag is refused (it cannot
-           be ACL'd), and an empty effective set refuses everything
-           (fail-closed contract, vesmaro#371/#369).
-        3. #359 duplicate gate: look up an already-imported record by
-           ``fed_id`` (fallback ``title`` + ``source_agent``). A hit
-           refreshes ``metadata.last_fed_at`` (when present) and returns
-           ``ALREADY_EXHAUSTED`` with the EXISTING storage id — no
-           re-write, so replayed pulls (mnemos-mesh #34) are idempotent.
-        4. Run mnemos's own moderation on the record's ``summary`` (the
-           compact payload is already moderation-processed by the peer,
-           but mnemos applies its own validation on top per #86).
-        5. Persist via :class:`MemoryManager.add` (Layer 1 secrets
-           scanner runs inside).
-        6. Return the written id + the mode actually applied + trigger
-           code (``EXHAUSTIVE`` on clean merge, ``REFUSED`` on ACL or
-           moderation refusal, ``ALREADY_EXHAUSTED`` on a duplicate).
+        Order of gates (unchanged by the extraction):
+
+        1. ACL GATE — fail-closed (vesmaro#371/#369 family), BEFORE the
+           duplicate gate, moderation, and any storage mutation:
+           (a) an empty effective allowed set (unknown peer, empty
+           allow-list, ``"*"`` with an empty shared_projects) denies;
+           (b) a record WITHOUT a ``project:`` tag cannot be ACL'd —
+           deny; (c) the record's project must be IN the effective
+           allowed set (for a ``"*"`` peer that is the shared_projects
+           union — symmetric with the read-side intersection).
+        2. #359 duplicate gate by ``fed_id`` (fallback ``title`` +
+           ``source_agent``): a hit refreshes
+           ``metadata.last_fed_at`` (when present) and reports
+           :attr:`CompactImportStatus.DUPLICATE` with the EXISTING
+           storage id — no re-write, so replays stay idempotent.
+        3. mnemos's own moderation on the record's ``summary`` (#86
+           defence-in-depth).
+        4. Persist via :meth:`MemoryManager.add` → WRITTEN.
+
+        Args:
+            compact: The record to import (already validated by the
+                caller — the RPC leg marshals it from proto, the
+                lazy-fetch leg from the mesh CLI's JSON contract).
+            peer_id: The ACL identity of the importer. On the RPC leg
+                this is the mesh node calling in; on the lazy-fetch leg
+                it is the record's ORIGIN peer (we trust an origin for
+                exactly what its ``allowed_projects`` grants).
+
+        Returns:
+            A :class:`CompactImportResult`; never raises for policy
+            refusals (the caller decides how to surface them).
         """
-        import_mode = int(request.import_mode)
-        # Validate import_mode (UNSPECIFIED is rejected).
-        if import_mode == int(_mesh_gen.core_pb2.ImportMode.IMPORT_MODE_UNSPECIFIED):
-            logger.info("mesh_server: WriteMemory refused — UNSPECIFIED import_mode")
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("import_mode must be MERGE or RESTORE")
-            return _mesh_gen.core_pb2.WriteMemoryResponse(
-                written_id="",
-                mode_applied=_mesh_gen.core_pb2.ImportMode.IMPORT_MODE_UNSPECIFIED,
-                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
-            )
-        # RESTORE hard gate (mnemos-operations §1).
-        if import_mode == int(_mesh_gen.core_pb2.ImportMode.RESTORE) and not bool(request.confirm):
-            logger.warning("mesh_server: WriteMemory refused — RESTORE without confirm=True")
-            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-            context.set_details("RESTORE requires confirm=True (hard gate)")
-            return _mesh_gen.core_pb2.WriteMemoryResponse(
-                written_id="",
-                mode_applied=_mesh_gen.core_pb2.ImportMode.MERGE,
-                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
-            )
-        # Downgrade RESTORE→MERGE on the mesh↔mnemos path: the mesh is
-        # transport, not an operator disaster-recovery tool. The applied
-        # mode is recorded in the response so the mesh surfaces it to the
-        # operator.
-        mode_applied = _mesh_gen.core_pb2.ImportMode.MERGE
-        if import_mode == int(_mesh_gen.core_pb2.ImportMode.RESTORE):
-            logger.info("mesh_server: downgrading RESTORE→MERGE on mesh↔mnemos path")
-
-        pb_record = request.record
-        compact = _compact_from_proto(pb_record)
         project = _tag_value(compact.tags, "project:")
         agent = _tag_value(compact.tags, "agent:") or compact.source_agent
-        # ACL: the caller is the mesh peer, identified via gRPC metadata
-        # in production. For the single-peer unit-test path we fall back
-        # to the only configured peer (same as ListMemories). The record's
-        # ``source_agent`` is the *origin* agent on the remote mnemos — it
-        # is NOT a federation peer and must not be used as the ACL identity.
-        peer_id = self._peer_id_from_context(context) or self._single_peer_id()
-        if peer_id is None:
-            logger.info("mesh_server: WriteMemory refused — no peer identity")
-            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
-            context.set_details("no peer identity and not exactly one peer configured")
-            return _mesh_gen.core_pb2.WriteMemoryResponse(
-                written_id="",
-                mode_applied=mode_applied,
-                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
-            )
-        # W2.5 TCP leg: on TLS connections, pin the caller's client-cert
-        # fingerprint to the configured peer (UDS calls skip this).
-        pin_peer = _resolve_peer(self._settings, peer_id)
-        if pin_peer is not None and not self._enforce_tls_client_pin(pin_peer, context):
-            return _mesh_gen.core_pb2.WriteMemoryResponse(
-                written_id="",
-                mode_applied=mode_applied,
-                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
-            )
-        # ACL GATE — fail-closed on the write path too (vesmaro#371/#369
-        # family), enforced BEFORE the duplicate gate, moderation, and any
-        # storage mutation:
-        # (a) an empty effective allowed set (unknown peer, empty
-        #     allow-list, "*" with an empty shared_projects) denies —
-        #     there is no implicit "all";
-        # (b) a record WITHOUT a project: tag cannot be ACL'd at all —
-        #     deny instead of writing into the project-less namespace;
-        # (c) the record's project must be IN the effective allowed set
-        #     (for a "*" peer that is the shared_projects union —
-        #     symmetric with the read-side intersection).
         allowed_projects = self._allowed_projects_for_peer(peer_id)
         if not allowed_projects:
             logger.info(
                 "mesh_server: WriteMemory refused — empty effective allowed set for peer_id=%s",
                 peer_id,
             )
-            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
-            context.set_details(
-                f"ACL REFUSED: peer {peer_id!r} has an empty effective allowed-projects set"
-            )
-            return _mesh_gen.core_pb2.WriteMemoryResponse(
-                written_id="",
-                mode_applied=mode_applied,
-                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            return CompactImportResult(
+                status=CompactImportStatus.REFUSED_ACL,
+                reason=f"ACL REFUSED: peer {peer_id!r} has an empty effective allowed-projects set",
             )
         if not project:
             logger.info(
                 "mesh_server: WriteMemory refused — record fed_id=%s carries no project tag",
                 compact.id,
             )
-            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
-            context.set_details("ACL REFUSED: record carries no project: tag — cannot be ACL'd")
-            return _mesh_gen.core_pb2.WriteMemoryResponse(
-                written_id="",
-                mode_applied=mode_applied,
-                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            return CompactImportResult(
+                status=CompactImportStatus.REFUSED_ACL,
+                reason="ACL REFUSED: record carries no project: tag — cannot be ACL'd",
             )
         if project not in allowed_projects:
             logger.info(
@@ -982,14 +960,9 @@ class MnemosCoreServicer:
                 project,
                 peer_id,
             )
-            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
-            context.set_details(
-                f"ACL REFUSED: project {project!r} not allowed for peer {peer_id!r}"
-            )
-            return _mesh_gen.core_pb2.WriteMemoryResponse(
-                written_id="",
-                mode_applied=mode_applied,
-                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            return CompactImportResult(
+                status=CompactImportStatus.REFUSED_ACL,
+                reason=f"ACL REFUSED: project {project!r} not allowed for peer {peer_id!r}",
             )
         # #359 idempotent import — duplicate gate BEFORE moderation and
         # create. The mesh replays one-shot pulls (mnemos-mesh #34);
@@ -1015,10 +988,9 @@ class MnemosCoreServicer:
                 duplicate.id,
                 compact.id,
             )
-            return _mesh_gen.core_pb2.WriteMemoryResponse(
+            return CompactImportResult(
+                status=CompactImportStatus.DUPLICATE,
                 written_id=duplicate.id,
-                mode_applied=mode_applied,
-                trigger_code=_trigger_code_to_proto(TriggerCode.ALREADY_EXHAUSTED),
             )
         # mnemos's own moderation on the compact summary (#86 import
         # validation). The peer already moderated, but mnemos re-checks
@@ -1031,10 +1003,9 @@ class MnemosCoreServicer:
         )
         if mod_result.verdict == ModerationVerdict.REFUSE:
             logger.info("mesh_server: WriteMemory refused — moderation REFUSE")
-            return _mesh_gen.core_pb2.WriteMemoryResponse(
-                written_id="",
-                mode_applied=mode_applied,
-                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            return CompactImportResult(
+                status=CompactImportStatus.REFUSED_MODERATION,
+                reason="moderation REFUSE",
             )
         content = mod_result.sanitized_content or compact.summary
         # Persist. MemoryManager.add runs the Layer 1 secrets scanner.
@@ -1064,8 +1035,110 @@ class MnemosCoreServicer:
             compact.id,
             project,
         )
-        return _mesh_gen.core_pb2.WriteMemoryResponse(
+        return CompactImportResult(
+            status=CompactImportStatus.WRITTEN,
             written_id=memory.id,
+        )
+
+    def WriteMemory(  # noqa: N802 -- gRPC servicer override; name dictated by generated core_pb2_grpc.MnemosCoreServicer
+        self,
+        request: Any,
+        context: grpc.ServicerContext[Any, Any],
+    ) -> Any:
+        """Import a :class:`CompactRecord` from a peer into vesmaro.
+
+        Steps (contract §3.1, #86 import validation, #359 idempotency):
+
+        1. Validate the request: ``import_mode`` must be MERGE or
+           RESTORE; RESTORE requires ``confirm=True`` (hard gate).
+        2. Resolve the peer from gRPC metadata (single-peer fallback for
+           tests) and enforce the W2.5 TLS client-cert pin.
+        3. Delegate to :meth:`import_compact_record` — the shared
+           in-process import path (ACL gate → #359 duplicate gate →
+           moderation → :meth:`MemoryManager.add`); the result maps
+           onto the response trigger code (``EXHAUSTIVE`` on clean
+           merge, ``ALREADY_EXHAUSTED`` on a duplicate, ``REFUSED`` on
+           an ACL or moderation refusal, with ``PERMISSION_DENIED`` set
+           for ACL refusals).
+        """
+        import_mode = int(request.import_mode)
+        # Validate import_mode (UNSPECIFIED is rejected).
+        if import_mode == int(_mesh_gen.core_pb2.ImportMode.IMPORT_MODE_UNSPECIFIED):
+            logger.info("mesh_server: WriteMemory refused — UNSPECIFIED import_mode")
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("import_mode must be MERGE or RESTORE")
+            return _mesh_gen.core_pb2.WriteMemoryResponse(
+                written_id="",
+                mode_applied=_mesh_gen.core_pb2.ImportMode.IMPORT_MODE_UNSPECIFIED,
+                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            )
+        # RESTORE hard gate (mnemos-operations §1).
+        if import_mode == int(_mesh_gen.core_pb2.ImportMode.RESTORE) and not bool(request.confirm):
+            logger.warning("mesh_server: WriteMemory refused — RESTORE without confirm=True")
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details("RESTORE requires confirm=True (hard gate)")
+            return _mesh_gen.core_pb2.WriteMemoryResponse(
+                written_id="",
+                mode_applied=_mesh_gen.core_pb2.ImportMode.MERGE,
+                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            )
+        # Downgrade RESTORE→MERGE on the mesh↔mnemos path: the mesh is
+        # transport, not an operator disaster-recovery tool. The applied
+        # mode is recorded in the response so the mesh surfaces it to
+        # the operator.
+        mode_applied = _mesh_gen.core_pb2.ImportMode.MERGE
+        if import_mode == int(_mesh_gen.core_pb2.ImportMode.RESTORE):
+            logger.info("mesh_server: downgrading RESTORE→MERGE on mesh↔mnemos path")
+
+        pb_record = request.record
+        compact = _compact_from_proto(pb_record)
+        # ACL: the caller is the mesh peer, identified via gRPC metadata
+        # in production. For the single-peer unit-test path we fall back
+        # to the only configured peer (same as ListMemories). The record's
+        # ``source_agent`` is the *origin* agent on the remote mnemos — it
+        # is NOT a federation peer and must not be used as the ACL identity.
+        peer_id = self._peer_id_from_context(context) or self._single_peer_id()
+        if peer_id is None:
+            logger.info("mesh_server: WriteMemory refused — no peer identity")
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("no peer identity and not exactly one peer configured")
+            return _mesh_gen.core_pb2.WriteMemoryResponse(
+                written_id="",
+                mode_applied=mode_applied,
+                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            )
+        # W2.5 TCP leg: on TLS connections, pin the caller's client-cert
+        # fingerprint to the configured peer (UDS calls skip this).
+        pin_peer = _resolve_peer(self._settings, peer_id)
+        if pin_peer is not None and not self._enforce_tls_client_pin(pin_peer, context):
+            return _mesh_gen.core_pb2.WriteMemoryResponse(
+                written_id="",
+                mode_applied=mode_applied,
+                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            )
+        result = self.import_compact_record(compact, peer_id=peer_id)
+        if result.status is CompactImportStatus.REFUSED_ACL:
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(result.reason)
+            return _mesh_gen.core_pb2.WriteMemoryResponse(
+                written_id="",
+                mode_applied=mode_applied,
+                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            )
+        if result.status is CompactImportStatus.REFUSED_MODERATION:
+            return _mesh_gen.core_pb2.WriteMemoryResponse(
+                written_id="",
+                mode_applied=mode_applied,
+                trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+            )
+        if result.status is CompactImportStatus.DUPLICATE:
+            return _mesh_gen.core_pb2.WriteMemoryResponse(
+                written_id=result.written_id,
+                mode_applied=mode_applied,
+                trigger_code=_trigger_code_to_proto(TriggerCode.ALREADY_EXHAUSTED),
+            )
+        return _mesh_gen.core_pb2.WriteMemoryResponse(
+            written_id=result.written_id,
             mode_applied=mode_applied,
             trigger_code=_trigger_code_to_proto(TriggerCode.EXHAUSTIVE),
         )

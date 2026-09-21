@@ -3434,6 +3434,47 @@ class SQLiteStore:
             )
         return pairs
 
+    def get_index_entries(self, fed_ids: Sequence[str]) -> dict[str, FederationIndexEntry]:
+        """Fetch ``federation_index`` rows by federation id (lazy fetch).
+
+        Point lookup for the S2 lazy-fetch resolution step: given the
+        ``--id`` list the operator asked for, return the mirrored
+        metadata rows keyed by ``id``. Ids with no row are simply
+        absent from the result — the CALLER decides whether a miss is
+        an error (``mnemos fetch`` treats it as one: the command is
+        driven by ids the mirror advertised, so an unknown id means
+        the operator and the index disagree).
+
+        Read-only; no ACL (the index is local mirror state — the
+        serving-side ACL applies when rows are SERVED, the import-side
+        gates when content is fetched).
+        """
+        if not fed_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in fed_ids)
+        conn = self._get_conn()
+        rows = conn.execute(
+            f"SELECT * FROM federation_index WHERE id IN ({placeholders})",
+            list(fed_ids),
+        ).fetchall()
+        return {
+            row["id"]: FederationIndexEntry(
+                id=row["id"],
+                type=row["type"],
+                title=row["title"],
+                tags=json.loads(row["tags"]),
+                project=row["project"],
+                source_agent=row["source_agent"],
+                source_peer=row["source_peer"],
+                origin_peer=row["origin_peer"],
+                content_state=row["content_state"],
+                timestamp=row["timestamp"],
+                schema_version=row["schema_version"],
+                received_at=row["received_at"],
+            )
+            for row in rows
+        }
+
     def index_head(self, projects: Sequence[str] | None = None) -> int:
         """Return the max ``federation_index`` rowid under the projects filter.
 
