@@ -225,8 +225,14 @@ ALLOWED_OPTIONAL_PREFIXES: frozenset[str] = frozenset(
 # strip-list cannot drift from the whitelist it polices.
 POLICY_TAG_PREFIXES: frozenset[str] = frozenset({"applyTo:", "severity:"})
 
-_PROJECT_RE = re.compile(r"^project:[a-z0-9_\-]{1,64}$")
-_AGENT_RE = re.compile(r"^agent:[a-z0-9_\-]{1,64}$")
+# Anchored with ``\Z`` (absolute end), NOT ``$``: a ``$`` anchor also
+# matches just before a trailing newline, so 'project:p1\n' / 'agent:a1\n'
+# passed strict validation (the columnal ``m.project = ?`` lookup never
+# sees the newline — no behavioral coupling, but a newline-carrying slug
+# is unreachable at query time exactly like the task dead-tag, #368).
+# Same anchor discipline as TASK_SLUG_RE / _TASK_RE (Ф1-PREP, #360).
+_PROJECT_RE = re.compile(r"^project:[a-z0-9_\-]{1,64}\Z")
+_AGENT_RE = re.compile(r"^agent:[a-z0-9_\-]{1,64}\Z")
 # ADR-0027 Phase 0 (epic #308): the optional task-scope tag. Same slug
 # alphabet/length as project/agent. Zero or one per record — a record
 # belongs to at most one task scope (see validate_tag_contract docstring
@@ -241,7 +247,7 @@ _TASK_SLUG_PATTERN = r"[a-z0-9_\-]{1,64}"
 # row.tags) can never hit "task:t1\n" (Ф1-PREP, #360 review item 2).
 TASK_SLUG_RE: re.Pattern[str] = re.compile(rf"^{_TASK_SLUG_PATTERN}\Z")
 _TASK_RE = re.compile(rf"^task:{_TASK_SLUG_PATTERN}\Z")
-_VESMARO_RE = re.compile(r"^mnemos:[a-z][a-z0-9\-]*$")
+_VESMARO_RE = re.compile(r"^mnemos:[a-z][a-z0-9\-]*\Z")
 
 
 class TagContractError(ValueError):

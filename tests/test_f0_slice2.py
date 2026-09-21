@@ -36,6 +36,14 @@ composition contract (§2e — governance rows ARE lens-stripped before the
 applyTo partition; symmetric with the contentType mode filter), and the
 graph-edge strict-subset fixture (both edge kinds).
 
+#368 WAVE additions (pre lens default-enablement gate): the signal-#4
+flush-paren + evidence tightening (the dotted-receiver twin of the #3
+rule — "compare node.js (the runtime)" / "e.g (note)" no longer match the
+pattern), the signal-#3 no-space comma residual pinned as documented
+behavior ("options(a, b, or c)"), and the ``\\Z`` anchor sweep across
+``_PROJECT_RE``/``_AGENT_RE``/``_VESMARO_RE`` (newline pins in
+``tests/test_f0_task_scope.py``).
+
 Test embedder: ``_HashEmbedder`` (deterministic hashed bag-of-tokens) —
 same rationale as the slice-1 suite: a MagicMock embedder cannot
 discriminate and would fake the ranking/gate semantics under test.
@@ -79,6 +87,7 @@ from vesmaro.api.main import app as real_app
 from vesmaro.api.main import lifespan
 from vesmaro.config import Settings
 from vesmaro.hooks import dispatch_hook, pre_llm_call
+from vesmaro.lens import _QUERY_CODE_SIGNALS as _LENS_SIGNALS
 from vesmaro.lens import Lens, lens_active, lens_admits, resolve_lens
 from vesmaro.manager import MemoryManager
 from vesmaro.models import (
@@ -217,7 +226,7 @@ class TestLensUnit:
             "check src/vesmaro/manager.py search",
             "rewrite fetch(url) => Result",
             "class SettingsLoader: what fields",
-            "obj.method(x) returns what",
+            "obj.method(x.y) returns what",  # dotted ARG = evidence (#368)
             "what does std::vector hold",
         ],
     )
@@ -246,6 +255,15 @@ class TestLensUnit:
             "see the notes (step-by-step guide)",  # hyphen is not evidence
             "retries happen (50% of runs)",  # percent is not evidence
             "the handler (the server's config)",  # quote/apostrophe neither
+            # #368 item 1 — signal #4 negative pins (the review false-fire
+            # class): a SPACE before the paren is English prose typography
+            # (a parenthetical, not a call), and the old
+            # receiver.identifier\s*\(\) shape admitted it.
+            "e.g (note)",  # THE #368 review typo case
+            "e.g (note the caveat)",  # spaced word-only group, dotted trigger
+            "what does v2.build (the new builder) do",  # spaced prose group
+            "check config.get (the getter)",  # spaced prose group
+            "compare handle_request (the slow path)",  # spaced prose group
         ],
     )
     def test_prose_queries_do_not_activate(self, query: str) -> None:
@@ -254,8 +272,66 @@ class TestLensUnit:
         prose notes about code. The parenthesized entries pin the Ф1-PREP
         signal-#3 tightening: only code-typical content INSIDE the parens
         (comma list, ``=``, underscored/dotted token, operator) activates;
-        empty and word-only groups are prose parentheticals."""
+        empty and word-only groups are prose parentheticals. The spaced
+        entries pin the #368 signal-#4 tightening: the same flush-paren +
+        evidence rule applies to the dotted receiver shape."""
         assert lens_active(Lens.CODE, query=query) is False
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # #368 item 1 — the two VERBATIM review false-fire shapes,
+            # pinned against the signal-#4 pattern itself: after the fix
+            # the shape no longer matches (flush paren + evidence). They
+            # are NOT full-lens negatives — "compare node.js (the
+            # runtime)" still carries a signal-#5 file-path token
+            # ('node.js' reads as ``.js``), which is a pre-existing,
+            # documented lexicon overlap OUTSIDE this item's scope.
+            "compare node.js (the runtime)",
+            "e.g (note)",
+        ],
+    )
+    def test_signal4_pattern_rejects_review_false_fires(self, query: str) -> None:
+        """Unit pin on the hardened signal-#4 regex: no space-gap before
+        ``(``, and the two review prose shapes no longer match it."""
+        assert _LENS_SIGNALS[3].search(query) is None
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # #368 acceptance — genuine code shapes activate (signal #4
+            # where the dotted receiver is the trigger, signal #3 for the
+            # bare-identifier calls; every group carries code evidence).
+            "node.js(fs, cb) callback pattern",
+            "trace handle_request(req, ctx)",
+            "v2.build(cfg=2) fails",
+            "run parse_csv(rows, opts)",
+            "config.get(app_name) returns",
+            "obj.method(x.y) returns what",  # dotted ARG = evidence
+        ],
+    )
+    def test_code_queries_still_activate_after_signal4_tightening(self, query: str) -> None:
+        """The #368 tightening only NARROWS: genuine flush-paren calls
+        with code evidence keep activating (ADR-0027 invariant 6)."""
+        assert lens_active(Lens.CODE, query=query) is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # #368 item 2 — the signal-#3 no-space comma RESIDUAL is
+            # DOCUMENTED behavior (the typographic heuristic: prose
+            # parentheticals take a leading space, so a flush group is
+            # read as a call). Pin it so future hardening cannot silently
+            # regress these shapes.
+            "options(a, b, or c)",
+            "color(red, green, blue)",
+        ],
+    )
+    def test_signal3_no_space_comma_residual_activates(self, query: str) -> None:
+        """Pinned residual: a FLUSH group with a comma list activates even
+        when its content reads as prose words — the leading space is the
+        discriminator, and its absence is code typography."""
+        assert lens_active(Lens.CODE, query=query) is True
 
     def test_admit_identity_when_inactive(self) -> None:
         assert lens_admits(Lens.CODE, query="deploy notes", content_type="prose") is True
