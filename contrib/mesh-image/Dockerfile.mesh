@@ -72,6 +72,12 @@ COPY --from=gencode /gen/ /usr/local/lib/python3.12/federation/gen/python/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
+# Pre-push gate ships in the image so the documented invocation
+# (`podman run --entrypoint python <img> /gate.py`) works without a
+# bind-mount (the file was referenced but never COPYied — live rollout
+# finding 2026-09-21).
+COPY contrib/mesh-image/gate.py /gate.py
+
 # Default directories (/data and /vault are volume mounts at runtime)
 RUN mkdir -p /data /vault
 
