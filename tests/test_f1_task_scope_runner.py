@@ -647,6 +647,108 @@ def test_verify_manifest_rejects_extra_and_missing_keys(
         runner.verify_manifest(stripped)
 
 
+def test_verify_outcomes_accepts_recorded_artifact_and_rejects_drift(
+    collected: tuple[dict, dict], tmp_path: Path
+) -> None:
+    """#382 round-trip: the WRITTEN artifact satisfies the runner's own
+    exact-key contract — record_run on a throwaway dir → read
+    outcomes.json back → verify_outcomes PASSES (the stamped linkage
+    key ``run_id`` is schema-legal exactly once, at the top level only).
+    Negatives: a hand-tampered extra top-level key, a duplicated
+    linkage key deeper in the artifact, and a MISMATCHED run_id each
+    fail loud."""
+    manifest, outcomes = collected
+    run_dir = runner.record_run(manifest, outcomes, tmp_path)
+    on_disk = json.loads((run_dir / "outcomes.json").read_text())
+    assert on_disk["run_id"] == manifest["run_id"]  # stamped exactly once
+    runner.verify_outcomes(on_disk)  # the recorded shape re-verifies
+
+    # the in-memory collect shape still verifies untouched
+    runner.verify_outcomes(outcomes)
+
+    # negative: a hand-tampered EXTRA top-level key still fails
+    with pytest.raises(AssertionError, match="unexpected"):
+        runner.verify_outcomes({**on_disk, "bogus_extra": 1})
+
+    # negative: a run_id nested deeper (stat-scan layer) is NOT linkage —
+    # it is an unexpected key under the exact tuple-key check
+    nested = {
+        **on_disk,
+        "queries": [
+            {**row, "arms": {**row["arms"], "A": {**row["arms"]["A"], "run_id": "x"}}}
+            if row["stratum"] == "t_gold"
+            else row
+            for row in on_disk["queries"]
+        ],
+    }
+    with pytest.raises(AssertionError, match="tuple keys"):
+        runner.verify_outcomes(nested)
+
+    # negative: a MISMATCHED top-level run_id breaks the manifest pairing
+    # (fresh sub-dir — the first recorded run id owns tmp_path's root)
+    with pytest.raises(AssertionError, match="run id mismatch"):
+        runner.record_run(
+            manifest,
+            {**outcomes, "run_id": "f1-task-scope-other"},
+            tmp_path / "second",
+        )
+
+
+def test_discordance_tally_keys_exactly_checked(collected: tuple[dict, dict]) -> None:
+    """Round-2 tightening (PR #386 review P2-1): the discordance tally is
+    the last dict layer with an exact-key check — the two tally keys are
+    derived from the SAME registered comparison pair that names the
+    comparison itself (_COMPARISONS as the single source of truth), so a
+    tamper renaming a tally key (e.g. ``A_only`` → ``run_id``) fails
+    loud with the comparison named. Positive control: the intact
+    artifact still verifies."""
+    _, outcomes = collected
+    runner.verify_outcomes(outcomes)  # positive control
+    first_stratum, first_comparisons = next(iter(outcomes["discordance"].items()))
+    first_comparison = next(iter(first_comparisons))
+    left, right = first_comparison.split("_vs_")
+
+    # negative: a renamed tally key fails, naming the comparison
+    renamed = {
+        **outcomes,
+        "discordance": {
+            **outcomes["discordance"],
+            first_stratum: {
+                **first_comparisons,
+                first_comparison: {"run_id": 0, f"{right}_only": 0},
+            },
+        },
+    }
+    with pytest.raises(
+        AssertionError, match=rf"discordance tally keys on {first_stratum}/{first_comparison}"
+    ):
+        runner.verify_outcomes(renamed)
+    # and the renamed keys are checked against the derived pair, not
+    # merely count 2: {"run_id", f"{left}_only"} also fails
+    renamed_left = {
+        **outcomes,
+        "discordance": {
+            **outcomes["discordance"],
+            first_stratum: {
+                **first_comparisons,
+                first_comparison: {f"{left}_only": 0, "run_id": 0},
+            },
+        },
+    }
+    with pytest.raises(AssertionError, match=f"{first_stratum}/{first_comparison}"):
+        runner.verify_outcomes(renamed_left)
+
+    # single source of truth: the expected tally pair for every
+    # registered comparison is exactly {left}_only / {right}_only of its
+    # own name — spot-check the derivation against _COMPARISONS directly
+    for stratum, comps in runner._COMPARISONS.items():
+        for first, second in comps:
+            assert set(outcomes["discordance"][stratum][f"{first}_vs_{second}"]) == {
+                f"{first}_only",
+                f"{second}_only",
+            }
+
+
 def test_stat_key_ban_catches_bare_spellings(collected: tuple[dict, dict]) -> None:
     """The extended _STAT_KEY_RE fires on the bare statistic spellings
     (p / pval / power / p-value / ci95 / ci_95) inside the manifest
