@@ -871,9 +871,11 @@ def verify_outcomes(outcomes: dict[str, Any]) -> None:
     Accepts BOTH shapes — the collect-only in-memory dict (exactly the
     base keys) and the recorded on-disk copy (base keys + the stamped
     linkage key ``run_id``, optional exactly once, and only here: a
-    ``run_id`` inside any deeper structure still trips the exact-key
-    checks below). Re-verifying a written artifact therefore passes
-    under the same contract that built it (#382)."""
+    ``run_id`` anywhere deeper in the artifact still trips the exact-key
+    checks below — per-row keys, per-arm tuple keys and, since the
+    round-2 tightening (#386 review), the discordance tally keys are
+    all exactly-checked too). Re-verifying a written artifact therefore
+    passes under the same contract that built it (#382)."""
     linkage = set(outcomes) & _OUTCOME_LINKAGE_KEYS
     if outcomes.get("run_id") is not None and not (
         isinstance(outcomes["run_id"], str) and outcomes["run_id"]
@@ -947,7 +949,18 @@ def verify_outcomes(outcomes: dict[str, Any]) -> None:
     for stratum, comparisons in expected_disc.items():
         if set(outcomes["discordance"][stratum]) != comparisons:
             raise AssertionError(f"discordance comparisons drifted on {stratum}")
-        for tally in outcomes["discordance"][stratum].values():
+        for comparison, tally in outcomes["discordance"][stratum].items():
+            # Exact tally keys, derived from the same registered pair as
+            # the comparison name itself — single source of truth
+            # (_COMPARISONS). Renaming a tally key (e.g. "A_only" →
+            # "run_id") must fail exactly like any other schema layer.
+            left, right = comparison.split("_vs_")
+            expected_tally_keys = {f"{left}_only", f"{right}_only"}
+            if set(tally) != expected_tally_keys:
+                raise AssertionError(
+                    f"discordance tally keys on {stratum}/{comparison} must be exactly "
+                    f"{sorted(expected_tally_keys)} — got {sorted(tally)}"
+                )
             if len(tally) != 2 or not all(isinstance(v, int) for v in tally.values()):
                 raise AssertionError("discordance tallies must be exactly two integer counts")
 

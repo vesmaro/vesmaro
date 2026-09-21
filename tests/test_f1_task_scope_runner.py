@@ -694,6 +694,61 @@ def test_verify_outcomes_accepts_recorded_artifact_and_rejects_drift(
         )
 
 
+def test_discordance_tally_keys_exactly_checked(collected: tuple[dict, dict]) -> None:
+    """Round-2 tightening (PR #386 review P2-1): the discordance tally is
+    the last dict layer with an exact-key check — the two tally keys are
+    derived from the SAME registered comparison pair that names the
+    comparison itself (_COMPARISONS as the single source of truth), so a
+    tamper renaming a tally key (e.g. ``A_only`` → ``run_id``) fails
+    loud with the comparison named. Positive control: the intact
+    artifact still verifies."""
+    _, outcomes = collected
+    runner.verify_outcomes(outcomes)  # positive control
+    first_stratum, first_comparisons = next(iter(outcomes["discordance"].items()))
+    first_comparison = next(iter(first_comparisons))
+    left, right = first_comparison.split("_vs_")
+
+    # negative: a renamed tally key fails, naming the comparison
+    renamed = {
+        **outcomes,
+        "discordance": {
+            **outcomes["discordance"],
+            first_stratum: {
+                **first_comparisons,
+                first_comparison: {"run_id": 0, f"{right}_only": 0},
+            },
+        },
+    }
+    with pytest.raises(
+        AssertionError, match=rf"discordance tally keys on {first_stratum}/{first_comparison}"
+    ):
+        runner.verify_outcomes(renamed)
+    # and the renamed keys are checked against the derived pair, not
+    # merely count 2: {"run_id", f"{left}_only"} also fails
+    renamed_left = {
+        **outcomes,
+        "discordance": {
+            **outcomes["discordance"],
+            first_stratum: {
+                **first_comparisons,
+                first_comparison: {f"{left}_only": 0, "run_id": 0},
+            },
+        },
+    }
+    with pytest.raises(AssertionError, match=f"{first_stratum}/{first_comparison}"):
+        runner.verify_outcomes(renamed_left)
+
+    # single source of truth: the expected tally pair for every
+    # registered comparison is exactly {left}_only / {right}_only of its
+    # own name — spot-check the derivation against _COMPARISONS directly
+    for stratum, comps in runner._COMPARISONS.items():
+        for first, second in comps:
+            assert set(outcomes["discordance"][stratum][f"{first}_vs_{second}"]) == {
+                f"{first}_only",
+                f"{second}_only",
+            }
+
+
 def test_stat_key_ban_catches_bare_spellings(collected: tuple[dict, dict]) -> None:
     """The extended _STAT_KEY_RE fires on the bare statistic spellings
     (p / pval / power / p-value / ci95 / ci_95) inside the manifest
