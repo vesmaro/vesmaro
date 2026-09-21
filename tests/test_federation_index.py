@@ -808,6 +808,38 @@ class TestBuildMetadataSyncResponse:
         assert list(resp.records) == []
         assert resp.latest_rev == 999  # head([scope-b]) == 0 < 999 → no rewind
 
+    def test_issue49_empty_scope_parks_at_peer_head_not_scope_head(
+        self, tmp_path: Path, manager: MemoryManager
+    ) -> None:
+        """mnemos-mesh#49 regression (live poller finding): the CLI polls
+        PER SCOPE and folds latest_rev into ONE MIN watermark. With the
+        #46 fix parking at the SCOPE head, a scope with NO rows at all
+        (head 0) pinned the aggregate to 0 forever — the data scope was
+        re-delivered on every tick (duplicates, deduped by LWW; no loss).
+
+        The #49 fix: an empty page parks at the PEER head (the whole
+        allowed set), which is ≥ every scope head this peer can see —
+        so an all-empty scope can no longer pin the aggregate, and no
+        allowed row exists beyond the peer head (skip-nothing proof).
+        """
+        manager.sqlite.upsert_index_entries(
+            [_entry("fed:r:a1", project="scope-a"), _entry("fed:r:a2", project="scope-a")]
+        )
+        peer_head = manager.sqlite.index_head(projects=["scope-a", "scope-b"])
+        assert peer_head > 0
+        # scope-b has NO rows at all: its scope head is 0, but the peer
+        # head is beyond it. The empty page must return the PEER head —
+        # the scope head (0) would pin the CLI's MIN aggregate.
+        assert manager.sqlite.index_head(projects=["scope-b"]) == 0
+        servicer = MnemosCoreServicer(
+            manager, settings=_settings(tmp_path, allowed=["scope-a", "scope-b"])
+        )
+        resp = servicer.build_metadata_sync_response(
+            self._request(project_scope="scope-b", since_rev=0)
+        )
+        assert list(resp.records) == [] and not resp.has_more
+        assert resp.latest_rev == peer_head  # not 0 (scope head), not the echo
+
     def test_watermark_pagination_partitions_corpus(
         self, tmp_path: Path, manager: MemoryManager
     ) -> None:

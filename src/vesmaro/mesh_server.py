@@ -1247,17 +1247,18 @@ class MnemosCoreServicer:
                 continue
             records.append(_metadata_to_proto(entry))
         if not rows:
-            # mnemos-mesh#46: an EMPTY page parks the watermark at the
-            # scope HEAD (max rowid under the effective-projects filter)
-            # instead of echoing since_rev — nothing undelivered exists
-            # beyond the head, and a MIN-aggregating poller (the mesh
-            # CLI folds the per-scope latest_rev into one watermark)
-            # otherwise sticks at the old checkpoint and re-delivers the
-            # data scope every tick. max() keeps the never-regress
+            # mnemos-mesh#46/#49: an EMPTY page parks the watermark at
+            # the PEER head — max rowid over the peer's whole allowed
+            # set — not the scope-filtered head. The mesh CLI folds
+            # per-scope latest_rev into one MIN watermark, so a scoped
+            # head of 0 on an empty scope pins the aggregate to 0
+            # forever (live poller finding #49). Nothing this peer may
+            # see exists beyond the allowed-set head, so parking there
+            # skips nothing for ANY scope; max() keeps the never-regress
             # invariant when the head sits below a watermark minted over
             # a wider scope.
             latest_rev = max(
-                since_rev, self._manager.sqlite.index_head(projects=effective_projects)
+                since_rev, self._manager.sqlite.index_head(projects=list(allowed_projects))
             )
         logger.info(
             "mesh_server: index sync served entries=%d peer=%s since_rev=%d "
