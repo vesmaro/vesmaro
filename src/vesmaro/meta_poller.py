@@ -71,6 +71,10 @@ META_POLL_PAGE_TIMEOUT_S: Final[float] = 30.0
 #: stderr tail kept in the error surface — diagnostics, not a log sink.
 _STDERR_TAIL_CHARS: Final[int] = 300
 
+#: stdout tail kept when JSON-envelope extraction fails (noise strategy
+#: (c) below) — shows the operator WHAT was on the wire, not a log sink.
+_STDOUT_TAIL_CHARS: Final[int] = 300
+
 
 class MetaPollError(Exception):
     """Typed poller failure for one peer-page fetch/parse.
@@ -137,6 +141,67 @@ def _chunks(seq: list[FederationIndexEntry], size: int) -> Sequence[Sequence[Fed
     return [seq[i : i + size] for i in range(0, len(seq), size)]
 
 
+def _validate_envelope(peer_id: str, payload: Any) -> SyncMetaPage:
+    """Validate a parsed JSON payload as a :class:`SyncMetaPage`.
+
+    Raises :class:`MetaPollError` naming the contract violation — a
+    syntactically valid JSON stdout that is not an envelope is a peer
+    bug, reported as honestly as broken JSON.
+    """
+    try:
+        return SyncMetaPage.model_validate(payload)
+    except ValidationError as exc:
+        raise MetaPollError(peer_id, f"sync-meta envelope violates contract: {exc}") from exc
+
+
+def _parse_sync_meta_stdout(peer_id: str, stdout: bytes) -> SyncMetaPage:
+    """Parse the ``sync-meta`` JSON envelope out of possibly noisy stdout.
+
+    The mesh track moved its logs to stderr, but the poller must SURVIVE
+    a noisy stdout (an older mesh build, a misconfigured CLI, a plugin
+    printing to fd 1). Strategies, in order:
+
+    a. the whole stdout parses as JSON — the clean-wire case;
+    b. otherwise find the FIRST line starting with ``{`` and accumulate
+       from it to EOF — the envelope is ONE object printed LAST, so any
+       chatter before that line is skipped;
+    c. neither parses → an honest :class:`MetaPollError` carrying the
+       stdout TAIL, so ``last_error`` shows what was actually on the
+       wire (trailing noise AFTER the envelope is not tolerated: the
+       contract says the envelope ends the output).
+
+    Decoding uses ``errors="replace"``: replacement characters inside
+    noise lines are harmless to (b); if the envelope itself is
+    undecodable the JSON parse fails and surfaces as (c) — never a
+    silent skip.
+    """
+    text = stdout.decode("utf-8", errors="replace")
+    # (a) clean wire: the whole stdout is the envelope.
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        return _validate_envelope(peer_id, payload)
+    # (b) prefix noise: the envelope opens at the first "{"-prefixed
+    # line and runs to EOF (one object, printed last).
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.startswith("{")), None)
+    if start is not None:
+        try:
+            payload = json.loads("\n".join(lines[start:]))
+        except json.JSONDecodeError:
+            pass
+        else:
+            return _validate_envelope(peer_id, payload)
+    # (c) honest error with the tail of what was on the wire.
+    tail = text[-_STDOUT_TAIL_CHARS:].strip()
+    raise MetaPollError(
+        peer_id,
+        f"sync-meta stdout is not valid JSON (no envelope found): {tail or 'empty stdout'!r}",
+    )
+
+
 class MetaPoller:
     """Per-process federation metadata poller (S2 phase 2).
 
@@ -162,6 +227,8 @@ class MetaPoller:
         self._title_blocklist = list(federation.index_title_blocklist)
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        #: The in-flight mesh CLI child, if any (see :meth:`stop`).
+        self._inflight: asyncio.subprocess.Process | None = None
 
     # ── Peer resolution ───────────────────────────────────────────────────
 
@@ -203,7 +270,14 @@ class MetaPoller:
         )
 
     async def stop(self, grace_s: float = 5.0) -> None:
-        """Signal the loop to stop and await it (bounded by ``grace_s``)."""
+        """Signal the loop to stop and await it (bounded by ``grace_s``).
+
+        On grace expiry the loop task is cancelled AND the in-flight
+        mesh CLI child is killed FIRST (review thread: a cancel
+        delivered mid-``communicate()`` aborts the pipe readers but does
+        NOT stop the subprocess — without the kill the child would run
+        on until its own 30s page timeout, wedging shutdown).
+        """
         self._stop.set()
         task = self._task
         if task is None:
@@ -211,10 +285,26 @@ class MetaPoller:
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=grace_s)
         except TimeoutError:
+            self._kill_inflight()
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._task = None
+
+    def _kill_inflight(self) -> None:
+        """Kill the in-flight mesh CLI child, if one exists (best-effort).
+
+        Idempotent and race-safe: a child that already exited (or was
+        never spawned) is a no-op; ``ProcessLookupError`` from a
+        concurrent reap is suppressed.
+        """
+        proc = self._inflight
+        self._inflight = None
+        if proc is None or proc.returncode is not None:
+            return
+        logger.info("meta poller: killing in-flight mesh CLI child pid=%s on stop", proc.pid)
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
 
     async def run(self) -> None:
         """The background loop: tick, then wait the interval (or stop)."""
@@ -360,6 +450,9 @@ class MetaPoller:
         except OSError as exc:
             raise MetaPollError(peer_id, f"cannot execute mesh bin {argv[0]!r}: {exc}") from exc
         try:
+            # Track the child so stop() can kill it on grace-cancel (a
+            # cancelled communicate() orphans a live subprocess).
+            self._inflight = proc
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=META_POLL_PAGE_TIMEOUT_S
             )
@@ -369,19 +462,14 @@ class MetaPoller:
             raise MetaPollError(
                 peer_id, f"sync-meta timed out after {META_POLL_PAGE_TIMEOUT_S:.0f}s"
             ) from exc
+        finally:
+            self._inflight = None
         if proc.returncode != 0:
             tail = stderr.decode("utf-8", errors="replace")[-_STDERR_TAIL_CHARS:].strip()
             raise MetaPollError(
                 peer_id, f"sync-meta exited {proc.returncode}: {tail or 'no stderr'}"
             )
-        try:
-            payload = json.loads(stdout.decode("utf-8", errors="strict"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise MetaPollError(peer_id, f"sync-meta stdout is not valid JSON: {exc}") from exc
-        try:
-            return SyncMetaPage.model_validate(payload)
-        except ValidationError as exc:
-            raise MetaPollError(peer_id, f"sync-meta envelope violates contract: {exc}") from exc
+        return _parse_sync_meta_stdout(peer_id, stdout)
 
     # ── Record parsing ────────────────────────────────────────────────────
 

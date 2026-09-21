@@ -46,9 +46,12 @@ from vesmaro.manager import MemoryManager
 from vesmaro.meta_poller import (
     META_POLL_BATCH,
     META_POLL_MAX_PAGES,
+    META_POLL_PAGE_TIMEOUT_S,
     MetaPoller,
+    MetaPollError,
     PeerPollResult,
     SyncMetaPage,
+    _parse_sync_meta_stdout,
 )
 from vesmaro.storage.sqlite_store import SQLiteStore
 
@@ -58,9 +61,14 @@ runner = CliRunner()
 #: REAL subprocess. Behaviour per peer is driven by the JSON state file
 #: (env ``MNEMOS_TEST_MESH_STATE``): ``pages`` (consumed one per call),
 #: ``loop_page`` (same page forever — cap tests), ``fail``/``fail_code``
-#: (non-zero exit + stderr), ``bad_json`` (garbage stdout), ``sleep_s``
-#: (timeout tests). Every invocation records its argv into ``calls``
-#: and the ``--since`` value into ``seen_since`` for assertions.
+#: (non-zero exit + stderr), ``bad_json`` (garbage stdout — a string is
+#: printed verbatim so tests can shape the garbage, e.g. a broken
+#: ``{``-opening fragment), ``noise`` (N INFO lines printed to STDOUT
+#: before the page JSON — the noisy-stdout hardening), ``sleep_s``
+#: (timeout tests; the double records its pid into ``pids`` BEFORE
+#: sleeping so tests can assert the child's fate). Every invocation
+#: records its argv into ``calls`` and the ``--since`` value into
+#: ``seen_since`` for assertions.
 FAKE_MESH_CLI = '''#!/usr/bin/env python3
 """Script double for `mnemos-mesh sync-meta` (test fixture)."""
 import json
@@ -85,12 +93,19 @@ def main() -> int:
             json.dump(state, f)
         sys.stderr.write(str(spec["fail"]))
         return int(spec.get("fail_code", 3))
+    # Noisy stdout (hardening tests): INFO chatter BEFORE the envelope.
+    for i in range(int(spec.get("noise") or 0)):
+        sys.stdout.write(f"INFO 2026-09-21T10:00:00Z mesh leg chatter line {i}\\n")
     if spec.get("bad_json"):
         with open(state_path, "w") as f:
             json.dump(state, f)
-        sys.stdout.write("this is not json")
+        bad = spec["bad_json"]
+        sys.stdout.write(bad if isinstance(bad, str) else "this is not json")
         return 0
     if spec.get("sleep_s"):
+        state.setdefault("pids", []).append(os.getpid())
+        with open(state_path, "w") as f:
+            json.dump(state, f)
         time.sleep(float(spec["sleep_s"]))
 
     if "loop_page" in spec:
@@ -302,6 +317,54 @@ class TestSyncMetaPage:
         assert invalid == 1 and entries == []
 
 
+class TestEnvelopeExtraction:
+    """Noise-hardening of :func:`meta_poller._parse_sync_meta_stdout`.
+
+    The poller must survive a noisy stdout even though the mesh track
+    moved its logs to stderr: (a) whole-stdout JSON, (b) first ``{``-
+    opening line accumulated to EOF, (c) honest error with the tail.
+    """
+
+    def test_strategy_a_whole_stdout_parses(self) -> None:
+        page = _parse_sync_meta_stdout("peer-a", b'{"records": [], "latest_rev": 3}')
+        assert page.latest_rev == 3 and not page.has_more
+
+    def test_strategy_b_prefix_noise_envelope_last(self) -> None:
+        stdout = (
+            b"INFO 2026-09-21T10:00:00Z chatter line 0\n"
+            b"INFO 2026-09-21T10:00:00Z chatter line 1\n"
+            b"INFO 2026-09-21T10:00:00Z chatter line 2\n"
+            b'{"records": [], "latest_rev": 9, "has_more": false}\n'
+        )
+        page = _parse_sync_meta_stdout("peer-a", stdout)
+        assert page.latest_rev == 9 and page.records == []
+
+    def test_strategy_c_no_brace_line_is_error_with_tail(self) -> None:
+        with pytest.raises(MetaPollError, match="not valid JSON") as excinfo:
+            _parse_sync_meta_stdout("peer-a", b"INFO line\nstill not json")
+        assert "still not json" in str(excinfo.value)  # the tail is surfaced
+
+    def test_trailing_noise_after_envelope_is_rejected(self) -> None:
+        # The envelope must END the output — chatter after it means the
+        # contract is broken; report, never guess.
+        stdout = b'{"records": [], "latest_rev": 1}\nINFO trailing chatter'
+        with pytest.raises(MetaPollError, match="not valid JSON"):
+            _parse_sync_meta_stdout("peer-a", stdout)
+
+    def test_broken_brace_fragment_is_error_with_tail(self) -> None:
+        with pytest.raises(MetaPollError, match="not valid JSON") as excinfo:
+            _parse_sync_meta_stdout("peer-a", b'INFO noise\n{"records": [')
+        assert '{"records": [' in str(excinfo.value)
+
+    def test_valid_json_wrong_shape_is_contract_error(self) -> None:
+        with pytest.raises(MetaPollError, match="violates contract"):
+            _parse_sync_meta_stdout("peer-a", b"[1, 2, 3]")
+
+    def test_undecodable_bytes_surface_as_error_not_silence(self) -> None:
+        with pytest.raises(MetaPollError):
+            _parse_sync_meta_stdout("peer-a", b"\xff\xfe garbage")
+
+
 # ── Store watermark ───────────────────────────────────────────────────────────
 
 
@@ -467,6 +530,31 @@ class TestPollPeer:
         assert result.error is not None and "not valid JSON" in result.error
         assert store.get_poll_state("peer-a").last_error
 
+    def test_noisy_stdout_envelope_still_extracted(
+        self, store: SQLiteStore, mesh: MeshDouble
+    ) -> None:
+        """3 INFO lines printed to stdout BEFORE the JSON (a CLI that
+        missed the logs-to-stderr fix): the poller extracts the envelope
+        (strategy b) and the page imports normally."""
+        mesh.set_peer("peer-a", {"noise": 3, "pages": [_page([_record(1)], latest_rev=7)]})
+        result = run(MetaPoller(store, make_federation(mesh)).poll_peer("peer-a"))
+        assert result.ok and result.fetched == 1 and result.accepted == 1
+        assert result.latest_rev == 7
+        assert store.get_poll_state("peer-a").since_rev == 7
+        assert [e.id for e, _ in store.list_index(limit=10)] == ["fed:agent:0001"]
+
+    def test_noisy_stdout_broken_json_is_honest_error(
+        self, store: SQLiteStore, mesh: MeshDouble
+    ) -> None:
+        """Noise + a broken ``{``-opening JSON fragment: extraction (b)
+        fails, the error is honest and carries the stdout tail."""
+        mesh.set_peer("peer-a", {"noise": 3, "bad_json": '{"records": ['})
+        result = run(MetaPoller(store, make_federation(mesh)).poll_peer("peer-a"))
+        assert result.error is not None and "not valid JSON" in result.error
+        assert '{"records": [' in result.error  # the tail is in last_error
+        assert store.get_poll_state("peer-a").last_error == result.error
+        assert store.get_poll_state("peer-a").since_rev == 0  # watermark untouched
+
     def test_missing_binary_is_honest_error(self, store: SQLiteStore, tmp_path: Path) -> None:
         federation = FederationConfig(
             peers={"peer-a": PeerConfig(bearer_token_env="X")},
@@ -549,6 +637,52 @@ class TestTickLoop:
             assert not poller.running
 
         run(scenario())
+
+    def test_stop_grace_cancel_kills_inflight_child(
+        self, store: SQLiteStore, mesh: MeshDouble
+    ) -> None:
+        """Review thread: a stop() whose grace expires MID-``communicate()``
+        must KILL the mesh CLI child, not merely cancel the await — a
+        cancelled ``communicate()`` tears down the pipe readers but
+        leaves the subprocess running until its own 30s page timeout.
+
+        The double sleeps 60s and records its pid before sleeping, so
+        the test observes the child's fate directly.
+        """
+        mesh.set_peer("peer-a", {"sleep_s": 60, "pages": []})
+        poller = MetaPoller(store, make_federation(mesh))
+
+        async def scenario() -> tuple[int, float] | None:
+            poller.start()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5
+            pid: int | None = None
+            while loop.time() < deadline:
+                pids = mesh.reload().get("pids", [])
+                if pids:
+                    pid = pids[-1]
+                    break
+                await asyncio.sleep(0.05)
+            assert pid is not None, "mesh double never recorded its pid (child never spawned?)"
+            t0 = loop.time()
+            await poller.stop(grace_s=0.3)
+            elapsed = loop.time() - t0
+            assert elapsed < META_POLL_PAGE_TIMEOUT_S  # did not ride out the page timeout
+            assert not poller.running
+            # Give the loop a moment to reap the killed child (SIGCHLD).
+            for _ in range(30):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return pid, elapsed  # dead AND reaped
+                await asyncio.sleep(0.1)
+            return pid, elapsed
+
+        outcome = run(scenario())
+        assert outcome is not None
+        pid, _elapsed = outcome
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)  # the child is gone — not orphaned for 60s
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
