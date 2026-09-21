@@ -824,8 +824,16 @@ class TestFetchCLI:
         cfg = _cli_config(tmp_path, mesh)
         result = runner.invoke(
             app,
-            ["fetch", "--id", "fed:agent-x:gone1", "--id", "fed:agent-x:gone2",
-             "--config", str(cfg), "--yes"],
+            [
+                "fetch",
+                "--id",
+                "fed:agent-x:gone1",
+                "--id",
+                "fed:agent-x:gone2",
+                "--config",
+                str(cfg),
+                "--yes",
+            ],
         )
         assert result.exit_code == 0, result.output
         assert "nothing to fetch" not in result.output
