@@ -55,6 +55,21 @@ class IndexUpsertStats:
     stale: int
 
 
+@dataclass(frozen=True, slots=True)
+class PollStateRow:
+    """One ``federation_poll_state`` row (S2 phase 2 poller watermark).
+
+    ``since_rev`` is the peer's own rowid-space watermark (its
+    SyncMetadata ``latest_rev`` echoes); ``last_ok_at`` /
+    ``last_error`` are the loop-health telemetry the operator reads.
+    """
+
+    peer_id: str
+    since_rev: int
+    last_ok_at: str
+    last_error: str
+
+
 # ADR-0018 P1-b (m2) — FTS5 snippet highlight markers used by
 # ``ccr_search``. Module-level so the issuance-side scanner
 # (``MemoryManager.retrieve_content``) strips EXACTLY these markers
@@ -977,6 +992,21 @@ CREATE TABLE IF NOT EXISTS federation_index (
 -- without a table scan.
 CREATE INDEX IF NOT EXISTS idx_federation_index_origin_timestamp
     ON federation_index(origin_peer, timestamp);
+
+-- S2 phase 2 meta-poller watermark state (ADR-0021 Q10.2 poll-first).
+-- One row per polled peer: ``since_rev`` is the peer's OWN rowid-space
+-- watermark echoed by its SyncMetadata pages (latest_rev) — the next
+-- poll sends it as ``--since`` so a restart resumes exactly after the
+-- last consumed row. ``last_ok_at`` / ``last_error`` are operator
+-- telemetry for "is the poll loop healthy". Additive CREATE IF NOT
+-- EXISTS: pre-phase-2 DBs gain the table on first connect, no data
+-- migration (the poller starts from rev 0 when no row exists).
+CREATE TABLE IF NOT EXISTS federation_poll_state (
+    peer_id    TEXT PRIMARY KEY,
+    since_rev  INTEGER NOT NULL DEFAULT 0,
+    last_ok_at TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT ''
+);
 """
     + _EDGE_STATS_NO_DELETE_TRIGGER_DDL
     + ";"
@@ -3430,6 +3460,81 @@ class SQLiteStore:
             cur.rowcount,
         )
         return cur.rowcount
+
+    # ── S2 phase 2 poller watermark state ─────────────────────────────────
+
+    #: Cap on the stored ``last_error`` text — subprocess stderr tails can
+    #: be arbitrarily long; the row is telemetry, not a log sink.
+    POLL_STATE_ERROR_MAX_LEN: Final[int] = 512
+
+    def get_poll_state(self, peer_id: str) -> PollStateRow | None:
+        """Read the persisted poll watermark for ``peer_id``.
+
+        Returns ``None`` when the peer has never been polled (the
+        caller starts from rev 0). Read-only; no caches involved.
+        """
+        row = (
+            self._get_conn()
+            .execute(
+                "SELECT peer_id, since_rev, last_ok_at, last_error "
+                "FROM federation_poll_state WHERE peer_id = ?",
+                (peer_id,),
+            )
+            .fetchone()
+        )
+        if row is None:
+            return None
+        return PollStateRow(
+            peer_id=row["peer_id"],
+            since_rev=int(row["since_rev"]),
+            last_ok_at=row["last_ok_at"],
+            last_error=row["last_error"],
+        )
+
+    def mark_poll_ok(self, peer_id: str, since_rev: int) -> None:
+        """Persist a successful poll checkpoint for ``peer_id``.
+
+        Sets the watermark, stamps ``last_ok_at`` (UTC ISO 8601, the
+        repo canon) and CLEARS ``last_error`` — a single success after
+        failures must not leave a stale error on the health surface.
+        Called after every successfully imported page, so a crash
+        mid-peer resumes from the last good page (at-least-once; the
+        idempotent LWW upsert makes replay harmless).
+        """
+        conn = self._get_conn()
+        conn.execute(
+            """
+            INSERT INTO federation_poll_state (peer_id, since_rev, last_ok_at, last_error)
+            VALUES (?, ?, ?, '')
+            ON CONFLICT(peer_id) DO UPDATE SET
+                since_rev = excluded.since_rev,
+                last_ok_at = excluded.last_ok_at,
+                last_error = ''
+            """,
+            (peer_id, int(since_rev), datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+
+    def mark_poll_error(self, peer_id: str, error: str) -> None:
+        """Record a failed poll for ``peer_id`` WITHOUT touching the watermark.
+
+        The watermark only ever advances on success (mark_poll_ok) — a
+        failed page is re-fetched next tick. ``last_ok_at`` is kept as
+        the last known-good timestamp; ``last_error`` is truncated to
+        :data:`POLL_STATE_ERROR_MAX_LEN` so a chatty subprocess cannot
+        grow the row unboundedly.
+        """
+        conn = self._get_conn()
+        conn.execute(
+            """
+            INSERT INTO federation_poll_state (peer_id, since_rev, last_ok_at, last_error)
+            VALUES (?, 0, '', ?)
+            ON CONFLICT(peer_id) DO UPDATE SET
+                last_error = excluded.last_error
+            """,
+            (peer_id, error[: self.POLL_STATE_ERROR_MAX_LEN]),
+        )
+        conn.commit()
 
     # ── CCR cache (P1-4) ──────────────────────────────────────────────────
 

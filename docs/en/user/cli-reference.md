@@ -41,6 +41,7 @@ mnemos [GLOBAL-OPTIONS] SUBCOMMAND [SUBCOMMAND-OPTIONS] [ARGS]
 | [`import`](export-import.md) | Import memories from an export file (dedicated page) |
 | [`logs`](#logs) | View pipeline traces |
 | [`sync`](sync.md) | Federation batch sync export / import (dedicated page) |
+| [`meta-poll`](#meta-poll) | Federation metadata poll: run one poller pass manually (S2 phase 2) |
 | [`scanner`](#scanner) | Background secrets scanner: `run` / `status` |
 
 > The `tags` group also provides `tags normalize` and `tags rename` (bulk prefix rename with dry-run); `migrate tags` is a deprecated alias for `mnemos tags rename --from gcw: --to mnemos: --no-dry-run`.
@@ -517,6 +518,50 @@ mnemos serve --log-file ~/.mnemos/logs/serve.log
 ```
 
 The full HTTP API surface is documented in [http-api.md](http-api.md). The Swagger UI is served at `http://HOST:PORT/docs`.
+
+---
+
+## `meta-poll`
+
+Run one federation metadata poll pass now (S2 phase 2, poll-first metadata sync). This is the same path the background loop runs per tick — executed once, in the foreground, with a per-peer summary — for manual runs and diagnostics.
+
+```text
+mnemos meta-poll [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--peer` | all poll targets | Poll only this peer id (must be a configured `meta_poll` target). |
+| `--config / -c` | — | Path to `config.yaml`. |
+
+Per peer, the command shells out to the mesh CLI (`mnemos-mesh sync-meta --config <mesh.yaml> --peer <id> --json [--since <rev>]`), parses the JSON page, and imports the records in-process through the gated upsert (`upsert_index_entries` with `sender_peer_id`): no-federate tag, title blocklist, origin-mutation guard and LWW conflict resolution all apply. **Metadata-only**: the poll path touches `federation_index` and the poll watermark table, never `memories` or the pipeline. Each successful pass prints a line like:
+
+```text
+✓ peer=mnemos-B fetched=12 accepted=10 rejected_by_gate=1 stale=1 pages=1 latest_rev=47
+```
+
+Exit code is `1` when any polled peer failed (non-zero CLI exit, broken JSON, timeout) — the failure is recorded in `federation_poll_state.last_error` and retried on the next pass; the watermark (`since_rev`) only advances on success.
+
+### Background loop (`federation.meta_poll`)
+
+The background poller runs inside `mnemos serve` as an asyncio task and is **default-off** — a config without the `meta_poll` key parses unchanged and the process behaves bit-for-bit as before (S1 / S2 phase 1).
+
+```yaml
+federation:
+  meta_poll:
+    enabled: true                      # default false — opt-in
+    interval_seconds: 300              # default 300; clamped to [60, 86400]
+    peers: all                         # "all" (every federation.peers key) or an explicit list
+    mesh_config_path: /etc/mnemos/mesh.yaml  # REQUIRED when enabled (passed as --config to the CLI)
+    mesh_bin: mnemos-mesh              # binary name (PATH) or absolute path
+```
+
+Notes:
+
+- `enabled: true` without `mesh_config_path` is a config error (startup fail-fast). An explicit `peers` list referencing an unknown peer id is also a config error — a typo must never become a silently skipped peer.
+- The per-peer watermark is persisted after every successfully imported page, so a restart (or crash) mid-peer resumes exactly after the last consumed row; the next request carries `--since <watermark>`. `has_more: true` pages chain immediately (up to 10 pages per peer per tick).
+- One peer's failure never stops the loop: it is logged at INFO, written to `federation_poll_state.last_error`, and the peer is retried on the next tick (the interval is the backoff).
+- With `runtime.uvicorn_workers > 1` every worker process runs its own poller — imports are idempotent (LWW), so this is redundant fetches, never corruption; `serve` prints a warning.
 
 ---
 
