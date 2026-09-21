@@ -25,8 +25,13 @@ LEDGER_PATH = Path(__file__).resolve().parent / "adjudication_ledger.json"
 STRATUM = f1_corpus.STRATUM_VERSION
 SPEC = "docs/experiments/f1-task-scope.md §3.5, §4.4, §6.6, §9"
 
+#: The canonical JSON type of an adjudication ledger (the on-disk shape
+#: this module loads and saves; the file's own authority — the exact
+#: key set — is re-verified structurally by the runner's schema checks).
+Ledger = dict[str, Any]
 
-def initial_ledger() -> dict[str, Any]:
+
+def initial_ledger() -> Ledger:
     """Bootstrap ledger: every analyzed pair active, zero rejects."""
     analyzed = sorted(q.qid for q in f1_corpus.build_corpus().analyzed_queries())
     return {
@@ -39,24 +44,25 @@ def initial_ledger() -> dict[str, Any]:
     }
 
 
-def load_ledger(path: Path | None = None) -> dict[str, Any]:
+def load_ledger(path: Path | None = None) -> Ledger:
     ledger_path = path if path is not None else LEDGER_PATH
-    return json.loads(ledger_path.read_text())
+    loaded: Ledger = json.loads(ledger_path.read_text())
+    return loaded
 
 
-def save_ledger(ledger: dict[str, Any], path: Path | None = None) -> None:
+def save_ledger(ledger: Ledger, path: Path | None = None) -> None:
     ledger_path = path if path is not None else LEDGER_PATH
     ledger_path.write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n")
 
 
-def ledger_state_hash(ledger: dict[str, Any]) -> str:
+def ledger_state_hash(ledger: Ledger) -> str:
     """sha256 over the canonical ledger state (the manifest coupling)."""
     return hashlib.sha256(
         json.dumps(ledger, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
 
 
-def active_analyzed_queries(ledger: dict[str, Any]) -> tuple[f1_corpus.GoldQuery, ...]:
+def active_analyzed_queries(ledger: Ledger) -> tuple[f1_corpus.GoldQuery, ...]:
     """The analyzed query set under the CURRENT ledger state.
 
     Initial state == the birth-declared analyzed set; after a rejection
@@ -81,7 +87,7 @@ def active_analyzed_queries(ledger: dict[str, Any]) -> tuple[f1_corpus.GoldQuery
     return active
 
 
-def record_rejection(ledger: dict[str, Any], qid: str, replacement_qid: str) -> dict[str, Any]:
+def record_rejection(ledger: Ledger, qid: str, replacement_qid: str) -> Ledger:
     """Reject one analyzed pair, promoting its surplus replacement.
 
     A copy is returned (the caller owns persistence); the replacement
@@ -96,7 +102,7 @@ def record_rejection(ledger: dict[str, Any], qid: str, replacement_qid: str) -> 
         raise ValueError(f"{replacement_qid!r} is not a surplus replacement pair")
     if by_qid[qid].stratum != by_qid[replacement_qid].stratum:
         raise ValueError("replacement must come from the same stratum")
-    new_ledger = json.loads(json.dumps(ledger))  # deep copy
+    new_ledger: Ledger = json.loads(json.dumps(ledger))  # deep copy
     new_ledger["rejects"].append(qid)
     new_ledger["replacements"].append(replacement_qid)
     active_analyzed_queries(new_ledger)  # validates the 192/48/24 shape

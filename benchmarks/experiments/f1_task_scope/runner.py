@@ -54,6 +54,10 @@ What is measured and persisted (F1 §2/§4.3 — NOTHING else):
   read from the artifact data, never re-derived by the analysis wave;
 * discordance tallies for the registered comparisons (T-gold: A/A0,
   A/C, A/B, C/B; X-gold and L-neg: A/A0);
+* the recorded artifact additionally carries the linkage key
+  ``run_id`` (stamped by ``--record``, schema-legal exactly once and
+  equal to the paired manifest's id — the on-disk file re-verifies
+  under the same exact-key contract, #382);
 * NO statistics at run time: no p-values, no CIs, no verdicts, no
   rates — single-look analysis runs once, outside this runner, after
   the recorded run (§6.6). The ban is schema (exact key allowlists +
@@ -709,6 +713,7 @@ def evaluate_invariants(
         "V6": {
             "manifest_verified": True,
             "write_once": "record_run refuses an existing run id (fails loud)",
+            "outcomes_reverified": "the written outcomes.json is re-verified on disk pre-rename",
             "statistics_ban": "no p-values/CIs/verdicts/rates in artifacts (schema-enforced)",
         },
         "store_copy": {
@@ -725,9 +730,15 @@ def evaluate_invariants(
 
 
 #: The exact top-level key set of an outcomes artifact (schema-enforced).
+#: The linkage field ``run_id`` (stamped by ``record_run`` onto the
+#: recorded copy, exactly-once and equal to the paired manifest's id) is
+#: part of the schema, so a WRITTEN artifact re-verifies under the same
+#: exact-key contract as the in-memory dict — "unexpected == missing ==
+#: broken" holds for every recorded file too (#382).
 _OUTCOME_TOP_KEYS: frozenset[str] = frozenset(
     {"spec", "pairing", "strata", "arm_order", "budget", "top_k", "queries", "discordance"}
 )
+_OUTCOME_LINKAGE_KEYS: frozenset[str] = frozenset({"run_id"})
 
 #: The exact per-arm key set of a query tuple.
 _ARM_TUPLE_KEYS: frozenset[str] = frozenset(
@@ -855,9 +866,21 @@ def build_outcomes(
 
 
 def verify_outcomes(outcomes: dict[str, Any]) -> None:
-    """Structural check of an outcomes artifact (fail loud on drift)."""
+    """Structural check of an outcomes artifact (fail loud on drift).
+
+    Accepts BOTH shapes — the collect-only in-memory dict (exactly the
+    base keys) and the recorded on-disk copy (base keys + the stamped
+    linkage key ``run_id``, optional exactly once, and only here: a
+    ``run_id`` inside any deeper structure still trips the exact-key
+    checks below). Re-verifying a written artifact therefore passes
+    under the same contract that built it (#382)."""
+    linkage = set(outcomes) & _OUTCOME_LINKAGE_KEYS
+    if outcomes.get("run_id") is not None and not (
+        isinstance(outcomes["run_id"], str) and outcomes["run_id"]
+    ):
+        raise AssertionError("outcomes run_id, when stamped, must be a non-empty string")
     missing = _OUTCOME_TOP_KEYS - set(outcomes)
-    extra = set(outcomes) - _OUTCOME_TOP_KEYS
+    extra = set(outcomes) - _OUTCOME_TOP_KEYS - linkage
     if missing or extra:
         raise AssertionError(
             f"outcomes top-level keys must be exactly {sorted(_OUTCOME_TOP_KEYS)} — "
@@ -1281,6 +1304,11 @@ def record_run(manifest: dict[str, Any], outcomes: dict[str, Any], runs_dir: Pat
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         recorded = {**outcomes, "run_id": manifest["run_id"]}
         (staging / "outcomes.json").write_text(json.dumps(recorded, indent=2) + "\n")
+        # The WRITTEN artifact must satisfy the runner's own schema (#382):
+        # what lands on disk is exactly what re-verification accepts — a
+        # recorded outcomes.json that would fail its own verify_outcomes
+        # never reaches the write-once directory.
+        verify_outcomes(json.loads((staging / "outcomes.json").read_text()))
         try:
             staging.rename(run_dir)
         except OSError as exc:
