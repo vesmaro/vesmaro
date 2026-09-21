@@ -981,6 +981,101 @@ def serve(
             mesh_server.stop(grace=2.0)
 
 
+# ── fetch (S2 lazy fetch) ─────────────────────────────────────────────────────
+
+
+@app.command(name="fetch")
+def fetch_cmd(
+    record_ids: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--id",
+            help="Federation record id (fed:<agent>:<uuid>); repeat for multiple records.",
+        ),
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Skip the interactive confirmation (required when stdin is not a TTY).",
+        ),
+    ] = False,
+    config: str = ConfigOption,
+) -> None:
+    """Fetch full records from an origin peer (S2 lazy fetch, explicit).
+
+    The index mirror carries metadata only; this command resolves each
+    --id to its origin peer (federation_index), shows the plan, asks
+    for an interactive y/N confirmation (or --yes), pulls the compact
+    records through the mesh CLI, and imports them IN-PROCESS through
+    the same path WriteMemory uses (ACL, duplicate gate, moderation,
+    secrets scanner). Requires federation.fetch.mesh_config_path in the
+    config. Exit code is 1 when any record failed to fetch/import
+    (errors); policy refusals (gated) exit 0 with a warning.
+    """
+    import sys
+
+    from vesmaro.lazy_fetch import (
+        FetchResolutionError,
+        run_fetch,
+    )
+
+    settings = load_settings(config)
+    setup_logging(settings, verbose=_verbose)
+    fed = settings.federation
+    if not record_ids:
+        console.print("[red]✗[/red] no --id given — name at least one federation record id")
+        raise typer.Exit(1)
+    if not fed.fetch.mesh_config_path.strip():
+        console.print(
+            "[red]✗[/red] federation.fetch.mesh_config_path is not set — "
+            "the mesh CLI needs the path to the peer-leg mesh yaml"
+        )
+        raise typer.Exit(1)
+
+    mgr = get_manager(config)
+
+    try:
+        stats = run_fetch(
+            mgr.sqlite,
+            mgr,
+            settings,
+            record_ids,
+            assume_yes=yes,
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            is_tty=sys.stdin.isatty,
+        )
+    except FetchResolutionError as exc:
+        console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    if stats.aborted:
+        # A declined/impossible confirmation is an abort, exit non-zero
+        # (same contract as mnemos-mesh pull — a script must never
+        # mistake an aborted fetch for a done one).
+        raise typer.Exit(1)
+    if not stats.fetched and not stats.imported and not stats.errors:
+        console.print(
+            "[green]✓[/green] nothing to fetch — every id resolved to a skip "
+            "(already local / tombstoned at origin)"
+        )
+        return
+
+    console.print(
+        f"[cyan]summary[/cyan] fetched={stats.fetched} imported={stats.imported} "
+        f"duplicates={stats.duplicates} gated={stats.gated} "
+        f"not_found={stats.not_found} skipped={stats.skipped} errors={stats.errors}"
+    )
+    if stats.gated:
+        console.print(
+            f"[yellow]⚠[/yellow] {stats.gated} record(s) rejected by the import gate "
+            "(ACL/moderation) — fetch otherwise succeeded"
+        )
+    if stats.errors:
+        raise typer.Exit(1)
+
+
 # ── meta-poll (S2 phase 2) ────────────────────────────────────────────────────
 
 

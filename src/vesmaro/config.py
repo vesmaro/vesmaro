@@ -606,6 +606,43 @@ class MetaPollConfig(BaseModel):
         return self
 
 
+class FetchConfig(BaseModel):
+    """S2 lazy-fetch configuration (ADR-0021 Q10.3 chairman ruling).
+
+    Lazy fetch is the EXPLICIT, operator-confirmed content fetch: the
+    index mirror (``federation_index``, populated by the meta-poller)
+    carries metadata-only rows; ``mnemos fetch --id <fed-id>`` resolves
+    a row's origin peer and pulls the full :class:`CompactRecord` from
+    it through the mesh CLI
+
+        <mesh_bin> fetch --config <mesh.yaml> --peer <origin> --id <fed-id> ... --json
+
+    (the Go-track subcommand; this side codes against its JSON
+    contract), then imports in-process through the very same path
+    :rpc:`WriteMemory` uses. There is no auto-fetch and no loop —
+    every fetch is confirmed by a human at a TTY or an explicit
+    ``--yes``.
+
+    Keys mirror :class:`MetaPollConfig` (same defaults); there is NO
+    ``enabled`` switch — the section only shapes the one-shot command,
+    never a background task.
+
+    Fields:
+        mesh_config_path: Path to the mesh ``yaml`` passed to the CLI
+            via ``--config``. REQUIRED to run ``mnemos fetch`` (the
+            CLI cannot dial the peer leg without it) — enforced at the
+            command boundary, not here (unlike ``meta_poll`` there is
+            no ``enabled`` to gate at startup).
+        mesh_bin: The mesh CLI binary to execute. Default
+            ``mnemos-mesh`` (resolved via ``PATH``). An absolute path
+            is the injection point used by tests to substitute a
+            script double.
+    """
+
+    mesh_config_path: str = Field(default="", max_length=4096)
+    mesh_bin: str = Field(default="mnemos-mesh", min_length=1, max_length=256)
+
+
 class FederationConfig(BaseModel):
     """Federation (Phase 0 batch sync) configuration.
 
@@ -663,6 +700,10 @@ class FederationConfig(BaseModel):
             poll-first, Q10.1 orchestration-in-mnemos ruling). Default
             OFF; see :class:`MetaPollConfig`. Additive: configs without
             the key parse unchanged (bit-for-bit S1/phase-1 behaviour).
+        fetch: S2 lazy-fetch (Q10.3) — keys for the explicit
+            ``mnemos fetch`` command only (mesh CLI binary + mesh yaml
+            path); see :class:`FetchConfig`. Additive; no background
+            behaviour.
     """
 
     shared_projects: list[str] = Field(default_factory=list)
@@ -672,6 +713,7 @@ class FederationConfig(BaseModel):
     access_log_path: str | None = Field(default=None, max_length=4096)
     index_title_blocklist: list[str] = Field(default_factory=list, max_length=256)
     meta_poll: MetaPollConfig = Field(default_factory=MetaPollConfig)
+    fetch: FetchConfig = Field(default_factory=FetchConfig)
 
     @field_validator("shared_projects")
     @classmethod
