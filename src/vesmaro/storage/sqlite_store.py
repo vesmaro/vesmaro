@@ -3434,6 +3434,40 @@ class SQLiteStore:
             )
         return pairs
 
+    def index_head(self, projects: Sequence[str] | None = None) -> int:
+        """Return the max ``federation_index`` rowid under the projects filter.
+
+        The scope HEAD for the SyncMetadata watermark (mnemos-mesh#46):
+        the highest storage position a scope-filtered rowid walk can
+        ever have delivered. The SyncMetadata body
+        (:meth:`MnemosCoreServicer.build_metadata_sync_response` in
+        ``mesh_server``) parks ``latest_rev`` here on an EMPTY page
+        instead of echoing ``since_rev`` — a MIN-aggregating poller
+        (the mesh CLI folds the per-scope ``latest_rev`` into one
+        watermark) otherwise sticks at the old checkpoint and
+        re-delivers the data scope every tick.
+
+        Deliberately NOT filtered by ``exclude_no_federate``: the head
+        is the insertion high-water mark of the scope, and a
+        no-federate row is never served anyway — jumping the watermark
+        past such a row is the intended skip (the same semantics a
+        blocked row inside a served page already has). An empty scope
+        (or empty index) yields ``0``.
+
+        Args:
+            projects: Restrict to these ``project`` values (SQL ``IN``,
+                the caller's effective ACL-intersected set); ``None`` =
+                no filter (the whole index).
+        """
+        conn = self._get_conn()
+        q = "SELECT COALESCE(MAX(rowid), 0) FROM federation_index"
+        params: list[Any] = []
+        if projects:
+            placeholders = ", ".join("?" for _ in projects)
+            q += f" WHERE project IN ({placeholders})"
+            params.extend(projects)
+        return int(conn.execute(q, params).fetchone()[0])
+
     def purge_origin(self, origin_peer: str) -> int:
         """Delete every index row sourced from ``origin_peer``.
 

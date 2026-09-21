@@ -545,6 +545,38 @@ class TestListIndex:
         assert entry.id == "fed:r:raw"
 
 
+class TestIndexHead:
+    """mnemos-mesh#46: the scope-head primitive for the SyncMetadata
+    watermark — max rowid under the projects filter, with NO serve-side
+    exclusions (the head is the insertion high-water mark)."""
+
+    def test_empty_index_is_zero(self, store: SQLiteStore) -> None:
+        assert store.index_head() == 0
+        assert store.index_head(projects=["any"]) == 0
+
+    def test_head_is_max_rowid_with_projects_filter(self, store: SQLiteStore) -> None:
+        store.upsert_index_entries([_entry("fed:r:1", project="a"), _entry("fed:r:2", project="b")])
+        rowids = {e.project: r for e, r in store.list_index(limit=10, exclude_no_federate=False)}
+        assert store.index_head() == max(rowids.values())
+        assert store.index_head(projects=["a"]) == rowids["a"]
+        assert store.index_head(projects=["a", "b"]) == max(rowids.values())
+        assert store.index_head(projects=["missing"]) == 0
+
+    def test_head_counts_never_served_rows(self, store: SQLiteStore) -> None:
+        # A no-federate row is invisible to every serve-side walk but
+        # still bounds the insertion head — the watermark may jump past
+        # it (intended skip, the same semantics a blocked row inside a
+        # served page already has).
+        conn = store._get_conn()
+        conn.execute(
+            "INSERT INTO federation_index (id, title, tags, project) "
+            "VALUES ('fed:r:nf', 'Never served', '[\"mnemos:no-federate\"]', 'p')"
+        )
+        conn.commit()
+        assert store.list_index() == []  # the walk never serves it
+        assert store.index_head(projects=["p"]) > 0  # ...but it IS the head
+
+
 # ── purge_origin ─────────────────────────────────────────────────────────────
 
 
@@ -702,11 +734,79 @@ class TestBuildMetadataSyncResponse:
         assert resp.latest_rev > 0
         assert all(r.schema_version == METADATA_SCHEMA for r in resp.records)
 
-    def test_empty_corpus_echos_watermark(self, servicer: MnemosCoreServicer) -> None:
+    def test_empty_corpus_parks_at_scope_head(self, servicer: MnemosCoreServicer) -> None:
+        """Empty index: the scope head is 0, so latest_rev stays 0 — the
+        watermark has nowhere to advance to (and never regresses)."""
         resp = servicer.build_metadata_sync_response(self._request())
         assert list(resp.records) == []
         assert resp.latest_rev == 0
         assert not resp.has_more
+
+    def test_issue46_empty_scope_page_advances_watermark_to_head(
+        self, tmp_path: Path, manager: MemoryManager
+    ) -> None:
+        """mnemos-mesh#46 regression: two scopes, one empty — an empty
+        page must park ``latest_rev`` at the SCOPE HEAD, not echo
+        ``since_rev``.
+
+        Model (ticket): the mesh CLI polls per scope and folds the
+        per-scope latest_rev into ONE watermark via MIN. With the echo
+        behaviour the empty scope pinned MIN at the old watermark, so
+        the data scope was re-delivered (duplicates) every tick. The
+        core-side fix: an empty fetch returns the max rowid of the
+        scope-filtered index — nothing is undeliverable beyond it.
+
+        Here scope-a carries the delivered rows (watermark parked at its
+        head); scope-b is SERVING-empty — its only row is no-federate,
+        invisible to the rowid walk — so scope-b's page is empty while
+        its insertion head sits BEYOND the watermark: the head, not the
+        echo, is what lets the watermark advance.
+        """
+        manager.sqlite.upsert_index_entries(
+            [_entry("fed:r:a1", project="scope-a"), _entry("fed:r:a2", project="scope-a")]
+        )
+        watermark = manager.sqlite.index_head(projects=["scope-a"])
+        conn = manager.sqlite._get_conn()
+        conn.execute(
+            "INSERT INTO federation_index (id, title, tags, project) "
+            "VALUES ('fed:r:b1', 'Never served', '[\"mnemos:no-federate\"]', 'scope-b')"
+        )
+        conn.commit()
+        head_b = manager.sqlite.index_head(projects=["scope-b"])
+        assert head_b > watermark  # the empty scope's head is beyond the watermark
+        servicer = MnemosCoreServicer(
+            manager, settings=_settings(tmp_path, allowed=["scope-a", "scope-b"])
+        )
+        # Poll the data scope: rows delivered, watermark parks at its head.
+        resp_a = servicer.build_metadata_sync_response(
+            self._request(project_scope="scope-a", since_rev=0)
+        )
+        assert len(resp_a.records) == 2
+        assert resp_a.latest_rev == watermark
+        # Poll the serving-empty scope FROM that watermark: an empty page
+        # whose latest_rev is scope-b's HEAD (watermark advances), not
+        # the since_rev echo that pinned MIN at the old checkpoint.
+        resp_b = servicer.build_metadata_sync_response(
+            self._request(project_scope="scope-b", since_rev=watermark)
+        )
+        assert list(resp_b.records) == [] and not resp_b.has_more
+        assert resp_b.latest_rev == head_b
+
+    def test_empty_page_head_below_watermark_never_regresses(
+        self, tmp_path: Path, manager: MemoryManager
+    ) -> None:
+        """The #46 head-park must not REWIND a watermark minted over a
+        wider scope: scope-b's head below since_rev → max() keeps the
+        checkpoint (never-regress invariant)."""
+        manager.sqlite.upsert_index_entries([_entry("fed:r:a1", project="scope-a")])
+        servicer = MnemosCoreServicer(
+            manager, settings=_settings(tmp_path, allowed=["scope-a", "scope-b"])
+        )
+        resp = servicer.build_metadata_sync_response(
+            self._request(project_scope="scope-b", since_rev=999)
+        )
+        assert list(resp.records) == []
+        assert resp.latest_rev == 999  # head([scope-b]) == 0 < 999 → no rewind
 
     def test_watermark_pagination_partitions_corpus(
         self, tmp_path: Path, manager: MemoryManager
