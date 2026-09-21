@@ -803,3 +803,30 @@ class TestFetchCLI:
         assert result.exit_code == 0, result.output
         assert "nothing to fetch" in result.output
         assert mesh.reload().get("calls", []) == []
+
+    def test_all_not_found_reports_summary_not_skip(
+        self, tmp_path: Path, mesh: MeshFetchDouble
+    ) -> None:
+        """Review F1 regression: when the peer returns not_found for EVERY
+        planned id, the CLI must show the summary (not_found=2) — not the
+        green 'nothing to fetch' skip message, which would hide a lost
+        record from the operator."""
+        store = SQLiteStore(tmp_path / "data" / "lazy-fetch-cli.db")
+        try:
+            _seed_index(
+                store,
+                _entry("fed:agent-x:gone1", origin_peer="peer-a"),
+                _entry("fed:agent-x:gone2", origin_peer="peer-a"),
+            )
+        finally:
+            store.close()
+        mesh.set({"records": [], "not_found": ["fed:agent-x:gone1", "fed:agent-x:gone2"]})
+        cfg = _cli_config(tmp_path, mesh)
+        result = runner.invoke(
+            app,
+            ["fetch", "--id", "fed:agent-x:gone1", "--id", "fed:agent-x:gone2",
+             "--config", str(cfg), "--yes"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "nothing to fetch" not in result.output
+        assert "not_found=2" in result.output

@@ -1055,7 +1055,17 @@ def fetch_cmd(
         # (same contract as mnemos-mesh pull — a script must never
         # mistake an aborted fetch for a done one).
         raise typer.Exit(1)
-    if not stats.fetched and not stats.imported and not stats.errors:
+    if (
+        not stats.fetched
+        and not stats.imported
+        and not stats.errors
+        and not stats.not_found
+        and not stats.gated
+    ):
+        # "Nothing to fetch" is only honest when every id resolved to a
+        # local skip. not_found>0 means the peer LOST (or gates) records
+        # the plan asked for — the operator must see the summary, not a
+        # green skip message (review F1).
         console.print(
             "[green]✓[/green] nothing to fetch — every id resolved to a skip "
             "(already local / tombstoned at origin)"
