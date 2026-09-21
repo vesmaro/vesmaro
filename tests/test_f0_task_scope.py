@@ -230,6 +230,55 @@ class TestTaskSlugNewlineAnchor:
         assert "task:t1" in result
 
 
+class TestAnchorCompletionNewlineSweep:
+    """#368 item 3 — the ``\\Z`` anchor sweep completed across the four
+    scope regexes.
+
+    ``_PROJECT_RE``/``_AGENT_RE``/``_VESMARO_RE`` were still on ``$``:
+    'project:p1\\n' (confirmed live) and 'agent:a1\\n' passed STRICT
+    validation with a trailing newline. No behavioral coupling with the
+    task regexes (project/agent are matched columnally at query time,
+    ``m.project = ?``), but a newline-carrying slug is unreachable at
+    query time exactly like the task dead-tag. ``\\Z`` (absolute end)
+    rejects it at the boundary; lax mode still salvages via
+    ``_normalize_slug`` strip.
+    """
+
+    @pytest.mark.parametrize("tag", ["project:p1\n", "agent:a1\n"])
+    def test_strict_rejects_trailing_newline_tags(self, tag: str) -> None:
+        """The duplicate-prefix fatal rule needs an INVALID, not a
+        second VALID prefix — so the newline tag rides on a base whose
+        own prefix family is patched around it (VALID_BASE with the
+        matching member removed)."""
+        base = [t for t in VALID_BASE if not tag.startswith(t.split(":")[0] + ":")]
+        with pytest.raises(TagContractError):
+            validate_tag_contract([*base, tag])
+
+    @pytest.mark.parametrize("tag", ["project:p1\n", "agent:a1\n"])
+    def test_lax_salvages_trailing_newline_tags(self, tag: str) -> None:
+        """Same salvage contract as the task anchor: whitespace is
+        strip-normalized, the scope survives."""
+        base = [t for t in VALID_BASE if not tag.startswith(t.split(":")[0] + ":")]
+        result = validate_tag_contract([*base, tag], strict=False)
+        assert tag.strip() in result
+        assert tag not in result
+
+    @pytest.mark.parametrize("tag", ["project:p1", "agent:a1"])
+    def test_clean_tags_still_validate(self, tag: str) -> None:
+        """Control: the sweep only NARROWS admissibility — clean tags
+        behave identically before and after the anchor change."""
+        base = [t for t in VALID_BASE if not tag.startswith(t.split(":")[0] + ":")]
+        tags = [*base, tag]
+        assert validate_tag_contract(tags) == tags
+
+    def test_mnemos_trailing_newline_rejected_strict(self) -> None:
+        """The ``mnemos:`` family rides the same anchor: a trailing
+        newline fails the format check in strict mode ('learning\\n' can
+        never be a whitelisted subtype)."""
+        with pytest.raises(TagContractError, match="invalid mnemos: tag format"):
+            validate_tag_contract([*VALID_BASE, "mnemos:learning\n"])
+
+
 class TestTagContractModel:
     def test_extracts_task_slug(self) -> None:
         tc = TagContract(tags=[*VALID_BASE, "task:refactor-auth"])

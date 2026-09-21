@@ -78,8 +78,19 @@ _LENS_CONTENT_TYPE: Final[dict[Lens, str]] = {Lens.CODE: "code"}
 #:      bare digits ("(404 pages)"). An empty-arg call ("parse_args()")
 #:      no longer activates either — with nothing inside the group the
 #:      shape is indistinguishable from prose, and a MISSED activation is
-#:      the safe direction (identity projection keeps every row);
-#:   4. a method call — receiver.identifier(;
+#:      the safe direction (identity projection keeps every row); the
+#:      no-space comma residual ("options(a, b, or c)") stays ADmissible
+#:      on purpose — the typographic heuristic (prose parens take a
+#:      leading space) is the discriminator, pinned as documented
+#:      behavior (#368).
+#:   4. a method call — receiver.identifier( — mirroring signal #3: the
+#:      identifier is FLUSH against ``(`` (no space: English typography
+#:      mandates one before a prose parenthetical, so "compare node.js
+#:      (the runtime)" and the typo "e.g (note)" are prose, not calls)
+#:      AND the group carries the same code evidence as #3 (comma, ``=``,
+#:      underscored/dotted token, comparison/bitwise operator — "node.js
+#:      (fs, cb)" vs "node.js (the runtime)"); the #368 review false-fired
+#:      the old whitespace-tolerant shape on exactly those prose shapes;
 #:   5. code-file paths (src/vesmaro/manager.py, app.ts);
 #:   6. code-only operators (=> arrow, :: scope resolution).
 #: An import statement is deliberately NOT a signal on its own — the
@@ -90,7 +101,7 @@ _QUERY_CODE_SIGNALS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\b(?:def|function|fn)\s+[A-Za-z_]\w*\s*\("),
     re.compile(r"\bclass\s+[A-Za-z_]\w*\s*[:({]"),
     re.compile(r"\b[A-Za-z_]\w*\((?=[^()]*(?:[,=*<>&|]|\w[_.]\w))[^()]*\)"),
-    re.compile(r"\b[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\("),
+    re.compile(r"\b[A-Za-z_]\w*\.[A-Za-z_]\w*\((?=[^()]*(?:[,=*<>&|]|\w[_.]\w))[^()]*\)"),
     re.compile(
         r"\b[\w./\\-]+\.(?:py|pyi|ts|tsx|js|jsx|mjs|rs|go|c|h|cc|cpp|java|kt|rb|sh|sql|toml)\b"
     ),
