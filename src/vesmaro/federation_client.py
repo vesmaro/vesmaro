@@ -47,7 +47,7 @@ __all__ = [
 ]
 
 
-def pull_from_peer(*args: Any, **kwargs: Any) -> Any:
+def pull_from_peer(*args: Any, **kwargs: Any) -> PullResult:
     """Vitals boundary #8 (A2): time the client pull (standalone — no manager)."""
     import time as _time
 

@@ -24,6 +24,12 @@ A2 gate facts (measured on the live integration, not in CI): INSERT
 p95 < 2 ms in the hooks path; volume/day; retention green.
 """
 
+# ── PROVENANCE ────────────────────────────────────────────────────────
+# Vendored from mnemos-vitals main (phase A2, 2026-09-22). Master copy
+# + methodology: ~/LABs/Projects/Project-Mnemos/mnemos-vitals. Sync rule:
+# changes land there first, then are ported in the same wave
+# (drift-guard tests on both sides must stay green).
+
 from __future__ import annotations
 
 import json
@@ -137,6 +143,18 @@ class VerbLedgerMixin:
                 with suppress(sqlite3.Error):
                     conn.rollback()
             return None
+
+    def last_rolled_hour(self) -> int:
+        """Latest hour present in verb_metrics_hourly (epoch hour; 0 if none).
+
+        The tick uses this to catch up after downtime instead of silently
+        skipping every missed hour (m3).
+        """
+        conn = self._conn()
+        if conn is None:
+            return 0
+        row = conn.execute("SELECT MAX(hour) FROM verb_metrics_hourly").fetchone()
+        return int(row[0] or 0)
 
     def rollup_hourly(self, *, hour: int | None = None) -> int:
         """Aggregate one hour of verb_metrics into verb_metrics_hourly.

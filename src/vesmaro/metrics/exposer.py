@@ -12,6 +12,12 @@ per-principal labels are banned everywhere. Host volume gauges
 and are passed in as plain key/value pairs.
 """
 
+# ── PROVENANCE ────────────────────────────────────────────────────────
+# Vendored from mnemos-vitals main (phase A2, 2026-09-22). Master copy
+# + methodology: ~/LABs/Projects/Project-Mnemos/mnemos-vitals. Sync rule:
+# changes land there first, then are ported in the same wave
+# (drift-guard tests on both sides must stay green).
+
 from __future__ import annotations
 
 import sqlite3

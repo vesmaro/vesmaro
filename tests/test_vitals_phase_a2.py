@@ -59,9 +59,7 @@ def _verb_rows(manager: MemoryManager) -> list[tuple]:
     store = manager._vitals_store
     assert store is not None
     conn = sqlite3.connect(store.db_path)
-    rows = conn.execute(
-        "SELECT surface, verb, status FROM verb_metrics ORDER BY id"
-    ).fetchall()
+    rows = conn.execute("SELECT surface, verb, status FROM verb_metrics ORDER BY id").fetchall()
     conn.close()
     return rows
 
@@ -87,20 +85,22 @@ class TestVerbBoundaries:
         settings = _settings(tmp_path)
         manager = _manager(settings)
         try:
-            api_main._manager = manager
+            # the shell resolves via mcp_server's own get_manager (the
+            # same seam the dispatch uses — M1 fix), so seed THAT manager
+            import vesmaro.mcp_server as mcp_mod
+
+            mcp_mod._manager = manager
             try:
                 result = asyncio.run(call_tool("mnemos_stats", {}))
             finally:
-                api_main._manager = None
+                mcp_mod._manager = None
             assert result  # a real tool ran
             rows = _verb_rows(manager)
             assert any(r[1] == "mnemos_stats" and r[0] == "mcp" for r in rows)
         finally:
             manager.close()
 
-    def test_rest_middleware_records_route_template_and_excludes_service(
-        self, tmp_path: Path
-    ):
+    def test_rest_middleware_records_route_template_and_excludes_service(self, tmp_path: Path):
         settings = _settings(tmp_path)
         manager = _manager(settings)
         try:
@@ -136,9 +136,7 @@ class TestVerbBoundaries:
 
 class TestRollupTick:
     def test_rollup_tick_runs_hourly_and_before_retention(self, mgr: MemoryManager):
-        mgr.record_verb_vitals(
-            surface="mcp", verb="mnemos_search", status="ok", latency_ms=7.0
-        )
+        mgr.record_verb_vitals(surface="mcp", verb="mnemos_search", status="ok", latency_ms=7.0)
         store = mgr._vitals_store
         assert store is not None
         # backdate the verb row into the PREVIOUS COMPLETE hour — the
@@ -203,9 +201,7 @@ class TestCliBoundary:
         import sqlite3 as s3
 
         cli_settings = _settings(tmp_path)
-        monkeypatch.setattr(
-            "vesmaro.config.load_settings", lambda _cfg=None: cli_settings
-        )
+        monkeypatch.setattr("vesmaro.config.load_settings", lambda _cfg=None: cli_settings)
         monkeypatch.setattr("sys.argv", ["vesmaro", "--version"])
         from vesmaro.cli.main import cli_main
 

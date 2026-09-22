@@ -4416,7 +4416,18 @@ class MemoryManager:
                         processor_stats.get("refine_queue_depth", 0),
                     )
                     _cycle_t0 = time.monotonic()
-                    result = self.run_pipeline(limit=200)
+                    try:
+                        result = self.run_pipeline(limit=200)
+                    except Exception as exc:
+                        # Vitals boundary #3 (A2) — the failure IS telemetry.
+                        self.record_verb_vitals(
+                            surface="background",
+                            verb="pipeline.cycle",
+                            status="error",
+                            latency_ms=(time.monotonic() - _cycle_t0) * 1000,
+                            meta={"error_type": type(exc).__name__},
+                        )
+                        raise
                     _cycle_ms = (time.monotonic() - _cycle_t0) * 1000
                     logger.info(
                         "Processor: cycle done — published=%d single=%d stuck=%d "
@@ -4447,7 +4458,18 @@ class MemoryManager:
                 # between the claim and its outcome write) re-enter the
                 # pending intake.
                 _reclaim_t0 = time.monotonic()
-                self.reclaim_stale_refinements()
+                try:
+                    self.reclaim_stale_refinements()
+                except Exception as exc:
+                    # Vitals boundary #5a (A2) — error leg.
+                    self.record_verb_vitals(
+                        surface="background",
+                        verb="refine.reclaim",
+                        status="error",
+                        latency_ms=(time.monotonic() - _reclaim_t0) * 1000,
+                        meta={"error_type": type(exc).__name__},
+                    )
+                    raise
                 # Vitals boundary #5a (A2).
                 self.record_verb_vitals(
                     surface="background",
@@ -4459,7 +4481,18 @@ class MemoryManager:
                 # embed is stale/missing (a failed post-swap upsert) get
                 # re-embedded; quarantined rows are skipped absolutely.
                 _heal_t0 = time.monotonic()
-                self.heal_stale_embeddings()
+                try:
+                    self.heal_stale_embeddings()
+                except Exception as exc:
+                    # Vitals boundary #5b (A2) — error leg.
+                    self.record_verb_vitals(
+                        surface="background",
+                        verb="embed.heal",
+                        status="error",
+                        latency_ms=(time.monotonic() - _heal_t0) * 1000,
+                        meta={"error_type": type(exc).__name__},
+                    )
+                    raise
                 # Vitals boundary #5b (A2).
                 self.record_verb_vitals(
                     surface="background",
@@ -4611,7 +4644,14 @@ class MemoryManager:
             return
         self._vitals_rollup_last_ts = now
         try:
-            rows = store.rollup_hourly()  # previous complete hour
+            # catch-up: roll every hour since the last rolled one (capped
+            # at a week — older gaps mean the plane was down longer than
+            # the raw TTL margin; the retention report surfaces that)
+            prev_hour = int(time.time() // 3600) - 1
+            first = max(store.last_rolled_hour() + 1, prev_hour - 168)
+            rows = 0
+            for hour in range(first, prev_hour + 1):
+                rows += store.rollup_hourly(hour=hour)
             if rows:
                 logger.info("vitals rollup: %d rows", rows)
         except Exception:

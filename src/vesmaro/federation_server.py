@@ -313,7 +313,7 @@ def _resolve_peer_token(peer: PeerConfig) -> str | None:
 # ── Main flow ─────────────────────────────────────────────────────────────────
 
 
-def handle_pull(*args: Any, **kwargs: Any) -> Any:
+def handle_pull(*args: Any, **kwargs: Any) -> tuple[PullResponse, int]:
     """Vitals boundary #7 (A2): time the pull, then delegate."""
     import time as _time
 

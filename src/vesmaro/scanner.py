@@ -43,6 +43,7 @@ Public API
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -244,7 +245,16 @@ class BackgroundScanner:
                     status="ok",
                     latency_ms=(time.monotonic() - _scan_t0) * 1000,
                 )
-            except Exception:
+            except Exception as exc:
+                # Vitals boundary #6 (A2) — error leg.
+                with contextlib.suppress(Exception):
+                    self._manager.record_verb_vitals(
+                        surface="background",
+                        verb="scanner.scan",
+                        status="error",
+                        latency_ms=(time.monotonic() - _scan_t0) * 1000,
+                        meta={"error_type": type(exc).__name__},
+                    )
                 # Non-fatal — a scan failure must never crash the
                 # scanner thread. The next pass will retry.
                 logger.exception("Background scanner pass failed (non-fatal)")
