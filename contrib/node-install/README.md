@@ -5,10 +5,12 @@ bundle: **server venv** (built from a release tag) + **mesh binary**
 (built from the paired release ref) + **configs** (`/etc/vesmaro`,
 secrets in 0600 env files) + **systemd units** + a cert-gen hook.
 
-Design properties: idempotent (re-running `install` == upgrade),
+Design properties: idempotent provisioning (a repeated `install` at the
+same pair re-provisions configs/units without touching the manifest),
 restarts only when artifacts actually change, upgrades are **atomic over
 the (core, mesh) PAIR** with pre-flight sqlite backup, health-verify and
-auto-rollback to the kept `*.prev-*` copies.
+auto-rollback — including mid-swap aborts — to the kept `*.prev-<ts>`
+copies.
 
 ```
 contrib/node-install/
@@ -109,9 +111,14 @@ On the dev laptop the legacy venv's python lives inside a distrobox —
 `status`/`adopt` probe it through `distrobox-enter` (box name
 overridable via `VESMARO_LEGACY_BOX`, default `ubuntu`); run these
 commands on the host (or via `distrobox-host-exec`), where `getent`
-resolves the real home. Adopted nodes **refuse bundle upgrades** —
-migration from legacy paths to managed bundle paths is a separate,
-deliberate operation.
+resolves the real home.
+
+Adopted nodes are **protected**: `install` refuses with an error (a
+bundle install would replace legacy units/binaries) unless
+`--migrate-adopted` is passed — and that flag currently refuses too,
+because migrating an adopted node onto managed bundle paths is a
+separate, deliberate operation that is not implemented yet. Likewise
+`upgrade` refuses on adopted nodes (see `upgrade --check`).
 
 ## upgrade
 
@@ -122,9 +129,27 @@ sudo ./vesmaro-node upgrade        # the real atomic pair swap
 
 The real run: pre-flight face health + fresh sqlite `.backup` into
 `<state>/backups/pre-upgrade-<ts>/`, build BOTH artifacts before
-touching the node, swap venv + mesh binary (prev copies kept), restart,
-verify `/health` per face and mesh `healthz` (version must equal the
-ledger), auto-rollback on failure.
+touching the node, swap venv + mesh binary into place (prev copies
+kept as `*.prev-<timestamp>`), restart, verify `/health` per face and
+mesh `healthz` (version must equal the ledger, `v`-prefix tolerant),
+then prune older prev copies. Rollback is automatic on **any** failure
+inside the swap..verify area — health-verify failures *and* mid-swap
+aborts (disk full, failed copy: an ERR trap fires) restore the
+previous pair and re-verify faces + mesh healthz. Nodes installed
+`--without-mesh` upgrade the core only (no mesh swap/restart).
+
+A repeated `install` on an existing managed node is **not** an
+upgrade: an unchanged pair is an idempotent re-provision (the manifest
+is not touched), and a **changed pair routes through the upgrade
+path** above (backup + verify + rollback) — the pair identity is
+(`core_tag`, `mesh_ref`) from the ledger, not the `--version` string.
+
+## Test hooks
+
+`VESMARO_TEST_FAIL_VERIFY=1` (sandbox drills only): skips the
+pre-flight health gates and forces every post-swap health verify to
+fail — exercises the rollback path end-to-end without breaking
+anything real. Never set it on a live node.
 
 ## uninstall
 

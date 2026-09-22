@@ -4,9 +4,11 @@
 # Bundle = server venv (vesmaro, from a RELEASE TAG) + mesh binary
 # (mnemos-mesh, from the paired release ref) + configs (/etc/vesmaro,
 # secrets in 0600 env files) + systemd units + cert-gen hook.
-# Idempotent: re-running install == upgrade; restarts happen only when
-# artifacts actually change. Upgrades are ATOMIC over the (core, mesh)
-# PAIR with pre-flight sqlite backup, health-verify and auto-rollback.
+# Idempotent: re-running install at the SAME pair is a re-provision;
+# a CHANGED pair routes through the upgrade path. Restarts happen only
+# when artifacts actually change. Upgrades are ATOMIC over the (core,
+# mesh) PAIR with pre-flight sqlite backup, health-verify and
+# auto-rollback (health-verify failures AND mid-swap aborts).
 #
 # Subcommands:
 #   install    deploy the bundle (adopt existing install when present)
@@ -29,8 +31,9 @@
 #
 # Sandbox: --dest DIR prefixes every target path and neutralizes
 # systemctl — full layout drill without touching the running system.
-set -euo pipefail
+set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
+umask 077   # everything not explicitly chmod'd (manifests, staging) is private
 
 SCRIPT_NAME="vesmaro-node"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,6 +79,7 @@ REGEN_UNITS=false
 RECONF=false
 FORCE=false
 ADOPT=false
+MIGRATE_ADOPTED=false
 GEN_CERTS=false
 CHECK=false
 PURGE=false
@@ -531,7 +535,7 @@ install_units() {  # returns (echo) list of units whose files changed
     gen="${DEST}${UNITDIR}/$u.gen"
     local final="${DEST}${UNITDIR}/$u"
     if [[ ! -f "$final" ]]; then
-      mv "$gen" "$final"; changed+="$u "; info "unit installed: $u"
+      mv "$gen" "$final"; chmod 0644 "$final"; changed+="$u "; info "unit installed: $u"
     elif cmp -s "$gen" "$final"; then
       rm -f "$gen"
     else
@@ -539,7 +543,7 @@ install_units() {  # returns (echo) list of units whose files changed
       manifest_exists && [[ "$(mf_get "units.${u%.service}")" != "" ]] && ours="yes"
       if [[ "$ours" == "yes" || $REGEN_UNITS ]]; then
         cp -f "$final" "${final}.bak-$(date +%Y%m%d%H%M%S)"
-        mv "$gen" "$final"; changed+="$u "; info "unit updated: $u (backup kept)"
+        mv "$gen" "$final"; chmod 0644 "$final"; changed+="$u "; info "unit updated: $u (backup kept)"
       else
         rm -f "$gen"
         warn "unit $u exists and differs from the bundle template — KEPT"
@@ -583,8 +587,17 @@ install_env_files() {
   local td; td="$(tmpl_dir)"
   mkdir -p "${DEST}${ENVDIR}"; chmod 0750 "${DEST}${ENVDIR}"
   if [[ ! -f "${DEST}${ENVDIR}/node.env" ]]; then
-    render "$td/env/node.env.example" "${DEST}${ENVDIR}/node.env"
-    chmod 0600 "${DEST}${ENVDIR}/node.env"; ok "env: $(dst "$ENVDIR")/node.env (0600, no secrets needed by default)"
+    python3 - "$td/env/node.env.example" "${DEST}${ENVDIR}/node.env" <<'PY'
+import sys, os
+src, dst = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    t = f.read()
+# O_EXCL: create-or-fail atomically at 0600 (umask-proof, no race)
+fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(t)
+PY
+    ok "env: $(dst "$ENVDIR")/node.env (0600, created O_EXCL)"
   fi
   if [[ "$PROFILE" == "laptop" && ! -f "${DEST}${ENVDIR}/board.env" ]]; then
     python3 - "$td/env/board.env.example" "${DEST}${ENVDIR}/board.env" <<'PY'
@@ -725,6 +738,82 @@ adopt_legacy() {
   warn "adopted nodes refuse bundle upgrades — migration to managed paths is a separate op"
 }
 
+# ── upgrade rollback (B2) ────────────────────────────────────────────
+# Restores the pre-upgrade pair from the *.prev-<ts> copies. Called both
+# from the health-verify failure path and from the ERR trap covering the
+# swap..verify area (disk full / cp abort / anything) so the node is
+# never left without a venv or on a mixed pair. Guards: single-shot
+# (RB_ACTIVE), tolerates prev copies missing (an abort may happen before
+# the prev was created), re-verifies faces + mesh healthz afterwards.
+RB_ACTIVE=false
+RB_DSTVENV=""; RB_DSTBIN=""; RB_VPREV=""; RB_MPREV=""
+RB_CORE_UNIT=""; RB_BOARD_UNIT=""; RB_MESH_UNIT=""; RB_MPORT=""
+RB_CUR_CV=""; RB_CUR_MV=""
+
+rollback_pair() {
+  $RB_ACTIVE || return 0
+  RB_ACTIVE=false
+  warn "rollback: restoring the pre-upgrade pair (${RB_CUR_CV:-?}, ${RB_CUR_MV:-no-mesh})"
+  if [[ -n "$RB_VPREV" && -d "$RB_VPREV" ]]; then
+    rm -rf "$RB_DSTVENV"
+    mv "$RB_VPREV" "$RB_DSTVENV"
+    ok "rollback: venv restored from $(basename "$RB_VPREV")"
+  elif [[ -d "$RB_DSTVENV" ]]; then
+    warn "rollback: no venv prev copy — keeping current $RB_DSTVENV (unverified)"
+  else
+    warn "rollback: venv MISSING ($RB_DSTVENV) and no prev copy — node left without a venv, investigate manually"
+  fi
+  if [[ -n "$RB_DSTBIN" ]]; then
+    if [[ -n "$RB_MPREV" && -f "$RB_MPREV" ]]; then
+      if [[ -f "$RB_DSTBIN" ]]; then mv "$RB_DSTBIN" "${RB_DSTBIN}.rollback-broken"; fi
+      mv "$RB_MPREV" "$RB_DSTBIN"
+      ok "rollback: mesh binary restored from $(basename "$RB_MPREV")"
+    elif [[ -f "$RB_DSTBIN" ]]; then
+      warn "rollback: no mesh prev copy — keeping current $RB_DSTBIN (unverified)"
+    else
+      warn "rollback: mesh binary MISSING ($RB_DSTBIN) and no prev copy"
+    fi
+  fi
+  local u
+  for u in "$RB_CORE_UNIT" "$RB_BOARD_UNIT" "$RB_MESH_UNIT"; do
+    if [[ -n "$u" ]]; then sys restart "$u"; fi
+  done
+  sleep 3
+  if [[ -z "${VESMARO_TEST_FAIL_VERIFY:-}" ]] && ! $SANDBOX; then
+    local p
+    for p in $(faces_for_profile); do
+      wait_health "http://127.0.0.1:$p/health" 60 \
+        || warn "ROLLBACK face :$p still unhealthy — investigate manually"
+    done
+    if [[ -n "$RB_MESH_UNIT" ]]; then
+      curl -sf -m 2 "http://127.0.0.1:$RB_MPORT/healthz" >/dev/null 2>&1 \
+        || warn "ROLLBACK mesh healthz still down on :$RB_MPORT — investigate manually"
+    fi
+  else
+    warn "rollback re-verify skipped (sandbox/test mode) — check files and versions manually"
+  fi
+}
+
+upgrade_swap_err() {  # ERR trap for the upgrade swap..verify area
+  local rc=$?
+  trap - ERR
+  warn "upgrade aborted mid-swap (rc=$rc) — invoking rollback"
+  rollback_pair
+  die "upgrade FAILED mid-swap, rollback applied — inspect the node before retrying"
+}
+
+verify_health() {  # $1 url, $2 timeout -> 0 ok (sandbox/test aware)
+  if [[ -n "${VESMARO_TEST_FAIL_VERIFY:-}" ]]; then
+    warn "TEST: VESMARO_TEST_FAIL_VERIFY is set — verify forced to FAIL ($1)"
+    return 1
+  fi
+  if $SANDBOX; then
+    printf "  [dry] health verify %s — skipped (sandbox, nothing runs under --dest)\n" "$1" >&2
+    return 0
+  fi
+  wait_health "$1" "$2"
+}
+
 # ── INSTALL / UPGRADE ────────────────────────────────────────────────
 cmd_install() {
   detect_sys
@@ -745,10 +834,44 @@ cmd_install() {
     return
   fi
 
-  manifest_exists && info "existing install found (installed $(mf_get updated_at)) — upgrade semantics"
+  # B1: an adopted (legacy live) node must never be silently overwritten
+  # by a bundle install — the only way in is an explicit migration, which
+  # is a separate operation (and deliberately not implemented yet).
+  if manifest_exists && [[ "$(mf_get adopted)" == "yes" ]]; then
+    if $MIGRATE_ADOPTED; then
+      die "--migrate-adopted: migrating a legacy adopted node onto managed bundle paths is a SEPARATE operation, not implemented in this slice — see the Adopt section of contrib/node-install/README.md"
+    fi
+    die "node is ADOPTED (legacy live install, manifest $MANIFEST) — bundle install would replace legacy units/binaries; pass --migrate-adopted once that op exists. Nothing was modified."
+  fi
 
   pick_python
   resolve_release
+
+  # M1: for an EXISTING managed install the pair identity (core_tag +
+  # mesh_ref), not the --version string, decides what happens:
+  #   same pair    -> idempotent re-provision (manifest NOT touched —
+  #                   rewriting core_tag here used to fake "no updates")
+  #   changed pair -> route through the UPGRADE path so the swap gets
+  #                   backup + verify + rollback semantics.
+  local first_provision=true
+  if manifest_exists; then
+    first_provision=false
+    local cur_t cur_m pair_same=false
+    cur_t="$(mf_get core_tag)"; cur_m="$(mf_get mesh_ref)"
+    if $WITHOUT_MESH; then
+      if [[ "$cur_t" == "$CORE_TAG" ]]; then pair_same=true; fi
+    else
+      if [[ "$cur_t" == "$CORE_TAG" && "$cur_m" == "$MESH_REF" ]]; then pair_same=true; fi
+    fi
+    if $pair_same; then
+      info "existing install at the same pair (tag $cur_t) — idempotent re-provision, manifest untouched"
+    else
+      info "pair change ($cur_t, ${cur_m:-no-mesh}) -> ($CORE_TAG, $MESH_REF) on an existing install — routing through the upgrade path"
+      cmd_upgrade
+      return $?
+    fi
+  fi
+
   local vrepo mrepo vcache mbin new_cv new_mv changed_units=""
   vrepo="$(ensure_repo vesmaro "$(default_vesmaro_repo)" git@github.com:vesmaro/vesmaro.git)"
   $WITHOUT_MESH || mrepo="$(ensure_repo mnemos-mesh "$(default_mesh_repo)" git@github.com:Korrnals/mnemos-mesh.git)"
@@ -772,7 +895,9 @@ cmd_install() {
     ok "server venv already at $new_cv — untouched"
   else
     if [[ -d "$dst_venv" ]]; then
-      mv "$dst_venv" "${dst_venv}.prev-${old_cv:-unknown}-$(date +%Y%m%d%H%M%S)"
+      # timestamped prev names sort chronologically (version-suffixed
+      # names sorted 4.10.0 before 4.9.0 and broke pruning)
+      mv "$dst_venv" "${dst_venv}.prev-$(date +%Y%m%d%H%M%S)"
     fi
     mkdir -p "$(dirname "$dst_venv")"
     cp -a "$vcache" "$dst_venv"
@@ -787,15 +912,15 @@ cmd_install() {
     if [[ -x "$dst_bin" ]] && [[ "$(sha256_of "$dst_bin")" == "$(sha256_of "$mbin")" ]]; then
       ok "mesh binary unchanged ($(sha256_of "$dst_bin" | cut -c1-12)) — untouched"
     else
-      [[ -x "$dst_bin" ]] && old_mv="$(version_mesh "$dst_bin")"
       if [[ -x "$dst_bin" ]]; then
-        mv "$dst_bin" "${dst_bin}.prev-${old_mv:-unknown}"
+        old_mv="$(version_mesh "$dst_bin")"
+        mv "$dst_bin" "${dst_bin}.prev-$(date +%Y%m%d%H%M%S)"
       fi
       mkdir -p "$(dirname "$dst_bin")"
       cp -f "$mbin" "$dst_bin"; chmod 0755 "$dst_bin"
       mesh_changed=true
       if [[ -n "$old_mv" ]]; then
-        ok "mesh binary deployed: $new_mv (prev kept: ${MESHBIN}.prev-$old_mv)"
+        ok "mesh binary deployed: $new_mv (prev kept: ${MESHBIN}.prev-<ts>)"
       else
         ok "mesh binary deployed: $new_mv"
       fi
@@ -810,30 +935,45 @@ cmd_install() {
     chown -R "$USER_NAME:" "$(dst "$DATADIR")" "$(dst "$STATEDIR")" "$(dst "$ENVDIR")" 2>/dev/null || true
   fi
   changed_units="$(install_units)"
-  if [[ -n "$changed_units" ]] && ! $SYS_DRY; then sys daemon-reload; fi
+  local u restart_set=""
+  if [[ -n "$changed_units" ]] && ! $SYS_DRY; then
+    sys daemon-reload
+    # a unit whose FILE changed needs a restart too, not just a reload
+    for u in $changed_units; do
+      if sys_real is-active "$u" >/dev/null 2>&1; then
+        sys restart "$u"
+        restart_set="$restart_set $u"
+      fi
+    done
+  fi
 
   cert_hook
 
-  # ── manifest BEFORE enable (so units become "ours" for next runs) ─
-  mf_write "style=$STYLE" "user=${USER_NAME:-}" "run_user=$RUN_USER" "profile=$PROFILE" \
-    "dest=$DEST" "core_version=$new_cv" "core_tag=$CORE_TAG" "core_ref=$(git -C "$vrepo" rev-parse --short=12 "${CORE_REF}^{commit}" 2>/dev/null || echo "$CORE_REF")" \
-    "venv=$VENV" "meshbin=$MESHBIN" "confdir=$CONFDIR" "envdir=$ENVDIR" "pki_dir=$PKIDIR" \
-    "data_dir=$DATADIR" "rundir=$RUNDIR" "bundle_dir=$BUNDLE_DIR" "pair_mode=$PAIR_MODE" "adopted=no"
-  if ! $WITHOUT_MESH; then
-    mf_write "mesh_version=$new_mv" "mesh_sha256=$(sha256_of "$dst_bin")" "mesh_ref=$MESH_REF"
+  # ── manifest BEFORE enable (so units become "ours" for next runs);
+  # M1: written on FIRST provisioning only — a same-pair re-provision
+  # must not rewrite core_tag/version fields it did not deploy.
+  if $first_provision; then
+    mf_write "style=$STYLE" "user=${USER_NAME:-}" "run_user=$RUN_USER" "profile=$PROFILE" \
+      "dest=$DEST" "core_version=$new_cv" "core_tag=$CORE_TAG" "core_ref=$(git -C "$vrepo" rev-parse --short=12 "${CORE_REF}^{commit}" 2>/dev/null || echo "$CORE_REF")" \
+      "venv=$VENV" "meshbin=$MESHBIN" "confdir=$CONFDIR" "envdir=$ENVDIR" "pki_dir=$PKIDIR" \
+      "data_dir=$DATADIR" "rundir=$RUNDIR" "bundle_dir=$BUNDLE_DIR" "pair_mode=$PAIR_MODE" "adopted=no"
+    if ! $WITHOUT_MESH; then
+      mf_write "mesh_version=$new_mv" "mesh_sha256=$(sha256_of "$dst_bin")" "mesh_ref=$MESH_REF"
+    fi
+    if [[ "$PROFILE" == "laptop" ]]; then
+      mf_write "units.core=mnemos-prod-laptop.service" "units.board=mnemos-board-laptop.service"
+    else
+      mf_write "units.core=mnemos-node.service"
+    fi
+    $WITHOUT_MESH || mf_write "units.mesh=mnemos-mesh.service"
   fi
-  if [[ "$PROFILE" == "laptop" ]]; then
-    mf_write "units.core=mnemos-prod-laptop.service" "units.board=mnemos-board-laptop.service"
-  else
-    mf_write "units.core=mnemos-node.service"
-  fi
-  $WITHOUT_MESH || mf_write "units.mesh=mnemos-mesh.service"
 
   install_bundle_copy
 
   # ── enable / restart ────────────────────────────────────────────
-  local u restart_set=""
-  $venv_changed && restart_set="$(profile_units | grep -v mesh | tr '\n' ' ')"
+  if $venv_changed; then
+    for u in $(profile_units | grep -v mesh); do restart_set="$restart_set $u"; done
+  fi
   $mesh_changed && restart_set="$restart_set mnemos-mesh.service"
   if ! $NO_ENABLE && ! $SYS_DRY; then
     for u in $(profile_units); do
@@ -871,17 +1011,31 @@ cmd_upgrade() {
   resolve_release
   info "target pair: core $CORE_TAG + mesh $MESH_REF (${PAIR_MODE})"
 
+  # mesh leg present? (a --without-mesh install records no meshbin; an
+  # explicit --without-mesh also narrows THIS upgrade to the core; an
+  # ADOPTED manifest records the mesh under adopted_meshbin instead)
+  local have_mesh=false
+  if ! $WITHOUT_MESH; then
+    if [[ -n "$(mf_get meshbin)" || -n "$(mf_get adopted_meshbin)" ]]; then have_mesh=true; fi
+  fi
+
   # ── dry-run ─────────────────────────────────────────────────────
   if $CHECK; then
     echo
     info "UPGRADE --check (dry run, nothing is modified)"
     printf "  core : %s (tag %s) -> %s\n" "${cur_cv:-?}" "${cur_tag:-?}" "$CORE_TAG"
-    printf "  mesh : %s (ref %s) -> %s\n" "${cur_mv:-?}" "${cur_meshref:-?}" "$MESH_REF"
+    if $have_mesh; then
+      printf "  mesh : %s (ref %s) -> %s\n" "${cur_mv:-?}" "${cur_meshref:-?}" "$MESH_REF"
+    else
+      echo "  mesh : n/a (this node runs --without-mesh)"
+    fi
     local any=false
     [[ "$cur_tag" != "$CORE_TAG" ]] && any=true \
       && echo "  files: venv swap ($VENV) + restart $(mf_get units.core)$( [[ $PROFILE == laptop ]] && echo " + $(mf_get units.board)")"
-    [[ "$cur_meshref" != "$MESH_REF" ]] && any=true \
-      && echo "  files: mesh binary swap ($MESHBIN) + restart $(mf_get units.mesh)"
+    if $have_mesh; then
+      [[ "$cur_meshref" != "$MESH_REF" ]] && any=true \
+        && echo "  files: mesh binary swap ($MESHBIN) + restart $(mf_get units.mesh)"
+    fi
     if ! $any; then
       ok "already at target pair (core tag $CORE_TAG, mesh ref $MESH_REF) — no updates"
       if [[ "$adopted" == "yes" ]]; then
@@ -895,85 +1049,125 @@ cmd_upgrade() {
     fi
     echo "  pre-flight: sqlite .backup of $(mf_get data_dir)/data -> $(dst "$STATEDIR")/backups/pre-upgrade-<ts>/"
     echo "  verify    : /health per face + mesh healthz (version must equal $EXPECT_MESHV), timeout 120s"
-    echo "  rollback  : auto (prev copies kept as *.prev-<version>)"
+    echo "  rollback  : auto — health-verify failures AND mid-swap aborts (ERR trap) restore the *.prev-<ts> copies"
     return 0
   fi
 
   [[ "$adopted" == "yes" ]] && die "adopted node — bundle upgrade refused (see upgrade --check)"
-  if [[ "$cur_tag" == "$CORE_TAG" && "$cur_meshref" == "$MESH_REF" ]]; then
-    ok "already at pair (core tag $cur_tag, mesh ref $cur_meshref) — nothing to do"; return 0
+  local pair_now=true
+  [[ "$cur_tag" != "$CORE_TAG" ]] && pair_now=false
+  if $have_mesh && [[ "$cur_meshref" != "$MESH_REF" ]]; then pair_now=false; fi
+  if $pair_now; then
+    ok "already at pair (core tag $cur_tag, mesh ref ${cur_meshref:-n/a}) — nothing to do"; return 0
   fi
 
   # ── pre-flight: health + fresh sqlite backup ─────────────────────
-  local p
-  for p in $(faces_for_profile); do
-    curl -sf -m 2 "http://127.0.0.1:$p/health" >/dev/null 2>&1 \
-      || die "pre-flight: face :$p unhealthy — fix before upgrading"
-  done
+  if [[ -n "${VESMARO_TEST_FAIL_VERIFY:-}" ]]; then
+    warn "TEST MODE (VESMARO_TEST_FAIL_VERIFY): pre-flight health SKIPPED, verify WILL FAIL — rollback drill only"
+  elif $SANDBOX; then
+    warn "sandbox: pre-flight health checks skipped (nothing runs under --dest)"
+  else
+    local p
+    for p in $(faces_for_profile); do
+      curl -sf -m 2 "http://127.0.0.1:$p/health" >/dev/null 2>&1 \
+        || die "pre-flight: face :$p unhealthy — fix before upgrading"
+    done
+  fi
   local mport; mport="$(mesh_metrics_port "${DEST}${CONFDIR}/mesh.yaml")"
-  curl -sf -m 2 "http://127.0.0.1:$mport/healthz" >/dev/null 2>&1 \
-    || warn "pre-flight: mesh healthz not answering on :$mport (continuing)"
-  local bdir; bdir="$(dst "$STATEDIR")/backups/pre-upgrade-$(date +%Y%m%d%H%M%S)"
-  info "pre-flight: sqlite backup -> $bdir"
-  local ddir; ddir="$(dst "$(mf_get data_dir)")/data"
-  [[ -d "$ddir" ]] || ddir="$(dst "$(mf_get data_dir)")"
-  local nb; nb="$(backup_sqlite "$ddir" "$bdir" | tail -1)"
-  [[ "$nb" -gt 0 ]] || die "pre-flight: no sqlite DBs backed up under $ddir — refusing"
+  if $have_mesh && [[ -z "${VESMARO_TEST_FAIL_VERIFY:-}" ]] && ! $SANDBOX; then
+    curl -sf -m 2 "http://127.0.0.1:$mport/healthz" >/dev/null 2>&1 \
+      || warn "pre-flight: mesh healthz not answering on :$mport (continuing)"
+  fi
+  if $SANDBOX; then
+    info "sandbox: sqlite backup skipped (no live data under --dest)"
+  else
+    local bdir; bdir="$(dst "$STATEDIR")/backups/pre-upgrade-$(date +%Y%m%d%H%M%S)"
+    info "pre-flight: sqlite backup -> $bdir"
+    local ddir; ddir="$(dst "$(mf_get data_dir)")/data"
+    [[ -d "$ddir" ]] || ddir="$(dst "$(mf_get data_dir)")"
+    local nb; nb="$(backup_sqlite "$ddir" "$bdir" | tail -1)"
+    [[ "$nb" -gt 0 ]] || die "pre-flight: no sqlite DBs backed up under $ddir — refusing"
+  fi
 
   # ── build both artifacts BEFORE touching the node ───────────────
-  local vrepo mrepo vcache mbin new_cv new_mv
+  local vrepo vcache new_cv
   vrepo="$(ensure_repo vesmaro "$(default_vesmaro_repo)" git@github.com:vesmaro/vesmaro.git)"
   vcache="$(build_venv "$vrepo" "$CORE_REF")"
   new_cv="$(version_core "$vcache/bin/mnemos")"
-  mrepo="$(ensure_repo mnemos-mesh "$(default_mesh_repo)" git@github.com:Korrnals/mnemos-mesh.git)"
-  mbin="$(build_mesh "$mrepo" "$MESH_REF" "$EXPECT_MESHV")"
-  new_mv="$(version_mesh "$mbin")"
+  local mrepo="" mbin="" new_mv=""
+  if $have_mesh; then
+    mrepo="$(ensure_repo mnemos-mesh "$(default_mesh_repo)" git@github.com:Korrnals/mnemos-mesh.git)"
+    mbin="$(build_mesh "$mrepo" "$MESH_REF" "$EXPECT_MESHV")"
+    new_mv="$(version_mesh "$mbin")"
+  fi
 
+  # ── swap area (B2: ERR-trapped — any abort rolls the pair back) ──
+  local ts; ts="$(date +%Y%m%d%H%M%S)"
   local dst_venv dst_bin
-  dst_venv="$(dst "$VENV")"; dst_bin="$(dst "$MESHBIN")"
-  local vprev="" mprev=""
-  info "swap: venv $cur_cv -> $new_cv ; mesh $cur_mv -> $new_mv"
-  mv "$dst_venv" "${dst_venv}.prev-${cur_cv:-unknown}"
-  vprev="${dst_venv}.prev-${cur_cv:-unknown}"
+  dst_venv="$(dst "$VENV")"
+  dst_bin=""
+  if $have_mesh; then dst_bin="$(dst "$MESHBIN")"; fi
+  RB_ACTIVE=true
+  RB_DSTVENV="$dst_venv"; RB_DSTBIN="$dst_bin"
+  RB_VPREV="${dst_venv}.prev-$ts"; RB_MPREV=""
+  RB_CORE_UNIT="$(mf_get units.core)"; RB_BOARD_UNIT="$(mf_get units.board)"; RB_MESH_UNIT=""
+  if $have_mesh; then RB_MESH_UNIT="$(mf_get units.mesh)"; fi
+  RB_MPORT="$mport"; RB_CUR_CV="$cur_cv"; RB_CUR_MV="$cur_mv"
+  trap 'upgrade_swap_err' ERR
+
+  info "swap: venv $cur_cv -> $new_cv"
+  mv "$dst_venv" "$RB_VPREV"
   cp -a "$vcache" "$dst_venv"
-  mv "$dst_bin" "${dst_bin}.prev-${cur_mv:-unknown}"
-  mprev="${dst_bin}.prev-${cur_mv:-unknown}"
-  cp -f "$mbin" "$dst_bin"; chmod 0755 "$dst_bin"
+  if $have_mesh; then
+    RB_MPREV="${dst_bin}.prev-$ts"
+    info "swap: mesh $cur_mv -> $new_mv"
+    mv "$dst_bin" "$RB_MPREV"
+    cp -f "$mbin" "$dst_bin"; chmod 0755 "$dst_bin"
+  fi
 
   # ── restart + verify (core faces first, then mesh) ──────────────
-  local core_unit board_unit mesh_unit u bad=false
-  core_unit="$(mf_get units.core)"; board_unit="$(mf_get units.board)"; mesh_unit="$(mf_get units.mesh)"
+  local core_unit board_unit u bad=false
+  core_unit="$RB_CORE_UNIT"; board_unit="$RB_BOARD_UNIT"
   for u in "$core_unit" "$board_unit"; do
     [[ -n "$u" ]] || continue
     sys restart "$u"
-    wait_health "http://127.0.0.1:$([[ $u == *board* ]] && echo 8788 || echo 8787)/health" 120 || bad=true
+    verify_health "http://127.0.0.1:$([[ $u == *board* ]] && echo 8788 || echo 8787)/health" 120 || bad=true
   done
-  if [[ -n "$mesh_unit" ]]; then
-    sys restart "$mesh_unit"
-    wait_health "http://127.0.0.1:$mport/healthz" 120 || bad=true
-    local got; got="$(curl -sf -m 2 "http://127.0.0.1:$mport/healthz" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)"
-    [[ -n "$EXPECT_MESHV" && "$got" != "$EXPECT_MESHV" ]] && { warn "healthz reports $got, expected $EXPECT_MESHV"; bad=true; }
+  if [[ -n "$RB_MESH_UNIT" ]]; then
+    sys restart "$RB_MESH_UNIT"
+    verify_health "http://127.0.0.1:$mport/healthz" 120 || bad=true
+    if [[ -z "${VESMARO_TEST_FAIL_VERIFY:-}" ]] && ! $SANDBOX; then
+      local got
+      got="$(curl -sf -m 2 "http://127.0.0.1:$mport/healthz" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)"
+      # "v"-prefix tolerant comparison (ledger may say 1.3.2, healthz v1.3.2)
+      if [[ -n "$EXPECT_MESHV" && "${got#v}" != "${EXPECT_MESHV#v}" ]]; then
+        warn "healthz reports ${got:-nothing}, expected $EXPECT_MESHV"; bad=true
+      fi
+    fi
   fi
+
+  trap - ERR   # leaving the protected swap..verify area
 
   if $bad; then
-    warn "health-verify FAILED — rolling back to ($cur_cv, $cur_mv)"
-    rm -rf "$dst_venv"; mv "$vprev" "$dst_venv"
-    mv "$dst_bin" "${dst_bin}.rollback-broken"; mv "$mprev" "$dst_bin"
-    for u in "$core_unit" "$board_unit" "$mesh_unit"; do [[ -n "$u" ]] && sys restart "$u"; done
-    sleep 3
-    for p in $(faces_for_profile); do
-      wait_health "http://127.0.0.1:$p/health" 60 || warn "ROLLBACK face :$p still unhealthy — investigate manually"
-    done
-    die "upgrade FAILED, rollback applied — node should be on ($cur_cv, $cur_mv)"
+    warn "health-verify FAILED — rolling back"
+    rollback_pair
+    die "upgrade FAILED, rollback applied — node should be back on ($cur_cv, ${cur_mv:-no-mesh})"
   fi
 
-  # prune older prev copies, keep the newest
+  # prune older prev copies, keep the newest. Prev names are TIMESTAMPED
+  # (sort chronologically); the old version-suffix scheme sorted 4.10.0
+  # before 4.9.0 and pruned the wrong copy.
   find "$(dirname "$dst_venv")" -maxdepth 1 -name "$(basename "$dst_venv").prev-*" | sort | head -n -1 | xargs -r rm -rf
-  find "$(dirname "$dst_bin")" -maxdepth 1 -name "$(basename "$dst_bin").prev-*" | sort | head -n -1 | xargs -r rm -f
+  if [[ -n "$dst_bin" ]]; then
+    find "$(dirname "$dst_bin")" -maxdepth 1 -name "$(basename "$dst_bin").prev-*" | sort | head -n -1 | xargs -r rm -f
+  fi
 
   mf_write "core_version=$new_cv" "core_tag=$CORE_TAG" "core_ref=$(git -C "$vrepo" rev-parse --short=12 "${CORE_REF}^{commit}" 2>/dev/null || echo "$CORE_REF")" \
-    "mesh_version=$new_mv" "mesh_ref=$MESH_REF" "mesh_sha256=$(sha256_of "$dst_bin")" "pair_mode=$PAIR_MODE"
-  ok "upgrade complete: (vesmaro $new_cv, mesh $new_mv), rollback copies kept (*.prev-*)"
+    "pair_mode=$PAIR_MODE"
+  if $have_mesh; then
+    mf_write "mesh_version=$new_mv" "mesh_ref=$MESH_REF" "mesh_sha256=$(sha256_of "$dst_bin")"
+  fi
+  ok "upgrade complete: (vesmaro $new_cv, mesh ${new_mv:-n/a}), rollback copies kept (*.prev-<ts>)"
 }
 
 # ── STATUS ───────────────────────────────────────────────────────────
@@ -1145,6 +1339,7 @@ while [[ $# -gt 0 ]]; do
     --reconf) RECONF=true; shift ;;
     --force) FORCE=true; shift ;;
     --adopt) ADOPT=true; shift ;;
+    --migrate-adopted) MIGRATE_ADOPTED=true; shift ;;
     --gen-certs) GEN_CERTS=true; shift ;;
     --check) CHECK=true; shift ;;
     --purge) PURGE=true; shift ;;
