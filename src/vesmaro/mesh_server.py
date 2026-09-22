@@ -63,6 +63,41 @@ configured peer's ``allowed_projects`` (or the global ``["*"]``
 wildcard) and returns ``PERMISSION_DENIED`` when the scope is
 disallowed. Fail-closed: unknown peer or empty allow-list → refuse.
 
+Agent data gate (W3 part 3, ADR-0018 variant (c) + ADR-0018-T §3)
+------------------------------------------------------------------
+The mesh's AgentGateway terminates agent-leg RPCs and TRANSLATES them
+to core-leg ``ListMemories`` / ``ReadMemory`` / ``WriteMemory`` calls
+stamped with three metadata keys: ``authorization: Bearer <token>``
+(end-to-end token relay), ``x-mnemos-agent-id`` (the VALIDATED verdict
+agent id), and ``x-mnemos-peer-id`` (the gateway node id — the same
+identity the federation leg uses). This module re-validates the token
+ON THE DATA PATH, per request (TM §3 / criterion 5: the mesh is
+transport, not an ACL authority — defense-in-depth against a
+compromised node calling the data RPCs directly):
+
+* **Additive**: a request WITHOUT ``x-mnemos-agent-id`` takes the
+  unchanged federation path (UDS/mTLS trust as before).
+* **Presence switches on the gate**: missing bearer →
+  ``UNAUTHENTICATED``; any token rejection (signature, expiry,
+  revocation, unknown jti, node binding) → ``UNAUTHENTICATED``; a
+  claimed agent id that does not match the verdict's ``sub`` →
+  ``PERMISSION_DENIED`` (identity derives ONLY from the signature —
+  TM T3/T4); a validation-backend failure → ``INTERNAL`` (fail-closed).
+  The node-binding (``aud``) check runs against the calling node's
+  ``x-mnemos-peer-id`` — the same value the gateway binds at issuance
+  (single-hop topology, TM T1).
+* **Effective scope = token scope ∩ transport-peer ACL** (TM §3),
+  resolved only here. The transport-peer ACL is the existing
+  fail-closed ``allowed_projects`` gate above (ADR-0016 per-peer ACL —
+  the agent rides the same core leg, so it can never see more than
+  that leg already permits); the token's ``project:`` grants can only
+  NARROW it. The class grant gates the method: ``WriteMemory`` requires
+  ``rw`` (a ``read`` token is refused regardless of the peer ACL);
+  list/read are open to both ``read`` and ``rw`` under the same project
+  filtering as the plain path — no filter bypass.
+* **T7 logging**: agent_id / jti / coarse reason only — never token
+  values, never record content.
+
 Fail-closed contract (ACL hardening, vesmaro#371/#369 family):
 
 * **No implicit "all".** The EFFECTIVE allowed set of a peer is its
@@ -133,7 +168,9 @@ from vesmaro import _mesh_gen
 from vesmaro.agent_tokens import (
     AgentTokenStore,
     load_or_create_signing_key,
+    scope_allows_write,
     signing_key_path,
+    token_project_grants,
     validate_agent_token,
 )
 from vesmaro.compact import (
@@ -157,7 +194,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MeshServer", "MeshTCPLegError", "MnemosCoreServicer"]
+__all__ = [
+    "AgentIdentity",
+    "MeshServer",
+    "MeshTCPLegError",
+    "MnemosCoreServicer",
+]
 
 #: Default page size for :rpc:`ListMemories` when the request omits ``limit``.
 #:
@@ -251,6 +293,65 @@ class CompactImportResult:
 #: ``sha256:<hex-of-DER-leaf>``. Bare hex (no prefix) is accepted for
 #: operator convenience and normalised before the constant-time compare.
 _FINGERPRINT_PREFIX: str = "sha256:"
+
+#: gRPC metadata key the mesh's AgentGateway stamps on every translated
+#: core-leg data RPC (W3, ADR-0018 variant (c)): ``x-mnemos-agent-id``
+#: carries the mnemos-VALIDATED verdict agent id — never a caller-asserted
+#: identity (ADR-0018-T T3/T4). Its PRESENCE switches on the agent data
+#: gate: a request without it takes the unchanged federation path.
+_AGENT_ID_METADATA_KEY: str = "x-mnemos-agent-id"
+
+
+@dataclass(frozen=True, slots=True)
+class AgentIdentity:
+    """The authenticated agent identity resolved for one data RPC.
+
+    Produced by :meth:`MnemosCoreServicer._agent_data_gate` (W3 part 3):
+    every field comes from the re-validated token verdict — identity is
+    derived ONLY from the signature (ADR-0018-T T3), never from the
+    caller-asserted ``x-mnemos-agent-id`` (which is matched against the
+    verdict and must equal it, else the RPC is refused).
+    """
+
+    #: Token ``sub`` — the mnemos-validated agent id (audit/log key).
+    agent_id: str
+    #: Token ``jti`` — per-request attribution in logs (ADR-0018-T T7).
+    jti: str
+    #: Canonical token scope grants (``read``/``rw`` + ``project:<slug>``).
+    scope: tuple[str, ...]
+
+
+def _narrow_by_agent_scope(allowed_projects: list[str], agent_scope: Sequence[str]) -> list[str]:
+    """Intersect a peer's effective allowed set with the token's project grants.
+
+    TM §3: the effective scope on the gateway path is ``token scope ∩
+    transport-peer ACL``, resolved ONLY in mnemos (criterion 5). The
+    transport-peer ACL here is the existing fail-closed
+    :attr:`vesmaro.config.PeerConfig.allowed_projects` gate — the agent
+    rides the same core leg the federation peer uses, so it is bounded by
+    whatever that leg already permits. The token's ``project:<slug>``
+    grants can only NARROW that set (an empty grant list narrows nothing:
+    "all projects the effective scope allows", per the scope grammar); a
+    ``"*"`` peer wildcard is already expanded to the ``shared_projects``
+    union by the caller, so the intersection is always concrete slugs.
+    An empty result permits nothing — the caller's existing fail-closed
+    denial applies unchanged.
+    """
+    token_projects = token_project_grants(agent_scope)
+    if not token_projects:
+        return allowed_projects
+    granted = set(token_projects)
+    narrowed = [p for p in allowed_projects if p in granted]
+    if not narrowed:
+        # The peer's own set is non-empty but the token grants miss it
+        # entirely — name the cause so the refusal is not misread as a
+        # peer-ACL problem (correlate via the gate-ok log line).
+        logger.info(
+            "mesh_server: agent token project grants narrowed the effective "
+            "allowed set to empty (grants=%s)",
+            sorted(granted),
+        )
+    return narrowed
 
 
 def _tcp_server_credentials(tls: MeshTCPTLSConfig) -> grpc.ServerCredentials:
@@ -718,6 +819,126 @@ class MnemosCoreServicer:
             return False
         return True
 
+    # ── Agent data gate (W3 part 3, ADR-0018-T §3/§8) ────────────────────────
+
+    @staticmethod
+    def _claimed_agent_id_from_context(context: grpc.ServicerContext[Any, Any]) -> str | None:
+        """Extract the caller-asserted agent id from gRPC metadata.
+
+        The mesh's AgentGateway stamps ``x-mnemos-agent-id`` on every
+        translated core-leg data RPC. Returns ``None`` when the key is
+        absent — the ADDITIVE contract: a request without it is the plain
+        federation path (mTLS/UDS trust, as before), never the agent
+        gate. The value is an UNVERIFIED claim until
+        :meth:`_agent_data_gate` matches it against the token verdict.
+        """
+        for key, value in context.invocation_metadata():
+            if key.lower() == _AGENT_ID_METADATA_KEY:
+                return str(value)
+        return None
+
+    def _agent_data_gate(
+        self,
+        context: grpc.ServicerContext[Any, Any],
+        *,
+        node_id: str,
+        claimed_agent_id: str,
+        rpc: str,
+    ) -> AgentIdentity | None:
+        """Re-validate the agent bearer token on the DATA path (per request).
+
+        ADR-0018-T §3 (criterion 5): the gateway validated the token
+        before translating the RPC, but mnemos RE-VALIDATES on every data
+        request — the mesh is transport, not an ACL authority, and a
+        compromised node must not be able to skip the gate by calling the
+        data RPCs directly. Checks (fail-closed at each step):
+
+        1. ``authorization`` metadata must carry a Bearer token → else
+           ``UNAUTHENTICATED`` (no bearer on an agent request).
+        2. :func:`vesmaro.agent_tokens.validate_agent_token` against the
+           CALLING node id (``node_id`` = the ``x-mnemos-peer-id``
+           transport identity — the same value the gateway binds as
+           ``aud`` at issuance and passes to :rpc:`ValidateAgentToken`;
+           single-hop topology, TM T1): signature, version, lifetime,
+           node binding, jti denylist. Any rejection →
+           ``UNAUTHENTICATED`` with the coarse reason category.
+        3. The verdict's ``agent_id`` must EQUAL the claimed
+           ``x-mnemos-agent-id`` (the gateway relays the verdict id
+           verbatim; a mismatch is a spoof or a broken relay) →
+           ``PERMISSION_DENIED``.
+        4. A store/key initialisation failure → ``INTERNAL`` (never a
+           fabricated pass, never a serving-thread crash).
+
+        The class grant (``rw`` ⊃ ``read``) is enforced by the CALLER
+        (WriteMemory requires ``rw``); the project grants narrow the
+        peer's allowed set via :func:`_narrow_by_agent_scope` at the
+        existing ACL checkpoint of each RPC.
+
+        T7 logging: ``agent_id`` / ``jti`` / coarse reason only — never
+        token values, never record content.
+
+        Returns:
+            The :class:`AgentIdentity` on success, or ``None`` after
+            setting the gRPC status (the caller returns its empty
+            refusal response).
+        """
+        token = self._bearer_from_context(context)
+        if token is None:
+            logger.info(
+                "mesh_server: agent data gate rejected rpc=%s reason=no_bearer claimed_agent_id=%s",
+                rpc,
+                claimed_agent_id,
+            )
+            context.set_code(grpc.StatusCode.UNAUTHENTICATED)
+            context.set_details(
+                "agent data gate: authorization metadata (Bearer <token>) is required"
+            )
+            return None
+        try:
+            store, key = self._token_validation_deps()
+        except Exception as exc:  # surfaced as INTERNAL, logged with cause
+            logger.error("mesh_server: agent data gate deps unavailable rpc=%s (%s)", rpc, exc)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"agent token validation backend unavailable: {exc}")
+            return None
+        verdict = validate_agent_token(token, node_id, store=store, key=key)
+        if not verdict.valid:
+            logger.info(
+                "mesh_server: agent data gate rejected rpc=%s agent_id=%s jti=%s reason=%s",
+                rpc,
+                verdict.agent_id,
+                verdict.jti,
+                verdict.reason,
+            )
+            context.set_code(grpc.StatusCode.UNAUTHENTICATED)
+            context.set_details(f"agent token rejected: {verdict.reason}")
+            return None
+        if verdict.agent_id != claimed_agent_id:
+            logger.info(
+                "mesh_server: agent data gate rejected rpc=%s reason=agent_id_mismatch "
+                "agent_id=%s jti=%s",
+                rpc,
+                verdict.agent_id,
+                verdict.jti,
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(
+                "agent identity mismatch: x-mnemos-agent-id does not match the token subject"
+            )
+            return None
+        logger.info(
+            "mesh_server: agent data gate ok rpc=%s agent_id=%s jti=%s scope=%s",
+            rpc,
+            verdict.agent_id,
+            verdict.jti,
+            ",".join(verdict.scope),
+        )
+        return AgentIdentity(
+            agent_id=verdict.agent_id or "",
+            jti=verdict.jti or "",
+            scope=tuple(verdict.scope),
+        )
+
     # ── RPC: ListMemories ──────────────────────────────────────────────────
 
     def ListMemories(  # noqa: N802 -- gRPC servicer override; name dictated by generated core_pb2_grpc.MnemosCoreServicer
@@ -736,20 +957,25 @@ class MnemosCoreServicer:
            peer's effective allowed set, and an unscoped request is
            intersected with that set. An empty effective set or an empty
            intersection → ``PERMISSION_DENIED`` — never an unfiltered
-           query (fail-closed contract, vesmaro#371/#369).
-        2. Validate ``resume_cursor`` when non-empty: garbage →
+           query (fail-closed contract, vesparo#371/#369).
+        2. W3 agent data gate (additive): when ``x-mnemos-agent-id`` is
+           present, re-validate the bearer token per request
+           (:meth:`_agent_data_gate`) and NARROW the effective set with
+           the token's ``project:`` grants (TM §3). Without the key:
+           unchanged federation behaviour.
+        3. Validate ``resume_cursor`` when non-empty: garbage →
            ``INVALID_ARGUMENT`` (ADR-0020 rule 3 — never a silent empty
            page). A valid checkpoint takes PRIORITY over ``since`` and
            resumes strictly AFTER the checkpointed storage position.
-        3. Query :class:`SQLiteStore.list_all_for_mesh` (rowid ASC walk)
+        4. Query :class:`SQLiteStore.list_all_for_mesh` (rowid ASC walk)
            with the filter fields — one query over the ACL-intersected
            project set, so a page boundary is a project-global checkpoint.
-        4. Exclude ``mnemos:no-federate`` records (defence-in-depth
+        5. Exclude ``mnemos:no-federate`` records (defence-in-depth
            layer 3 — moderation would refuse them anyway).
-        5. Build :class:`CompactRecord` via
+        6. Build :class:`CompactRecord` via
            :func:`vesmaro.compact.build_compact_record` (runs moderation)
            and stamp ``revision`` with the source rowid (ADR-0021 Q10.6).
-        6. Return a page with ``total`` + ``has_more`` + an opaque
+        7. Return a page with ``total`` + ``has_more`` + an opaque
            ``cursor`` checkpoint minted from the last delivered rowid
            (non-empty iff the page is non-empty; empty page → empty
            cursor, byte-identical to a pre-ADR-0020 core).
@@ -775,6 +1001,21 @@ class MnemosCoreServicer:
             return _mesh_gen.core_pb2.ListMemoriesResponse(
                 records=[], total=0, has_more=False, cursor=""
             )
+        # W3 part 3 — agent data gate (additive, ADR-0018-T §3): the
+        # presence of x-mnemos-agent-id marks a gateway-relayed agent
+        # request → the bearer token is re-validated per request and the
+        # agent identity comes ONLY from the verdict. Without the key:
+        # the unchanged federation path.
+        agent: AgentIdentity | None = None
+        claimed_agent_id = self._claimed_agent_id_from_context(context)
+        if claimed_agent_id is not None:
+            agent = self._agent_data_gate(
+                context, node_id=peer_id, claimed_agent_id=claimed_agent_id, rpc="ListMemories"
+            )
+            if agent is None:
+                return _mesh_gen.core_pb2.ListMemoriesResponse(
+                    records=[], total=0, has_more=False, cursor=""
+                )
         if project_scope and self._check_acl(peer_id, project_scope, context) is None:
             return _mesh_gen.core_pb2.ListMemoriesResponse(
                 records=[], total=0, has_more=False, cursor=""
@@ -787,6 +1028,10 @@ class MnemosCoreServicer:
         # into an unfiltered query. An unscoped request intersects to the
         # peer's full allowed set (principle: unscoped = intersection).
         allowed_projects = self._allowed_projects_for_peer(peer_id)
+        if agent is not None:
+            # TM §3: effective scope = token scope ∩ transport-peer ACL —
+            # the token's project grants can only NARROW the peer grant.
+            allowed_projects = _narrow_by_agent_scope(allowed_projects, agent.scope)
         if not allowed_projects:
             logger.info(
                 "mesh_server: ListMemories refused — empty effective allowed set for peer_id=%s",
@@ -915,20 +1160,25 @@ class MnemosCoreServicer:
 
         1. Resolve the caller's peer (same identity rules as ListMemories)
            and enforce the TLS pin on the TCP leg.
-        2. Parse the id: a ``fed:<agent>:<uuid>`` CompactRecord id carries
+        2. W3 agent data gate (additive): when ``x-mnemos-agent-id`` is
+           present, re-validate the bearer token per request
+           (:meth:`_agent_data_gate`); on success the token's
+           ``project:`` grants NARROW the effective set (TM §3).
+           Without the key: unchanged federation behaviour.
+        3. Parse the id: a ``fed:<agent>:<uuid>`` CompactRecord id carries
            the source ``memory.id`` as its tail; anything else is treated
            as a raw memory id (unit-test / operator path).
-        3. Unknown id → ``NOT_FOUND``. ``mnemos:no-federate`` →
+        4. Unknown id → ``NOT_FOUND``. ``mnemos:no-federate`` →
            ``NOT_FOUND`` too — the record's very existence is not
            disclosed (defence-in-depth layer 3).
-        4. ACL GATE (fail-closed, every request): untagged records are
+        5. ACL GATE (fail-closed, every request): untagged records are
            never served on this path; the record's project must be in the
            peer's effective allowed set; an explicit ``request.project``
            must MATCH the record's project (narrowing only).
-        5. Build the CompactRecord via moderation; a moderation refuse →
+        6. Build the CompactRecord via moderation; a moderation refuse →
            ``REFUSED`` trigger code (the call itself succeeds — the code
            is the outcome, mirroring the write path).
-        6. ``revision`` is stamped 0 (= "no revision information", the
+        7. ``revision`` is stamped 0 (= "no revision information", the
            documented proto default): the by-id fetch does not walk the
            rowid list path; stamping a storage revision here would imply
            LWW semantics this leg does not participate in.
@@ -948,6 +1198,15 @@ class MnemosCoreServicer:
         pin_peer = _resolve_peer(self._settings, peer_id)
         if pin_peer is not None and not self._enforce_tls_client_pin(pin_peer, context):
             return _mesh_gen.core_pb2.ReadMemoryResponse(trigger_code=_mesh_gen.fed_pb2.REFUSED)
+        # W3 part 3 — agent data gate (additive; see ListMemories).
+        agent: AgentIdentity | None = None
+        claimed_agent_id = self._claimed_agent_id_from_context(context)
+        if claimed_agent_id is not None:
+            agent = self._agent_data_gate(
+                context, node_id=peer_id, claimed_agent_id=claimed_agent_id, rpc="ReadMemory"
+            )
+            if agent is None:
+                return _mesh_gen.core_pb2.ReadMemoryResponse(trigger_code=_mesh_gen.fed_pb2.REFUSED)
 
         memory_id = record_id.rsplit(":", 1)[-1] if record_id.startswith("fed:") else record_id
         memory = self._manager.get(memory_id)
@@ -970,6 +1229,10 @@ class MnemosCoreServicer:
 
         project = _tag_value(memory.tags, "project:")
         allowed_projects = self._allowed_projects_for_peer(peer_id)
+        if agent is not None:
+            # TM §3: effective scope = token scope ∩ transport-peer ACL —
+            # the token's project grants can only NARROW the peer grant.
+            allowed_projects = _narrow_by_agent_scope(allowed_projects, agent.scope)
         if not allowed_projects or not project or project not in allowed_projects:
             logger.info(
                 "mesh_server: ReadMemory refused — project=%s not in allowed set for peer_id=%s",
@@ -1111,7 +1374,13 @@ class MnemosCoreServicer:
 
     # ── RPC: WriteMemory ───────────────────────────────────────────────────
 
-    def import_compact_record(self, compact: CompactRecord, *, peer_id: str) -> CompactImportResult:
+    def import_compact_record(
+        self,
+        compact: CompactRecord,
+        *,
+        peer_id: str,
+        agent_scope: Sequence[str] | None = None,
+    ) -> CompactImportResult:
         """Import one :class:`CompactRecord` under a peer identity (shared path).
 
         The transport-free core of :rpc:`WriteMemory`, extracted so the
@@ -1120,14 +1389,15 @@ class MnemosCoreServicer:
         moderation, :meth:`MemoryManager.add` (Layer 1 secrets scanner)
         — without spinning up a gRPC server. The RPC handler resolves
         the transport concerns (import-mode validation, RESTORE gate,
-        peer identity from gRPC metadata, TLS pinning) and delegates
-        here; callers that classify outcomes map :attr:`status` onto
-        their own counters (the Go pull maps the proto trigger codes
-        1:1 onto written/duplicate/gated — see ``writeOutcome`` there).
+        peer identity from gRPC metadata, TLS pinning, the W3 agent
+        data gate) and delegates here; callers that classify outcomes
+        map :attr:`status` onto their own counters (the Go pull maps
+        the proto trigger codes 1:1 onto written/duplicate/gated — see
+        ``writeOutcome`` there).
 
         Order of gates (unchanged by the extraction):
 
-        1. ACL GATE — fail-closed (vesmaro#371/#369 family), BEFORE the
+        1. ACL GATE — fail-closed (vesparo#371/#369 family), BEFORE the
            duplicate gate, moderation, and any storage mutation:
            (a) an empty effective allowed set (unknown peer, empty
            allow-list, ``"*"`` with an empty shared_projects) denies;
@@ -1135,6 +1405,10 @@ class MnemosCoreServicer:
            deny; (c) the record's project must be IN the effective
            allowed set (for a ``"*"`` peer that is the shared_projects
            union — symmetric with the read-side intersection).
+           With ``agent_scope`` (the gateway-relayed agent token's
+           scope, W3 part 3) the allowed set is additionally narrowed
+           by the token's ``project:`` grants (TM §3 effective scope =
+           token ∩ transport-peer ACL — narrowing only).
         2. #359 duplicate gate by ``fed_id`` (fallback ``title`` +
            ``source_agent``): a hit refreshes
            ``metadata.last_fed_at`` (when present) and reports
@@ -1152,6 +1426,10 @@ class MnemosCoreServicer:
                 this is the mesh node calling in; on the lazy-fetch leg
                 it is the record's ORIGIN peer (we trust an origin for
                 exactly what its ``allowed_projects`` grants).
+            agent_scope: The re-validated agent token's scope grants
+                when the import arrived via the W3 gateway path
+                (:class:`AgentIdentity.scope`), else ``None`` (federation
+                / lazy-fetch — the gate is a no-op, unchanged behaviour).
 
         Returns:
             A :class:`CompactImportResult`; never raises for policy
@@ -1160,6 +1438,8 @@ class MnemosCoreServicer:
         project = _tag_value(compact.tags, "project:")
         agent = _tag_value(compact.tags, "agent:") or compact.source_agent
         allowed_projects = self._allowed_projects_for_peer(peer_id)
+        if agent_scope is not None:
+            allowed_projects = _narrow_by_agent_scope(allowed_projects, agent_scope)
         if not allowed_projects:
             logger.info(
                 "mesh_server: WriteMemory refused — empty effective allowed set for peer_id=%s",
@@ -1277,9 +1557,17 @@ class MnemosCoreServicer:
            RESTORE; RESTORE requires ``confirm=True`` (hard gate).
         2. Resolve the peer from gRPC metadata (single-peer fallback for
            tests) and enforce the W2.5 TLS client-cert pin.
-        3. Delegate to :meth:`import_compact_record` — the shared
+        3. W3 agent data gate (additive): when ``x-mnemos-agent-id`` is
+           present, re-validate the bearer token per request
+           (:meth:`_agent_data_gate`) and require the ``rw`` class
+           grant — a ``read``-scoped token is refused with
+           ``PERMISSION_DENIED`` regardless of the peer ACL. Without
+           the key: unchanged federation behaviour.
+        4. Delegate to :meth:`import_compact_record` — the shared
            in-process import path (ACL gate → #359 duplicate gate →
-           moderation → :meth:`MemoryManager.add`); the result maps
+           moderation → :meth:`MemoryManager.add`, with the token's
+           ``project:`` grants narrowing the allowed set via
+           ``agent_scope``); the result maps
            onto the response trigger code (``EXHAUSTIVE`` on clean
            merge, ``ALREADY_EXHAUSTED`` on a duplicate, ``REFUSED`` on
            an ACL or moderation refusal, with ``PERMISSION_DENIED`` set
@@ -1340,7 +1628,39 @@ class MnemosCoreServicer:
                 mode_applied=mode_applied,
                 trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
             )
-        result = self.import_compact_record(compact, peer_id=peer_id)
+        # W3 part 3 — agent data gate (additive; see ListMemories), plus
+        # the WRITE class grant: ``rw`` ⊃ ``read`` — a read-scoped agent
+        # token must not import records, no matter what the peer ACL says.
+        agent: AgentIdentity | None = None
+        claimed_agent_id = self._claimed_agent_id_from_context(context)
+        if claimed_agent_id is not None:
+            agent = self._agent_data_gate(
+                context, node_id=peer_id, claimed_agent_id=claimed_agent_id, rpc="WriteMemory"
+            )
+            if agent is None:
+                return _mesh_gen.core_pb2.WriteMemoryResponse(
+                    written_id="",
+                    mode_applied=mode_applied,
+                    trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+                )
+            if not scope_allows_write(agent.scope):
+                logger.info(
+                    "mesh_server: WriteMemory refused — agent scope lacks rw (agent_id=%s jti=%s)",
+                    agent.agent_id,
+                    agent.jti,
+                )
+                context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+                context.set_details("agent token scope is read-only — WriteMemory requires rw")
+                return _mesh_gen.core_pb2.WriteMemoryResponse(
+                    written_id="",
+                    mode_applied=mode_applied,
+                    trigger_code=_trigger_code_to_proto(TriggerCode.REFUSED),
+                )
+        result = self.import_compact_record(
+            compact,
+            peer_id=peer_id,
+            agent_scope=agent.scope if agent is not None else None,
+        )
         if result.status is CompactImportStatus.REFUSED_ACL:
             context.set_code(grpc.StatusCode.PERMISSION_DENIED)
             context.set_details(result.reason)

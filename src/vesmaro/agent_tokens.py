@@ -59,6 +59,7 @@ import os
 import sqlite3
 import threading
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -89,6 +90,7 @@ __all__ = [
     "rotate_agent_token",
     "scope_allows_write",
     "signing_key_path",
+    "token_project_grants",
     "validate_agent_token",
 ]
 
@@ -218,10 +220,24 @@ def parse_scope(spec: str) -> list[str]:
     return [class_grant, *(f"project:{p}" for p in sorted(projects))]
 
 
-def scope_allows_write(scope: list[str] | str) -> bool:
+def scope_allows_write(scope: Sequence[str]) -> bool:
     """True when the (parsed or stored) scope carries the ``rw`` grant."""
     grants = scope.split(",") if isinstance(scope, str) else scope
     return SCOPE_RW in grants
+
+
+def token_project_grants(scope: Sequence[str]) -> list[str]:
+    """Project slugs a token scope narrows to (``[]`` = no narrowing).
+
+    The scope grammar's ``project:<slug>`` grants can only NARROW the
+    effective scope (token ∩ transport-peer ACL, TM §3); an empty result
+    means "every project the transport peer's ACL already allows". Used
+    by the core-leg data gate (W3 part 3) to intersect the peer's
+    effective allowed set with the token's project grants — an agent can
+    never see more than the underlying peer leg permits.
+    """
+    grants = scope.split(",") if isinstance(scope, str) else scope
+    return [g[len("project:") :] for g in grants if g.startswith("project:")]
 
 
 # ── Claims + envelope ─────────────────────────────────────────────────────────
