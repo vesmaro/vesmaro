@@ -414,14 +414,24 @@ def load_or_create_signing_key(path: Path) -> Ed25519PrivateKey:
         encryption_algorithm=serialization.NoEncryption(),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Review N2: write via temp + os.replace so a crash mid-write can
+    # never leave a torn PEM under the final path (the docstring
+    # promises exactly that; a direct O_EXCL write to the final name
+    # did not uphold it).
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         return _load_signing_key(path)  # concurrent first-use race: load the winner
     with os.fdopen(fd, "wb") as handle:
         handle.write(pem)
         handle.flush()
         os.fsync(handle.fileno())
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
     os.chmod(path, 0o600)
     logger.info("agent_tokens: generated new Ed25519 signing key at %s", path)
     return _load_signing_key(path)  # round-trip through disk: one code path
@@ -709,6 +719,12 @@ def validate_agent_token(
     per host) — a string compare would add no security.
     """
     moment = now if now is not None else int(datetime.now(UTC).timestamp())
+
+    # Review N3 (defense-in-depth): a sane length cap BEFORE parsing —
+    # gRPC metadata limits will bound this on the wire, but the validator
+    # stays cheap and bounded standalone too.
+    if not token or len(token) > 8192:
+        return AgentTokenVerdict(rejected="malformed")
 
     try:
         claims = decode_agent_token(token, key)

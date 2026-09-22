@@ -181,6 +181,10 @@ def token_revoke(
     if agent is None and jti is None:
         console.print("[red]Provide --agent <id> (revoke all) or --jti <id> (revoke one).[/red]")
         raise typer.Exit(1)
+    if agent is not None and jti is not None:
+        # Review N4: giving both silently favoured --jti — refuse loudly.
+        console.print("[red]--agent and --jti are mutually exclusive.[/red]")
+        raise typer.Exit(1)
     settings = _resolve_settings(config)
     store = AgentTokenStore(settings.db_path)
     try:
