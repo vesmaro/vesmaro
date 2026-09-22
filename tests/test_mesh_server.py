@@ -29,6 +29,14 @@ tests cover:
   read AND write; untagged WriteMemory records are refused; wildcard
   read/write is bounded by ``shared_projects``.
 * Server lifecycle (start/stop cleanly, socket cleanup, context manager).
+* W3 agent data gate (ADR-0018-T §3, criterion 5): a request without
+  ``x-mnemos-agent-id`` keeps the federation path unchanged (additive);
+  with the key, the bearer is re-validated per request — a valid read
+  token lists/reads but cannot write, an rw token writes, garbage /
+  expired / revoked / cross-node (aud) tokens and a missing bearer →
+  ``UNAUTHENTICATED``, a spoofed agent id → ``PERMISSION_DENIED``, and
+  the token's ``project:`` grants NARROW the transport-peer ACL on both
+  the list and write paths (TM §3 effective scope = token ∩ peer ACL).
 
 The tests use the real :class:`MemoryManager` against a tmp SQLite store
 so the moderation pipeline + Layer 1 secrets scanner run for real.
@@ -1549,3 +1557,340 @@ class TestValidateAgentToken:
         assert key_path.exists()
         mode = stat.S_IMODE(key_path.stat().st_mode)
         assert mode == 0o600
+
+
+# ── Agent data gate (W3 part 3, ADR-0018-T §3 — data-path re-validation) ─────
+
+
+def _agent_metadata(
+    token: str | None,
+    agent_id: str,
+    *,
+    node: str = _PEER_ID,
+) -> list[tuple[str, str]]:
+    """Build the core-leg metadata triple the gateway stamps on translated
+    agent RPCs (mnemos-mesh ``internal/gateway``): peer id + validated
+    agent id + the end-to-end bearer relay.
+
+    ``token=None`` omits the authorization key (the no-bearer case);
+    ``node`` defaults to the configured peer id — the aud the tokens in
+    these tests are minted for (single-hop: gateway node id == peer id).
+    """
+    md: list[tuple[str, str]] = [("x-mnemos-peer-id", node), ("x-mnemos-agent-id", agent_id)]
+    if token is not None:
+        md.append(("authorization", f"Bearer {token}"))
+    return md
+
+
+def _issue(settings: Settings, *, agent_id: str, scope: str, node: str = _PEER_ID) -> str:
+    """Mint + register a token against the SAME store/key the servicer uses."""
+    store, key = _token_mint_deps(settings)
+    token, _claims = issue_agent_token(
+        agent_id=agent_id,
+        node_id=node,
+        scope_spec=scope,
+        store=store,
+        key=key,
+    )
+    return token
+
+
+@pytest.fixture
+def multi_project_env(
+    tmp_path: Path,
+) -> Generator[tuple[MeshServer, Settings, MemoryManager], None, None]:
+    """Server whose peer is allowed BOTH projects, one seed record in each.
+
+    Isolates the TM §3 NARROWING axis from the peer-ACL axis: the peer
+    alone would serve both projects, so any single-project visibility in
+    the tests using this fixture comes from the TOKEN's project grants.
+    """
+    base = tmp_path / "mp"
+    settings = _settings_with_peer(
+        base, allowed=[_PROJECT, _PROJECT_OTHER], shared=[_PROJECT, _PROJECT_OTHER]
+    )
+    manager = MemoryManager(settings)
+    mock_embedder = MagicMock()
+    mock_embedder.embed.return_value = [0.1] * 384
+    manager._embedder = mock_embedder
+    for project in (_PROJECT, _PROJECT_OTHER):
+        manager.add(
+            MemoryCreate(
+                content=f"Agent-gate narrowing seed for {project}.",
+                title=f"Seed {project}",
+                tags=[f"project:{project}", f"agent:{_AGENT}", "mnemos:decision"],
+                source=MemorySource.MANUAL,
+            ),
+            project=project,
+            agent=_AGENT,
+        )
+    srv = MeshServer(str(base / "core.sock"), manager, settings, max_workers=2)
+    srv.start()
+    yield srv, settings, manager
+    srv.stop(grace=0.5)
+    manager.close()
+
+
+class TestAgentDataGate:
+    """Per-request token re-validation on ListMemories/ReadMemory/WriteMemory.
+
+    Contract under test (ADR-0018-T §3, criterion 5): the presence of
+    ``x-mnemos-agent-id`` switches on the gate — the bearer is
+    re-validated per request, identity comes ONLY from the verdict, the
+    effective scope is token ∩ transport-peer ACL, and a request WITHOUT
+    the key keeps the unchanged federation behaviour (additive).
+    """
+
+    def test_no_agent_metadata_keeps_legacy_path(self, server: MeshServer) -> None:
+        """No x-mnemos-agent-id → the plain federation path is unchanged."""
+        _wait_for_server(server)
+        stub = _stub(server)
+        response = stub.ListMemories(
+            _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+            timeout=2.0,
+        )
+        assert response.total >= 2  # the seeded fixture records — served
+
+    def test_read_agent_can_list_and_read(self, server: MeshServer, settings: Settings) -> None:
+        """A valid read-scoped token serves List and Read (rw ⊃ read too)."""
+        token = _issue(settings, agent_id="harness-ro", scope="read")
+        _wait_for_server(server)
+        stub = _stub(server)
+        listed = stub.ListMemories(
+            _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+            metadata=_agent_metadata(token, "harness-ro"),
+            timeout=2.0,
+        )
+        assert listed.records, "read agent must list the allowed project"
+        record_id = str(listed.records[0].id)
+        read = stub.ReadMemory(
+            _mesh_gen.core_pb2.ReadMemoryRequest(record_id=record_id),
+            metadata=_agent_metadata(token, "harness-ro"),
+            timeout=2.0,
+        )
+        assert read.record.id == record_id
+        assert read.trigger_code == _mesh_gen.fed_pb2.EXHAUSTIVE
+
+    def test_read_agent_write_denied(self, server: MeshServer, settings: Settings) -> None:
+        """WriteMemory with a read-scoped token → PERMISSION_DENIED, no write."""
+        token = _issue(settings, agent_id="harness-ro", scope="read")
+        _wait_for_server(server)
+        stub = _stub(server)
+        record = _make_compact_record(record_id="fed:harness-ro:gate-1")
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.WriteMemory(
+                _mesh_gen.core_pb2.WriteMemoryRequest(
+                    record=_to_proto_record(record),
+                    import_mode=_mesh_gen.core_pb2.ImportMode.MERGE,
+                ),
+                metadata=_agent_metadata(token, "harness-ro"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
+        servicer = server.servicer
+        assert servicer is not None
+        assert servicer._manager.sqlite.find_federated_duplicate(fed_id=record.id) is None
+
+    def test_rw_agent_write_ok(self, server: MeshServer, settings: Settings) -> None:
+        """An rw-scoped token imports a record (trigger EXHAUSTIVE + persisted)."""
+        token = _issue(settings, agent_id="harness-rw", scope="rw")
+        _wait_for_server(server)
+        stub = _stub(server)
+        record = _make_compact_record(record_id="fed:harness-rw:gate-2")
+        response = stub.WriteMemory(
+            _mesh_gen.core_pb2.WriteMemoryRequest(
+                record=_to_proto_record(record),
+                import_mode=_mesh_gen.core_pb2.ImportMode.MERGE,
+            ),
+            metadata=_agent_metadata(token, "harness-rw"),
+            timeout=2.0,
+        )
+        assert response.trigger_code == _mesh_gen.fed_pb2.EXHAUSTIVE
+        assert response.written_id
+        servicer = server.servicer
+        assert servicer is not None
+        assert servicer._manager.get(response.written_id) is not None
+
+    def test_garbage_token_unauthenticated(self, server: MeshServer, settings: Settings) -> None:
+        """A non-envelope bearer → UNAUTHENTICATED (fail-closed, no crash)."""
+        _token_mint_deps(settings)  # key exists — rejection is on signature
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+                metadata=_agent_metadata("not-a-token-at-all", "harness-x"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+    def test_expired_token_unauthenticated(self, server: MeshServer, settings: Settings) -> None:
+        """An expired token → UNAUTHENTICATED on the data path."""
+        import time as _time
+
+        store, key = _token_mint_deps(settings)
+        token, _claims = issue_agent_token(
+            agent_id="harness-old",
+            node_id=_PEER_ID,
+            scope_spec="read",
+            store=store,
+            key=key,
+            ttl_hours=1.0,
+            now=int(_time.time()) - 7200,
+        )
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ReadMemory(
+                _mesh_gen.core_pb2.ReadMemoryRequest(record_id="fed:a:b"),
+                metadata=_agent_metadata(token, "harness-old"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+    def test_revoked_token_unauthenticated(self, server: MeshServer, settings: Settings) -> None:
+        """A revoked jti → UNAUTHENTICATED (denylist checked per request)."""
+        import time as _time
+
+        store, key = _token_mint_deps(settings)
+        token, claims = issue_agent_token(
+            agent_id="harness-rev",
+            node_id=_PEER_ID,
+            scope_spec="read",
+            store=store,
+            key=key,
+        )
+        assert store.revoke_jti(claims.jti, now=int(_time.time()))
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+                metadata=_agent_metadata(token, "harness-rev"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+    def test_spoofed_agent_id_permission_denied(
+        self, server: MeshServer, settings: Settings
+    ) -> None:
+        """A VALID token for agent A claiming x-mnemos-agent-id=B → refused.
+
+        Identity derives ONLY from the validated token (TM T3/T4): the
+        claimed metadata id must EQUAL the verdict subject.
+        """
+        token = _issue(settings, agent_id="harness-real", scope="read")
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+                metadata=_agent_metadata(token, "harness-impostor"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_missing_bearer_unauthenticated(self, server: MeshServer) -> None:
+        """x-mnemos-agent-id WITHOUT an authorization bearer → refused."""
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+                metadata=_agent_metadata(None, "harness-nobearer"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+    def test_non_bearer_scheme_unauthenticated(
+        self, server: MeshServer, settings: Settings
+    ) -> None:
+        """A Basic-scheme authorization on an agent request → refused."""
+        token = _issue(settings, agent_id="harness-scheme", scope="read")
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+                metadata=[
+                    ("x-mnemos-peer-id", _PEER_ID),
+                    ("x-mnemos-agent-id", "harness-scheme"),
+                    ("authorization", f"Basic {token}"),
+                ],
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+    def test_aud_mismatch_rejected(self, server: MeshServer, settings: Settings) -> None:
+        """A token minted for ANOTHER gateway node → UNAUTHENTICATED.
+
+        The data path binds aud to the CALLING node (x-mnemos-peer-id)
+        — the same value the gateway binds at issuance — so a token
+        replayed through a different node fails closed (TM T1).
+        """
+        token = _issue(settings, agent_id="harness-aud", scope="read", node="mesh-node-OTHER")
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+                metadata=_agent_metadata(token, "harness-aud"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+    def test_token_project_grant_narrows_list(
+        self, multi_project_env: tuple[MeshServer, Settings, MemoryManager]
+    ) -> None:
+        """Unscoped list with a project:other token → ONLY that project.
+
+        The peer alone allows both projects (fixture); the single-project
+        page proves the narrowing comes from the TOKEN (TM §3 effective
+        scope = token ∩ transport-peer ACL).
+        """
+        server, settings, _manager = multi_project_env
+        token = _issue(settings, agent_id="harness-narrow", scope=f"read,project:{_PROJECT_OTHER}")
+        _wait_for_server(server)
+        stub = _stub(server)
+        response = stub.ListMemories(
+            _mesh_gen.core_pb2.ListMemoriesRequest(),
+            metadata=_agent_metadata(token, "harness-narrow"),
+            timeout=2.0,
+        )
+        assert response.records, "the narrowed project must still be served"
+        served_projects = {
+            t[len("project:") :]
+            for rec in response.records
+            for t in rec.tags
+            if t.startswith("project:")
+        }
+        assert served_projects == {_PROJECT_OTHER}
+
+    def test_token_project_grant_blocks_other_projects(
+        self, multi_project_env: tuple[MeshServer, Settings, MemoryManager]
+    ) -> None:
+        """A scoped list for a non-granted project → PERMISSION_DENIED, and a
+        write into a non-granted project → REFUSED (narrowing on write too).
+        """
+        server, settings, _manager = multi_project_env
+        token = _issue(settings, agent_id="harness-narrow", scope=f"rw,project:{_PROJECT_OTHER}")
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+                metadata=_agent_metadata(token, "harness-narrow"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
+        record = _make_compact_record(record_id="fed:harness-narrow:gate-3", project=_PROJECT)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.WriteMemory(
+                _mesh_gen.core_pb2.WriteMemoryRequest(
+                    record=_to_proto_record(record),
+                    import_mode=_mesh_gen.core_pb2.ImportMode.MERGE,
+                ),
+                metadata=_agent_metadata(token, "harness-narrow"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
