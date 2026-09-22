@@ -47,6 +47,14 @@ import pytest
 from pydantic import ValidationError
 
 from vesmaro import _mesh_gen
+from vesmaro.agent_tokens import (
+    AgentTokenClaims,
+    AgentTokenStore,
+    encode_agent_token,
+    issue_agent_token,
+    load_or_create_signing_key,
+    signing_key_path,
+)
 from vesmaro.compact import CompactRecord
 from vesmaro.config import FederationConfig, PeerConfig, Settings
 from vesmaro.manager import MemoryManager
@@ -1324,3 +1332,220 @@ class TestReadMemory:
         )
         assert response.trigger_code == _mesh_gen.fed_pb2.REFUSED
         assert not response.record.id
+
+
+# ── ValidateAgentToken (W3 part 2, ADR-0018-T §3/§8 launch condition 2) ───────
+
+
+#: Gateway node id used as the token `aud` in these tests (the mesh node
+#: that would call this RPC on every agent request).
+_GATEWAY_NODE = "mesh-node-1"
+
+
+def _token_mint_deps(settings: Settings) -> tuple[AgentTokenStore, Any]:
+    """Build the mint-side store + key mirroring the servicer's lazy deps.
+
+    The key file lands at the SAME path ``_token_validation_deps``
+    resolves (``<data_dir>/agent-token-signing.key``, no config
+    override), so tokens minted here verify against the server's key.
+    """
+    settings.mnemos.data_dir.mkdir(parents=True, exist_ok=True)
+    key = load_or_create_signing_key(
+        signing_key_path(
+            settings.mnemos.data_dir, override=settings.federation.agent_token_key_path
+        )
+    )
+    return AgentTokenStore(settings.db_path), key
+
+
+class TestValidateAgentToken:
+    """Wire wrapper over validate_agent_token — verdict matrix, fail-closed."""
+
+    def _call(
+        self,
+        server: MeshServer,
+        token: str | None,
+        *,
+        node_id: str = _GATEWAY_NODE,
+        scheme: str = "Bearer",
+        timeout: float = 2.0,
+    ) -> Any:
+        """Invoke the RPC; token=None sends NO authorization metadata."""
+        _wait_for_server(server)
+        stub = _stub(server)
+        metadata: list[tuple[str, str]] = [("x-mnemos-peer-id", _PEER_ID)]
+        if token is not None:
+            metadata.append(("authorization", f"{scheme} {token}"))
+        return stub.ValidateAgentToken(
+            _mesh_gen.core_pb2.ValidateAgentTokenRequest(gateway_node_id=node_id),
+            metadata=metadata,
+            timeout=timeout,
+        )
+
+    def test_valid_rw_token_full_verdict(self, server: MeshServer, settings: Settings) -> None:
+        store, key = _token_mint_deps(settings)
+        token, claims = issue_agent_token(
+            agent_id="harness-a",
+            node_id=_GATEWAY_NODE,
+            scope_spec="rw",
+            store=store,
+            key=key,
+        )
+        response = self._call(server, token)
+        assert response.valid is True
+        assert response.agent_id == "harness-a"
+        assert list(response.scope) == ["rw"]
+        assert response.jti == claims.jti
+        assert response.aud == _GATEWAY_NODE
+        assert response.exp_ok is True
+        assert response.revoked is False
+        assert response.reason == ""
+
+    def test_read_scope_propagates(self, server: MeshServer, settings: Settings) -> None:
+        store, key = _token_mint_deps(settings)
+        token, _claims = issue_agent_token(
+            agent_id="harness-ro",
+            node_id=_GATEWAY_NODE,
+            scope_spec="read",
+            store=store,
+            key=key,
+        )
+        response = self._call(server, token)
+        assert response.valid is True
+        assert list(response.scope) == ["read"]
+
+    def test_revoked_token_fails_closed(self, server: MeshServer, settings: Settings) -> None:
+        import time as _time
+
+        store, key = _token_mint_deps(settings)
+        token, claims = issue_agent_token(
+            agent_id="harness-b",
+            node_id=_GATEWAY_NODE,
+            scope_spec="read",
+            store=store,
+            key=key,
+        )
+        assert store.revoke_jti(claims.jti, now=int(_time.time()))
+        response = self._call(server, token)
+        assert response.valid is False
+        assert response.revoked is True
+        assert response.reason == "revoked"
+        assert response.agent_id == "harness-b"
+
+    def test_aud_mismatch_rejected(self, server: MeshServer, settings: Settings) -> None:
+        """A token minted for ANOTHER gateway node is rejected (aud binding)."""
+        store, key = _token_mint_deps(settings)
+        token, _claims = issue_agent_token(
+            agent_id="harness-c",
+            node_id="mesh-node-OTHER",
+            scope_spec="read",
+            store=store,
+            key=key,
+        )
+        response = self._call(server, token)
+        assert response.valid is False
+        assert response.reason == "aud_mismatch"
+
+    def test_expired_token_rejected(self, server: MeshServer, settings: Settings) -> None:
+        import time as _time
+
+        store, key = _token_mint_deps(settings)
+        now = int(_time.time())
+        # Minted 2h ago with a 1h TTL — comfortably expired.
+        token, _claims = issue_agent_token(
+            agent_id="harness-d",
+            node_id=_GATEWAY_NODE,
+            scope_spec="read",
+            store=store,
+            key=key,
+            ttl_hours=1.0,
+            now=now - 7200,
+        )
+        response = self._call(server, token)
+        assert response.valid is False
+        assert response.reason == "expired"
+        assert response.exp_ok is False
+
+    def test_unknown_jti_fails_closed(self, server: MeshServer, settings: Settings) -> None:
+        """A correctly-signed envelope with an UNREGISTERED jti is rejected."""
+        import time as _time
+        import uuid as _uuid
+
+        _store, key = _token_mint_deps(settings)
+        now = int(_time.time())
+        claims = AgentTokenClaims(
+            iss="mnemos",
+            sub="harness-e",
+            aud=_GATEWAY_NODE,
+            scope=["read"],
+            iat=now - 60,
+            exp=now + 3600,
+            jti=_uuid.uuid4().hex,
+        )
+        response = self._call(server, encode_agent_token(claims, key))
+        assert response.valid is False
+        assert response.reason == "unknown_jti"
+
+    def test_garbage_token_is_malformed_not_crash(
+        self, server: MeshServer, settings: Settings
+    ) -> None:
+        _token_mint_deps(settings)  # key exists — rejects on signature, not deps
+        response = self._call(server, "not-a-token-at-all")
+        assert response.valid is False
+        assert response.reason in {"malformed", "bad_signature"}
+        assert response.agent_id == ""
+
+    def test_missing_authorization_metadata_is_invalid_argument(self, server: MeshServer) -> None:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            self._call(server, None)
+        assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+    def test_non_bearer_scheme_is_invalid_argument(
+        self, server: MeshServer, settings: Settings
+    ) -> None:
+        store, key = _token_mint_deps(settings)
+        token, _claims = issue_agent_token(
+            agent_id="harness-f",
+            node_id=_GATEWAY_NODE,
+            scope_spec="read",
+            store=store,
+            key=key,
+        )
+        with pytest.raises(grpc.RpcError) as exc_info:
+            self._call(server, token, scheme="Basic")
+        assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+    def test_empty_gateway_node_id_is_invalid_argument(
+        self, server: MeshServer, settings: Settings
+    ) -> None:
+        store, key = _token_mint_deps(settings)
+        token, _claims = issue_agent_token(
+            agent_id="harness-g",
+            node_id=_GATEWAY_NODE,
+            scope_spec="read",
+            store=store,
+            key=key,
+        )
+        with pytest.raises(grpc.RpcError) as exc_info:
+            self._call(server, token, node_id="")
+        assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+    def test_signing_key_minted_0600_on_first_use(
+        self, server: MeshServer, settings: Settings
+    ) -> None:
+        """First validated RPC mints the key file with owner-only perms."""
+        store, key = _token_mint_deps(settings)
+        token, _claims = issue_agent_token(
+            agent_id="harness-h",
+            node_id=_GATEWAY_NODE,
+            scope_spec="read",
+            store=store,
+            key=key,
+        )
+        assert self._call(server, token).valid is True
+        key_path = signing_key_path(
+            settings.mnemos.data_dir, override=settings.federation.agent_token_key_path
+        )
+        assert key_path.exists()
+        mode = stat.S_IMODE(key_path.stat().st_mode)
+        assert mode == 0o600

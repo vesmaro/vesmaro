@@ -114,6 +114,7 @@ import json
 import logging
 import os
 import ssl
+import threading
 import time
 from collections.abc import Sequence
 from concurrent import futures
@@ -124,10 +125,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import grpc
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import ValidationError
 
 from vesmaro import __version__ as _mnemos_version
 from vesmaro import _mesh_gen
+from vesmaro.agent_tokens import (
+    AgentTokenStore,
+    load_or_create_signing_key,
+    signing_key_path,
+    validate_agent_token,
+)
 from vesmaro.compact import (
     CONTENT_STATE_AVAILABLE,
     METADATA_SCHEMA,
@@ -601,6 +609,12 @@ class MnemosCoreServicer:
         self._manager: MemoryManager = manager
         self._settings: Settings = settings
         self._start_time: float = start_time if start_time is not None else time.monotonic()
+        # W3 part 2 (ValidateAgentToken): lazily-initialised agent-token
+        # validation deps — see _token_validation_deps. None until the
+        # first agent RPC arrives (first-use key mint, ADR-0018-T §3).
+        self._token_store: AgentTokenStore | None = None
+        self._token_key: Ed25519PrivateKey | None = None
+        self._token_deps_lock: threading.Lock = threading.Lock()
 
     # ── ACL helper ─────────────────────────────────────────────────────────
 
@@ -993,6 +1007,107 @@ class MnemosCoreServicer:
             record=_compact_to_proto(rec),
             trigger_code=_mesh_gen.fed_pb2.EXHAUSTIVE,
         )
+
+    # ── RPC: ValidateAgentToken ──────────────────────────────────────────
+
+    def ValidateAgentToken(  # noqa: N802 -- gRPC servicer override; name dictated by generated core_pb2_grpc.MnemosCoreServicer
+        self,
+        request: Any,
+        context: grpc.ServicerContext[Any, Any],
+    ) -> Any:
+        """Validate an AgentGateway bearer token (W3 part 2, ADR-0018-T §3/§8).
+
+        Thin wire wrapper around :func:`vesmaro.agent_tokens.validate_agent_token`
+        — this RPC is the launch-condition-2 validation hook the mesh's
+        AgentGateway calls on EVERY agent request before translating it to
+        a data RPC. The token rides in the ``authorization`` metadata key
+        (``Bearer <token>``), NEVER in the request message (ADR-0018-T §2:
+        a message field could reach logs). The core leg itself is already
+        authenticated (UDS filesystem isolation or mesh-CA mTLS), so only
+        the mesh can reach this RPC.
+
+        The verdict (not a bare bool) is returned so the gateway can
+        rate-limit per agent and log a precise reject reason to its
+        ``gateway_query`` category — mnemos keeps sole authority over
+        signature verification, revocation, and (per data RPC) the
+        effective-scope gate (criterion 5).
+
+        Fail-closed mapping:
+
+        * missing/empty ``authorization`` metadata, a non-Bearer scheme,
+          or an empty ``gateway_node_id`` → ``INVALID_ARGUMENT`` (a
+          malformed RPC from the mesh, not a token verdict);
+        * a store/key initialisation failure (unreadable signing key,
+          locked DB) → ``INTERNAL`` — never crash the serving thread,
+          never return a fabricated ``valid=True``;
+        * anything else → the honest verdict, including ``valid=False``
+          with the per-check ``reason``.
+        """
+        node_id = str(request.gateway_node_id or "")
+        if not node_id:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("gateway_node_id must be non-empty")
+            return _mesh_gen.core_pb2.ValidateAgentTokenResponse()
+        token = self._bearer_from_context(context)
+        if token is None:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("authorization metadata (Bearer <token>) is required")
+            return _mesh_gen.core_pb2.ValidateAgentTokenResponse()
+
+        try:
+            store, key = self._token_validation_deps()
+        except Exception as exc:  # surfaced as INTERNAL, logged with cause
+            logger.error("mesh_server: ValidateAgentToken deps unavailable (%s)", exc)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"token validation backend unavailable: {exc}")
+            return _mesh_gen.core_pb2.ValidateAgentTokenResponse()
+
+        verdict = validate_agent_token(token, node_id, store=store, key=key)
+        if not verdict.valid:
+            logger.info(
+                "mesh_server: token rejected agent_id=%s jti=%s reason=%s",
+                verdict.agent_id,
+                verdict.jti,
+                verdict.reason,
+            )
+        return _mesh_gen.core_pb2.ValidateAgentTokenResponse(
+            valid=bool(verdict.valid),
+            agent_id=verdict.agent_id or "",
+            scope=list(verdict.scope),
+            jti=verdict.jti or "",
+            aud=verdict.aud or "",
+            exp_ok=bool(verdict.exp_ok),
+            revoked=bool(verdict.revoked),
+            reason=verdict.reason or "",
+        )
+
+    def _token_validation_deps(self) -> tuple[AgentTokenStore, Ed25519PrivateKey]:
+        """Lazily build the agent-token store + signing key (first use).
+
+        Mirrors the part-1 CLI wiring: the store is the shared SQLite DB
+        (``agent_tokens`` table, ``CREATE TABLE IF NOT EXISTS`` — safe
+        next to the main schema) and the key lives at
+        ``<data_dir>/agent-token-signing.key`` (config override wins),
+        minted on first use at mode 0600. Lazy on purpose: a mnemos host
+        that never serves agent RPCs never mints a key and never opens
+        the registry — "first use" semantics per ADR-0018-T §3.
+
+        Double-checked under a lock so concurrent first RPCs build the
+        pair exactly once. Failures propagate to the caller (the RPC
+        maps them to INTERNAL) — no half-initialised state is retained.
+        """
+        if self._token_store is None or self._token_key is None:
+            with self._token_deps_lock:
+                if self._token_store is None:
+                    self._token_store = AgentTokenStore(self._settings.db_path)
+                if self._token_key is None:
+                    self._token_key = load_or_create_signing_key(
+                        signing_key_path(
+                            self._settings.mnemos.data_dir,
+                            override=self._settings.federation.agent_token_key_path,
+                        )
+                    )
+        return self._token_store, self._token_key
 
     # ── RPC: WriteMemory ───────────────────────────────────────────────────
 
@@ -1704,6 +1819,25 @@ class MnemosCoreServicer:
         for key, value in metadata:
             if key.lower() == "x-mnemos-peer-id":
                 return str(value)
+        return None
+
+    @staticmethod
+    def _bearer_from_context(context: grpc.ServicerContext[Any, Any]) -> str | None:
+        """Extract the bearer token from ``authorization`` metadata.
+
+        ADR-0018-T §2: the token rides in ``authorization:
+        ``Bearer <token>`` — never in a message field. Accepts the
+        scheme case-insensitively (``bearer``/``Bearer``) and returns
+        ``None`` when the key is absent, the scheme is not Bearer, or
+        the remainder is empty — the RPC maps that to INVALID_ARGUMENT.
+        """
+        for key, value in context.invocation_metadata():
+            if key.lower() != "authorization":
+                continue
+            parts = str(value).strip().split(None, 1)
+            if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
+                return parts[1].strip()
+            return None
         return None
 
     def _single_peer_id(self) -> str | None:

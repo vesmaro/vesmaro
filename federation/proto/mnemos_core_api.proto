@@ -319,9 +319,69 @@ message UpsertIndexEntriesResponse {
   mnemos.federation.v1.TriggerCodes trigger_code = 3;
 }
 
+// ValidateAgentTokenRequest — ask mnemos to validate an AgentGateway
+// bearer token (W3 part 2, ADR-0018-T §3 launch condition 2: the
+// mnemos-side validation hook runs before the mesh forwards the FIRST
+// agent request).
+//
+// TOKEN PLACEMENT (ADR-0018-T §2 — end-to-end rule): the token itself
+// rides in gRPC `authorization` metadata ("Bearer <token>"), NEVER in
+// this message. A token in a message field could reach query logs (T7)
+// and breaks the "identity derives ONLY from the mnemos-validated
+// token" rule (T3/T4). The core leg is already authenticated (UDS
+// filesystem isolation or mesh-CA mTLS), so the metadata key cannot be
+// spoofed by a third party — only the mesh dials this RPC.
+message ValidateAgentTokenRequest {
+  // The id of the mesh GATEWAY NODE that is serving the agent RPC and
+  // asking for validation. mnemos enforces the token's `aud` node
+  // binding against this value (early cross-node reuse rejection).
+  string gateway_node_id = 1;
+}
+
+// ValidateAgentTokenResponse — the per-check validation verdict, a
+// faithful wire mirror of mnemos's AgentTokenVerdict. Carries per-check
+// outcomes (not a bare bool) so the gateway can rate-limit per agent,
+// log a precise reject reason to the gateway_query category, and
+// fast-fail — WITHOUT ever becoming an ACL authority (criterion 5:
+// scope→ACL resolution stays mnemos-side on every data RPC).
+message ValidateAgentTokenResponse {
+  // True when the envelope verified: valid signature, v1, un-expired,
+  // aud == the requesting gateway node, jti known and not revoked and
+  // not past its rotation grace window. False means reject; see reason.
+  bool valid = 1;
+
+  // The agent identity (token `sub` claim) when derivable from the
+  // envelope, else empty. The gateway uses this for rate-limit keying
+  // and audit attribution — NEVER caller-asserted fields (T3/T4).
+  string agent_id = 2;
+
+  // The token's scope grants (e.g. ["read"] / ["rw"]). Informational
+  // for the gateway's fast-fail write gate only; the effective scope
+  // (token ∩ transport-peer ACL) is resolved per data RPC in mnemos.
+  repeated string scope = 3;
+
+  // The token id (jti) when derivable — logged for per-request
+  // attribution (ADR-0018-T §5 anti-sharing), never the token value.
+  string jti = 4;
+
+  // The token's audience (`aud` claim) when derivable.
+  string aud = 5;
+
+  // True when iat <= now < exp held at validation time.
+  bool exp_ok = 6;
+
+  // True when the jti was found on the mnemos-side denylist.
+  bool revoked = 7;
+
+  // Reject reason when valid=false: malformed | bad_signature |
+  // unsupported_version | expired | not_yet_valid | aud_mismatch |
+  // unknown_jti | revoked | grace_expired. Empty when valid=true.
+  string reason = 8;
+}
+
 // MnemosCore — the mesh↔mnemos core service over Unix socket + gRPC.
 //
-// Seven RPCs:
+// Eight RPCs:
 //   * ListMemories          — mnemos exports to mesh (mesh reads).
 //   * ReadMemory            — single-record fetch by id (W3-v1 gateway
 //                             read path, ADR-0018 amendment 3).
@@ -348,6 +408,17 @@ service MnemosCore {
   // metadata; mnemos applies the fail-closed effective-scope gate before
   // releasing the record. Additive — pre-W3 callers never see it.
   rpc ReadMemory(ReadMemoryRequest) returns (ReadMemoryResponse);
+
+  // ValidateAgentToken — mnemos-side validation of an AgentGateway
+  // bearer token (W3 part 2, ADR-0018-T §3 + §8 launch condition 2).
+  // The mesh's AgentGateway calls this on EVERY agent RPC before
+  // translating it to a data call: signature, version, TTL window,
+  // `aud` node binding and the jti/sub denylists are checked here
+  // (fail-closed on an unknown jti). The token rides in the
+  // `authorization` metadata key, never in the request message.
+  // Additive — pre-W3 callers never see it.
+  rpc ValidateAgentToken(ValidateAgentTokenRequest)
+      returns (ValidateAgentTokenResponse);
 
   // WriteMemory — mesh imports a CompactRecord from a peer into mnemos.
   // Idempotent by CompactRecord.id. mnemos may apply its own import
