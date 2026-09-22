@@ -22,6 +22,7 @@ Reference:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from typing import Any
@@ -46,7 +47,43 @@ __all__ = [
 ]
 
 
-def pull_from_peer(
+def pull_from_peer(*args: Any, **kwargs: Any) -> Any:
+    """Vitals boundary #8 (A2): time the client pull (standalone — no manager)."""
+    import time as _time
+
+    from vesmaro.metrics.boundary import record_verb_standalone
+
+    t0 = _time.monotonic()
+    try:
+        result = _pull_from_peer_impl(*args, **kwargs)
+    except Exception:
+        settings = kwargs.get("settings")
+        if settings is not None:
+            with contextlib.suppress(Exception):
+                record_verb_standalone(
+                    settings,
+                    surface="background",
+                    verb="federation.pull_client",
+                    status="error",
+                    latency_ms=(_time.monotonic() - t0) * 1000,
+                    meta={"peer_id": args[0] if args else kwargs.get("peer_id", "")},
+                )
+        raise
+    settings = kwargs.get("settings")
+    if settings is not None:
+        with contextlib.suppress(Exception):
+            record_verb_standalone(
+                settings,
+                surface="background",
+                verb="federation.pull_client",
+                status="ok",
+                latency_ms=(_time.monotonic() - t0) * 1000,
+                meta={"peer_id": args[0] if args else kwargs.get("peer_id", "")},
+            )
+    return result
+
+
+def _pull_from_peer_impl(
     peer_id: str,
     query: str,
     project_scope: str,

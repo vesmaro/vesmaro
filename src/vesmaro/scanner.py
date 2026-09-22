@@ -235,7 +235,15 @@ class BackgroundScanner:
             return
         while not self._stop_event.is_set():
             try:
+                _scan_t0 = time.monotonic()
                 self.run_scan(incremental=self._config.incremental)
+                # Vitals boundary #6 (A2) — scanner.scan verb.
+                self._manager.record_verb_vitals(
+                    surface="background",
+                    verb="scanner.scan",
+                    status="ok",
+                    latency_ms=(time.monotonic() - _scan_t0) * 1000,
+                )
             except Exception:
                 # Non-fatal — a scan failure must never crash the
                 # scanner thread. The next pass will retry.

@@ -158,8 +158,8 @@ dev = ["vesmaro[dev]"]
 
 [project.scripts]
 # Canonical + short hook (owner-approved, GWS card #331 amendment)
-vesmaro = "vesmaro.cli.main:app"
-vesma = "vesmaro.cli.main:app"
+vesmaro = "vesmaro.cli.main:cli_main"
+vesma = "vesmaro.cli.main:cli_main"
 vesmaro-train = "vesmaro.train_entry:main"
 # Legacy compatibility commands (dual-import period; retire no earlier than 6.0)
 mnemos = "vesmaro.cli.main:app"

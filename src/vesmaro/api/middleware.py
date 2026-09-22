@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import logging
+from collections.abc import Awaitable, Callable
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -125,7 +126,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(self, request: Request, call_next: object) -> Response:
-        from collections.abc import Awaitable, Callable
 
         _call_next: Callable[[Request], Awaitable[Response]] = call_next  # type: ignore[assignment]
 
@@ -234,3 +234,51 @@ class AuthMiddleware(BaseHTTPMiddleware):
         request.state.auth_session_hash = session_hash
 
         return await _call_next(request)
+
+
+class VitalsVerbMiddleware(BaseHTTPMiddleware):
+    """Phase A2 boundary #2 — one verb row per REST request.
+
+    Verb is the ROUTE TEMPLATE (``rest:POST:/search``), never the raw
+    path — concrete paths are banned from the plane (RL-S2). Service
+    endpoints (health/metrics/stats/docs) are excluded. Unmatched 404s
+    are counted under the fixed verb ``unmatched`` — a counter only, no
+    caller-controlled material enters the ledger.
+    """
+
+    _EXCLUDED = frozenset(
+        {"/health", "/metrics", "/api/v1/metrics", "/docs", "/redoc", "/openapi.json"}
+    )
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        import time as _time
+
+        path = request.scope.get("path", "")
+        if path in self._EXCLUDED or path.startswith("/api/v1/stats"):
+            return await call_next(request)
+        t0 = _time.monotonic()
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            route = request.scope.get("route")
+            template = getattr(route, "path", None) or "unmatched"
+            verb = f"rest:{request.method}:{template}"
+            try:
+                from vesmaro.api.main import get_manager  # deferred: no import cycle
+
+                get_manager().record_verb_vitals(
+                    surface="rest",
+                    verb=verb,
+                    status="ok" if status_code < 400 else "error",
+                    latency_ms=(_time.monotonic() - t0) * 1000,
+                    status_code=status_code,
+                )
+            except Exception:
+                pass
