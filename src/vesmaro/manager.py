@@ -448,6 +448,13 @@ class MemoryManager:
         # every processor cycle, to avoid scanning the cache table
         # every `interval_sec` (default 120s).
         self._ccr_cleanup_last_ts: float = 0.0
+        # ADR-0026 phase A — vitals sidecar (passive assemble metrics).
+        # Guest contract: creation is non-fatal; a disabled or broken
+        # metrics plane never blocks the server.
+        from vesmaro.metrics.boundary import create_vitals_store
+
+        self._vitals_store = create_vitals_store(settings)
+        self._vitals_retention_last_ts: float = 0.0
         # ADR-0017 D1 (#125) — bounded registry for assemble_context
         # mode="async" results (handle -> (ContextBlock dict, session)).
         # In-memory, single-tenant, capped by
@@ -487,6 +494,9 @@ class MemoryManager:
         self.stop_background_processor()
         self.sqlite.close()
         self.vectors.close()
+        vitals = self._vitals_store
+        if vitals is not None:
+            vitals.close()
 
     # ── helpers ───────────────────────────────────────────────────────────
 
@@ -4418,6 +4428,8 @@ class MemoryManager:
                 self.heal_stale_embeddings()
                 # CCR cleanup tick — runs on its own interval, not every cycle.
                 self._maybe_run_ccr_cleanup()
+                # Vitals retention tick (C4) — nightly cadence, own interval.
+                self._maybe_run_vitals_retention()
             except Exception:
                 logger.exception("Background processor error")
             self._processor_stop.wait(timeout=interval_sec)
@@ -4445,6 +4457,54 @@ class MemoryManager:
                 )
         except Exception:
             logger.exception("CCR cleanup failed (non-fatal)")
+
+    # ── Vitals (ADR-0026 phase A) ─────────────────────────────────────────
+
+    def record_assemble_vitals(self, result: dict[str, Any]) -> None:
+        """Record one assemble call into the vitals sidecar (non-fatal).
+
+        Called by the two collection boundaries AFTER the result exists
+        (the MCP ``mnemos_assemble_context`` handler and the
+        ``pre_llm_call`` hook) — never from the assemble pipeline
+        itself: S2 measures that verb directly and the wrapper must stay
+        out of its path. All failure modes are swallowed by the sink.
+        """
+        store = self._vitals_store
+        if store is None:
+            return
+        if "stats" not in result:
+            # mode="async" returns a handle envelope, not an assembly —
+            # recording it would poison the corpus with empty rows. The
+            # real assembly lands (and is recorded) when the handle is
+            # redeemed and returns the full result.
+            return
+        try:
+            store.record_assemble(result)
+        except Exception:  # the plane must never surface
+            logger.warning("vitals: boundary record failed (non-fatal)", exc_info=True)
+
+    def _maybe_run_vitals_retention(self) -> None:
+        """Nightly sidecar retention (C4): DELETE per-TTL + VACUUM.
+
+        Mirrors the CCR cleanup cadence pattern. Unlike the collection
+        path, retention failure is FAIL-LOUD (error log = the alert the
+        nightly-job contract demands), while the processor loop itself
+        keeps running.
+        """
+        store = self._vitals_store
+        if store is None:
+            return
+        interval = self.settings.vitals.retention_interval_sec
+        now = time.monotonic()
+        if self._vitals_retention_last_ts and (now - self._vitals_retention_last_ts) < interval:
+            return
+        self._vitals_retention_last_ts = now
+        try:
+            deleted = store.run_retention()
+            if any(deleted.values()):
+                logger.info("vitals retention: %s", deleted)
+        except Exception:
+            logger.error("vitals retention failed (C4 alert)", exc_info=True)
 
     @property
     def processor_running(self) -> bool:

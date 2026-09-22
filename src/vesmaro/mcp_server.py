@@ -2243,7 +2243,7 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
         if asm_agent is not None and not isinstance(asm_agent, str):
             return {"error": "agent must be a string when provided"}
         try:
-            return mgr.assemble_context(
+            asm_result = mgr.assemble_context(
                 session=asm_session,
                 project=asm_project,
                 file=asm_file,
@@ -2253,6 +2253,11 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
                 async_handle=args.get("async_handle"),
                 agent=asm_agent,
             )
+            # Vitals collection boundary (ADR-0026 phase A): record AFTER
+            # the result exists — the pipeline itself stays write-free.
+            # Non-fatal by contract; a no-op when the plane is disabled.
+            mgr.record_assemble_vitals(asm_result)
+            return asm_result
         except ValueError as exc:
             # Boundary validation (mode/budget/async_handle incl. the
             # session-bound handle check) — surface a clean error dict
