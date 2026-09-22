@@ -449,11 +449,19 @@ class MemoryManager:
         # every `interval_sec` (default 120s).
         self._ccr_cleanup_last_ts: float = 0.0
         # ADR-0026 phase A — vitals sidecar (passive assemble metrics).
-        # Guest contract: creation is non-fatal; a disabled or broken
-        # metrics plane never blocks the server.
-        from vesmaro.metrics.boundary import create_vitals_store
+        # Guest contract: the plane NEVER blocks the server — runtime
+        # failures degrade to no-ops, and even a broken deployment
+        # (ImportError of the vendored subpackage) costs only a warning.
+        try:
+            from vesmaro.metrics.boundary import create_vitals_store
 
-        self._vitals_store = create_vitals_store(settings)
+            self._vitals_store = create_vitals_store(settings)
+        except ImportError:
+            logger.warning(
+                "vitals: metrics package import failed (broken deployment)"
+                " — plane disabled (non-fatal)"
+            )
+            self._vitals_store = None
         self._vitals_retention_last_ts: float = 0.0
         # ADR-0017 D1 (#125) — bounded registry for assemble_context
         # mode="async" results (handle -> (ContextBlock dict, session)).

@@ -913,6 +913,12 @@ class VitalsConfig(BaseModel):
     vendored under ``vesmaro.metrics``). Default-on in local-first: a
     local attacker holding the sidecar already holds the main store
     with full content, so collection adds no exposure.
+
+    The collection boundaries are EXHAUSTIVE: the MCP
+    ``mnemos_assemble_context`` handler and the ``pre_llm_call`` hook.
+    REST ``POST /context/assemble`` is deliberately NOT a boundary —
+    it is the multi-principal surface C3 exists to protect; do not add
+    collection there without revisiting C3.
     """
 
     enabled: bool = True

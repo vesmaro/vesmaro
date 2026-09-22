@@ -113,7 +113,14 @@ class TestCollectionBoundary:
         settings = _settings(tmp_path)
         mgr = _manager(settings)
         try:
-            mgr.record_assemble_vitals({"tokens": "not-a-dict"})  # no raise
+            # carries "stats" so the garbage passes the envelope guard and
+            # actually hits the sink's catch-all (not just the filter)
+            garbage = {
+                "stats": "not-a-dict",
+                "tokens": {"estimated": "x"},
+                "blocks": [{"score": "NOT-A-FLOAT"}],
+            }
+            mgr.record_assemble_vitals(garbage)  # no raise
         finally:
             mgr.close()
 
@@ -163,15 +170,17 @@ class TestC1IsolationCanary:
         assert offenders == [], f"server imports the vitals repo: {offenders}"
 
     def test_sidecar_referenced_only_by_metrics_package(self):
-        """C1, structural form: bug-report / backup / export / federation
-        paths can never include the sidecar because NOTHING outside
-        ``vesmaro.metrics`` may even name it."""
+        """C1 tripwire (not a boundary): nothing outside the vendored
+        ``vesmaro/metrics/`` package may even NAME the sidecar — so
+        bug-report / backup / export / federation code paths stay blind
+        to it. The real C1 enforcement is that the sink is the only
+        write path; this tripwire catches naming drift early."""
         tokens = ("metrics.sqlite", ".hkey", "SIDECAR_FILENAME")
         offenders: list[str] = []
         for p in SRC.rglob("*.py"):
+            if p.relative_to(SRC).parts[0] == "metrics":
+                continue  # the vendored package itself
             text = p.read_text(encoding="utf-8")
-            if "metrics" in p.parts:
-                continue
             if any(t in text for t in tokens):
                 offenders.append(str(p.relative_to(SRC)))
         assert offenders == [], f"sidecar referenced outside vesmaro.metrics: {offenders}"
