@@ -1,0 +1,46 @@
+# mesh.yaml — mnemos-mesh daemon config (rendered by vesmaro-node).
+# Node id: @@NODE_ID@@
+#
+# After the first cert-gen, fill in:
+#   - mnemos.core_fingerprint  (sha256 of core.pem — printed by the
+#     installer after cert-gen),
+#   - mtls.peer_fingerprints   (peer node_id -> sha256 fingerprint),
+#   - peers[]                  (address + fingerprint + projects).
+# Until then the mesh runs single-node (safe: no peer dial-outs).
+
+node_id: @@NODE_ID@@
+# Peer gRPC listener (mTLS). LAN/WireGuard address for real peers.
+listen: ":8443"
+# Rollback leg to the core (unix). Primary leg is the TCP dial below.
+unix_socket: @@RUNDIR@@/core.sock
+
+mtls:
+  ca_cert: @@PKIDIR@@/ca.pem
+  node_cert: @@PKIDIR@@/node.pem
+  node_key: @@PKIDIR@@/node.key
+  rotation_days: 90
+  peer_fingerprints: {}
+    # peer-node-id: "sha256:..."
+
+peers: []
+  # - id: peer-node-id
+  #   address: "192.168.1.72:30843"
+  #   fingerprint: "sha256:..."
+  #   projects: ["shared-project"]
+
+# How THIS mesh daemon reaches the local core face: TCP leg with
+# server-side mTLS material from the core cert pair.
+mnemos:
+  transport: tcp
+  address: "127.0.0.1:8790"
+  core_fingerprint: ""   # sha256:... of core.pem — fill after cert-gen
+  dial_timeout: 5s
+  heartbeat_interval: 30s
+
+logging:
+  level: info
+  format: json
+
+metrics:
+  # healthz + Prometheus scrape, loopback only.
+  listen: "127.0.0.1:9091"

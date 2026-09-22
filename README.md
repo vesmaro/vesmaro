@@ -337,6 +337,7 @@ conversations that survive restarts. See [a2a-sessions.md](docs/en/architecture/
 | [tag-contract.md](docs/en/user/tag-contract.md) | The `project:` / `agent:` / `mnemos:` schema enforced on every memory |
 | [security.md](docs/en/admin/security.md) | Threat model, SSRF guard, FTS5 escape, auth model |
 | [kubernetes-deployment.md](docs/en/admin/kubernetes-deployment.md) | Helm chart for K8s/K3s clusters: ingress, storage, TLS, TOTP secret |
+| [contrib/node-install/](contrib/node-install/) | `vesmaro-node` — one-command bare-metal node bundle: venv + mesh binary + units, with adopt / atomic pair upgrade / uninstall |
 | [runbooks/](docs/en/admin/runbooks/) | Install, migrate, backup / restore, dependency updates, container deployment |
 | [adr/](docs/project/adr/) | Architectural decision records — the *why* behind the design |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes — Keep a Changelog format |

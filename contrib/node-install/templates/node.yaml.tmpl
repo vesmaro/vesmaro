@@ -1,0 +1,53 @@
+# node.yaml — vesmaro node, core face (rendered by vesmaro-node).
+# Profile: @@PROFILE@@ | Style: @@STYLE@@ | Run user: @@RUN_USER@@
+#
+# SECRETS: never in this file. Env overrides live in @@ENVDIR@@/node.env
+# (mode 0600), wired into the unit via EnvironmentFile=-... (optional).
+#
+# Full field reference: config.example.yaml in the vesmaro repo.
+
+mnemos:
+  # Classic package layout for the node store.
+  vault_path: @@DATADIR@@/vault
+  data_dir: @@DATADIR@@/data
+
+api:
+  # Core face: loopback only. Expose remotely via the mesh (mTLS),
+  # not by widening this bind.
+  host: "127.0.0.1"
+  port: 8787
+  auth_enabled: false
+  totp_enabled: false
+  behind_tls_proxy: false
+  cors_enabled: false
+
+mesh:
+  # Master switch: the bundle enables the mesh leg unless installed
+  # with --without-mesh.
+  enabled: @@MESH_ENABLED@@
+  # Rollback leg (unix socket). Primary leg is TCP below — the mesh
+  # daemon dials the core on 127.0.0.1:8790 (mTLS, core-side server).
+  socket_path: @@RUNDIR@@/core.sock
+  timeout_s: 5.0
+  tcp:
+    enabled: @@MESH_ENABLED@@
+    port: 8790
+    bind: "127.0.0.1"
+    tls:
+      cert_file: @@PKIDIR@@/core.pem
+      key_file: @@PKIDIR@@/core.key
+      ca_file: @@PKIDIR@@/ca.pem
+  # Peer-leg mode (RESERVED — future slice "mesh as child of serve"):
+  #   external — mesh runs as its own systemd unit (mnemos-mesh.service);
+  #              this is the topology the bundle installs today.
+  #   child    — mesh spawned as a child process of `mnemos serve`.
+  #              NOT IMPLEMENTED yet; the field below is a placeholder
+  #              so configs carry it early. Keep it commented.
+  #peer_leg:
+  #  mode: external
+
+logging:
+  level: INFO
+  log_file: @@DATADIR@@/logs/mnemos.log
+  max_file_size_mb: 10
+  backup_count: 3

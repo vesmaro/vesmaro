@@ -1,0 +1,35 @@
+# board.yaml — vesmaro node, board read face (profile: laptop only).
+# Rendered by vesmaro-node. Second face over the SAME store as the core:
+# the core owns mesh/federation; this face only serves reads to the
+# vesmaro-eyes board.
+#
+# SECRETS: bearer token + TOTP master key live in @@ENVDIR@@/board.env
+# (mode 0600). The TOTP key satisfies the non-loopback startup guard
+# (VESMARO_API__TOTP_MASTER_KEY); no TOTP enrollment is required when
+# totp_enabled mirrors the core policy below.
+
+mnemos:
+  # Same store as the core face (WAL allows the second reader).
+  vault_path: @@DATADIR@@/vault
+  data_dir: @@DATADIR@@/data
+
+api:
+  # LAN bind for the board; auth is MANDATORY on non-loopback.
+  host: "0.0.0.0"
+  port: 8788
+  auth_enabled: true
+  totp_enabled: true
+  behind_tls_proxy: true
+  cors_enabled: false
+
+mesh:
+  # The core face owns the mesh legs; board never touches them.
+  enabled: false
+  socket_path: @@RUNDIR@@/core.sock
+  timeout_s: 5.0
+
+logging:
+  level: INFO
+  log_file: @@DATADIR@@/logs/board.log
+  max_file_size_mb: 10
+  backup_count: 3
