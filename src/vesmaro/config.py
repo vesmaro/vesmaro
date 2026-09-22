@@ -905,6 +905,33 @@ class MeshTCPConfig(BaseModel):
         return self
 
 
+class VitalsConfig(BaseModel):
+    """Passive assemble metrics into the vitals sidecar (ADR-0026).
+
+    Phase A of the memory-value observability track (ArchCom core
+    ``7ec9dda3``; implementation developed in the mnemos-vitals repo,
+    vendored under ``vesmaro.metrics``). Default-on in local-first: a
+    local attacker holding the sidecar already holds the main store
+    with full content, so collection adds no exposure.
+
+    The collection boundaries are EXHAUSTIVE: the MCP
+    ``mnemos_assemble_context`` handler and the ``pre_llm_call`` hook.
+    REST ``POST /context/assemble`` is deliberately NOT a boundary —
+    it is the multi-principal surface C3 exists to protect; do not add
+    collection there without revisiting C3.
+    """
+
+    enabled: bool = True
+    # C3 config-lint: per-request rows carry a session column; under
+    # api.auth_enabled=true (multi-principal) collection refuses to
+    # start without this explicit acknowledgement. The server keeps
+    # running without metrics — refusal, never a crash.
+    ack_session_collection: bool = False
+    # C4: nightly DELETE + VACUUM cadence for the sidecar (TTLs are
+    # born-final: verb 30d, hourly rollup 400d, assemble family 90d).
+    retention_interval_sec: int = Field(default=24 * 3600, ge=3600)
+
+
 class MeshConfig(BaseModel):
     """mnemos-mesh gRPC client configuration (Phase 3, issue #105 M3).
 
@@ -1024,6 +1051,7 @@ class Settings(BaseSettings):
     federation: FederationConfig = FederationConfig()
     scanner: ScannerConfig = ScannerConfig()
     mesh: MeshConfig = MeshConfig()
+    vitals: VitalsConfig = VitalsConfig()
     logging: LoggingConfig = LoggingConfig()
     # M5: declarative policy rules (loaded from YAML or set programmatically)
     policies: dict[str, Any] = Field(default_factory=dict)

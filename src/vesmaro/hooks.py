@@ -164,6 +164,9 @@ def pre_llm_call(
         query=context_hint,
         task=task,
     )
+    # Vitals collection boundary (ADR-0026 phase A): record after the
+    # result exists — non-fatal, no-op when the plane is disabled.
+    mgr.record_assemble_vitals(result)
     result["hook"] = "pre_llm_call"
     result["injection"] = "prepend result['text'] to the model call prompt"
     if include_awareness:
