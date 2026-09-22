@@ -11,11 +11,15 @@
 # auto-rollback (health-verify failures AND mid-swap aborts).
 #
 # Subcommands:
-#   install    deploy the bundle (adopt existing install when present)
-#   upgrade    atomic pair upgrade (--check = dry-run)
-#   status     versions, units, face health, mesh healthz, peer skew,
-#              available tags, pair compatibility
-#   uninstall  remove the bundle (--keep-data default | --purge)
+#   install           deploy the bundle (adopt existing install when present)
+#   container-install flatpak-style: pull READY images from ghcr, deploy
+#                     rootless quadlets (systemd --user), data stays on
+#                     the HOST via bind-mounts (local-first)
+#   upgrade           atomic pair upgrade (--check = dry-run)
+#   status            versions, units, face health, mesh healthz, peer skew,
+#                     available tags, pair compatibility (+containers)
+#   uninstall         remove the bundle (--keep-data default | --purge);
+#                     also removes a container install when one is recorded
 #
 # Layout styles:
 #   system (default)  /opt/vesmaro/venv, /usr/local/bin/mnemos-mesh,
@@ -84,10 +88,21 @@ MIGRATE_ADOPTED=false
 GEN_CERTS=false
 CHECK=false
 PURGE=false
+KEEP_DATA=false
 ASSUME_YES=false
 INCLUDE_ADOPTED=false
 WORKDIR="${XDG_CACHE_HOME:-$HOME/.cache}/vesmaro-node"
 PYBIN_FLAG=""
+
+# container-install state
+CT_NAME=""
+CT_TAG=""
+CT_MESH_TAG=""
+CT_PORT=""
+CT_DATA_DIR=""
+CT_NETWORK="host"
+GHCR_CORE="ghcr.io/korrnals/mnemos"
+GHCR_MESH="ghcr.io/korrnals/mnemos-mesh"
 
 SANDBOX=false
 SYS_DRY=false
@@ -815,6 +830,293 @@ verify_health() {  # $1 url, $2 timeout -> 0 ok (sandbox/test aware)
   wait_health "$1" "$2"
 }
 
+# ── container install (flatpak-style, rootless) ──────────────────────
+# Pulls READY images from ghcr (ghcr tag == git release tag) and drives
+# them with quadlets under systemd --user. The container carries CODE
+# ONLY — configs, pki and data stay on the HOST (bind-mounts,
+# local-first). v1 runs on the HOST network namespace (documented
+# compromise: the mesh container dials the core on 127.0.0.1:8790 and
+# peers reach :8443; bridge + published ports is the follow-up).
+
+in_container_ctx() {
+  [[ -n "${DISTROBOX_NAME:-}" || -e /run/.containerenv ]]
+}
+
+# getent must resolve the HOST home (inside a distrobox it answers the
+# box's $HOME — the known adopted-gate caveat; here we WANT the box
+# context, so route through distrobox-host-exec).
+host_getent_home() {  # $1 user -> host home dir
+  if in_container_ctx && command -v distrobox-host-exec >/dev/null 2>&1; then
+    distrobox-host-exec getent passwd "$1" 2>/dev/null | cut -d: -f6
+  else
+    getent passwd "$1" | cut -d: -f6
+  fi
+}
+
+podman_bin() {  # echoes the podman command (HOST storage, rootless)
+  if in_container_ctx; then
+    command -v distrobox-host-exec >/dev/null 2>&1 && { echo "distrobox-host-exec podman"; return; }
+    die "inside a container but no distrobox-host-exec — run on the host or from the dev box"
+  fi
+  command -v podman >/dev/null 2>&1 && { echo "podman"; return; }
+  echo ""
+}
+
+userctl_bin() {  # echoes a working `systemctl --user` command (or "")
+  if in_container_ctx; then
+    command -v distrobox-host-exec >/dev/null 2>&1 \
+      && distrobox-host-exec systemctl --user is-system-running >/dev/null 2>&1 \
+      && { echo "distrobox-host-exec systemctl --user"; return; }
+    echo ""
+  fi
+  command -v systemctl >/dev/null 2>&1 \
+    && systemctl --user is-system-running >/dev/null 2>&1 \
+    && { echo "systemctl --user"; return; }
+  echo ""
+}
+
+# container paths (rootless: everything under the REAL host $HOME)
+CT_HOME=""; CT_CONFDIR=""; CT_DATADIR=""; CT_STATEDIR=""; CT_QUADDIR=""
+CT_RUNDIR=""; CT_MANIFEST=""
+compute_container_paths() {
+  local who="${USER_NAME:-$(id -un)}"
+  [[ "$(id -u)" == 0 ]] && die "container-install is ROOTLESS-only (systemd --user + rootless podman) — run as the owning user"
+  CT_HOME="$(host_getent_home "$who")"
+  [[ -n "$CT_HOME" && "$CT_HOME" != "/" ]] || die "no home resolved for $who (host getent)"
+  CT_CONFDIR="$CT_HOME/.config/vesmaro"
+  CT_DATADIR="${CT_DATA_DIR:-$CT_HOME/.local/share/vesmaro/data}"
+  CT_STATEDIR="$CT_HOME/.local/state/vesmaro"
+  CT_QUADDIR="$CT_HOME/.config/containers/systemd"
+  CT_RUNDIR="$CT_STATEDIR/container-run"
+  CT_MANIFEST="${DEST}${CT_STATEDIR}/container-manifest.json"
+}
+
+certs_present() {
+  local p="${DEST}${CT_CONFDIR}/pki"
+  [[ -f "$p/ca.pem" && -f "$p/core.pem" && -f "$p/core.key" \
+     && -f "$p/node.pem" && -f "$p/node.key" ]]
+}
+
+ct_units() {  # echoes unit names for the current effective pair
+  echo "${CT_NAME}-core.service"
+  $CT_MESH_ON || return 0
+  echo "${CT_NAME}-mesh.service"
+}
+
+render_quadlet() {  # $1 tmpl  $2 out  rest @@VAR@@=..
+  render "$1" "$2" "${@:3}"
+}
+
+cmd_container_install() {
+  detect_sys   # keeps sys* harmless if anything calls it
+  compute_container_paths
+  CT_NAME="${CT_NAME:-vesmaro}"
+  CONFDIR="$CT_CONFDIR"   # deploy_yaml renders into $CONFDIR — point it at the container confdir
+
+  # ── resolve the pair from the ledger (image tag == git tag) ─────
+  if [[ -z "$CT_TAG" && -z "$CT_MESH_TAG" ]]; then
+    local row; row="$(tsv_last)"
+    [[ -n "$row" ]] || die "ledger empty — add a pair to compatibility.tsv (or pass --tag/--mesh-tag with --force)"
+    CT_TAG="$(cut -d'|' -f1 <<<"$row")"
+    CT_MESH_TAG="$(cut -d'|' -f2 <<<"$row")"
+  else
+    CT_TAG="${CT_TAG:-$(tsv_last | cut -d'|' -f1)}"
+    CT_MESH_TAG="${CT_MESH_TAG:-$(tsv_last | cut -d'|' -f2)}"
+    if ! $FORCE && ! pair_known "$CT_TAG" "$CT_MESH_TAG"; then
+      warn "pair ($CT_TAG, $CT_MESH_TAG) is not in the ledger"
+      list_known_pairs
+      die "refusing unverified pair — add it to compatibility.tsv or pass --force"
+    fi
+  fi
+  CT_PORT="${CT_PORT:-8787}"
+  [[ "$CT_NETWORK" == "host" ]] || die "v1 supports --network host only (bridge + published ports is the follow-up; see README)"
+
+  # mesh leg: explicit --without-mesh, or auto-off when no mTLS material
+  CT_MESH_ON=true
+  $WITHOUT_MESH && CT_MESH_ON=false
+  if $CT_MESH_ON && ! certs_present; then
+    CT_MESH_ON=false
+    warn "mTLS certs not found in ${CT_CONFDIR}/pki — installing CORE-ONLY"
+    warn "  (the core fails fast on a TCP leg without readable certs; provision certs + rerun container-install to add the mesh container — idempotent)"
+  fi
+
+  local POD=""
+  [[ -z "$DEST" ]] && { POD="$(podman_bin)"; [[ -n "$POD" ]] || die "no podman reachable (rootless, host storage)"; }
+  local UCTL=""
+  [[ -z "$DEST" ]] && { UCTL="$(userctl_bin)"; [[ -n "$UCTL" ]] || die "no systemd --user reachable (needed for quadlets)"; }
+
+  # ── (a) pull READY images (never build here) ────────────────────
+  if [[ -n "$POD" ]]; then
+    $POD login ghcr.io --get-login >/dev/null 2>&1 \
+      || warn "not logged in to ghcr.io (private registry) — pull may fail; run: podman login ghcr.io"
+    info "pull: $GHCR_CORE:$CT_TAG"
+    $POD pull "$GHCR_CORE:$CT_TAG" || die "pull failed: $GHCR_CORE:$CT_TAG"
+    if $CT_MESH_ON; then
+      info "pull: $GHCR_MESH:$CT_MESH_TAG"
+      $POD pull "$GHCR_MESH:$CT_MESH_TAG" || die "pull failed: $GHCR_MESH:$CT_MESH_TAG"
+    fi
+  else
+    printf "  [dry] podman pull %s:%s\n" "$GHCR_CORE" "$CT_TAG" >&2
+    $CT_MESH_ON && printf "  [dry] podman pull %s:%s\n" "$GHCR_MESH" "$CT_MESH_TAG" >&2
+  fi
+
+  # ── host dirs (data/pki/run stay local-first) ───────────────────
+  mkdir -p "${DEST}${CT_DATADIR}/data" "${DEST}${CT_DATADIR}/vault" \
+           "${DEST}${CT_CONFDIR}/pki" "${DEST}${CT_RUNDIR}" "${DEST}${CT_QUADDIR}" "${DEST}${CT_STATEDIR}"
+
+  # ── configs (kept on re-runs unless --reconf) ───────────────────
+  local td; td="$(tmpl_dir)"
+  local mesh_enabled="false"; $CT_MESH_ON && mesh_enabled="true"
+  deploy_yaml node.container.yaml containers/node.container.yaml.tmpl \
+    "@@PORT@@=$CT_PORT" "@@MESH_ENABLED@@=$mesh_enabled"
+  if $CT_MESH_ON; then
+    deploy_yaml mesh.container.yaml containers/mesh.container.yaml.tmpl \
+      "@@NODE_ID@@=${NODE_ID:-$(hostname -s)}"
+  fi
+
+  # ── quadlets (ours by construction: namespaced <name>-{core,mesh}) ─
+  local mesh_vols=""
+  if $CT_MESH_ON; then
+    mesh_vols="Volume=${CT_CONFDIR}/pki:/etc/vesmaro/pki:ro
+Volume=${CT_STATEDIR}/container-run:/run/vesmaro"
+  fi
+  local changed_units="" q final gen
+  render_quadlet "$td/containers/vesmaro-core.container.tmpl" "${DEST}${CT_QUADDIR}/${CT_NAME}-core.container.gen" \
+    "@@CORE_TAG@@=$CT_TAG" "@@NAME@@=$CT_NAME" "@@PORT@@=$CT_PORT" \
+    "@@CONFDIR@@=$CT_CONFDIR" "@@DATADIR@@=$CT_DATADIR" "@@MESH_VOLUMES@@=$mesh_vols"
+  local -a tmpls=( "core" )
+  $CT_MESH_ON && tmpls+=( "mesh" )
+  if $CT_MESH_ON; then
+    render_quadlet "$td/containers/vesmaro-mesh.container.tmpl" "${DEST}${CT_QUADDIR}/${CT_NAME}-mesh.container.gen" \
+      "@@MESH_TAG@@=$CT_MESH_TAG" "@@NAME@@=$CT_NAME" "@@NODE_ID@@=${NODE_ID:-$(hostname -s)}" \
+      "@@CONFDIR@@=$CT_CONFDIR" "@@STATEDIR@@=$CT_STATEDIR"
+  fi
+  for q in "${tmpls[@]}"; do
+    gen="${DEST}${CT_QUADDIR}/${CT_NAME}-${q}.container.gen"
+    final="${DEST}${CT_QUADDIR}/${CT_NAME}-${q}.container"
+    if [[ ! -f "$final" ]]; then
+      mv "$gen" "$final"; changed_units+="${CT_NAME}-${q}.service "
+      info "quadlet installed: $(basename "$final")"
+    elif cmp -s "$gen" "$final"; then
+      rm -f "$gen"
+    else
+      cp -f "$final" "${final}.bak-$(date +%Y%m%d%H%M%S)"
+      mv "$gen" "$final"; changed_units+="${CT_NAME}-${q}.service "
+      info "quadlet updated: $(basename "$final") (backup kept — rollback = restore the .bak + daemon-reload)"
+    fi
+  done
+
+  # ── manifest (pair identity for idempotency/uninstall) ──────────
+  MANIFEST="$CT_MANIFEST"
+  local first=true
+  manifest_exists && first=false
+  mf_write "mode=container" "name=$CT_NAME" "user=${USER_NAME:-$(id -un)}" \
+    "core_tag=$CT_TAG" "mesh_tag=$CT_MESH_TAG" "mesh_on=$CT_MESH_ON" \
+    "port=$CT_PORT" "data_dir=$CT_DATADIR" "confdir=$CT_CONFDIR" \
+    "quaddir=$CT_QUADDIR" "network=$CT_NETWORK" "dest=$DEST" \
+    "images=$GHCR_CORE:$CT_TAG,$GHCR_MESH:$CT_MESH_TAG" \
+    "units.core=${CT_NAME}-core.service" "adopted=no"
+  $CT_MESH_ON && mf_write "units.mesh=${CT_NAME}-mesh.service"
+
+  # ── start (quadlet -> generated systemd --user units) ──────────
+  # NOTE: quadlet-generated units cannot be `systemctl enable`d (they
+  # are "generated" — enable refuses); the [Install] section of the
+  # .container file makes the generator enable them persistently, so
+  # daemon-reload + start is the whole story.
+  if [[ -n "$UCTL" ]]; then
+    $UCTL daemon-reload
+    local u
+    for u in $(ct_units); do
+      if [[ " $changed_units " == *" $u "* ]] || ! $UCTL is-active "$u" >/dev/null 2>&1; then
+        $UCTL start "$u" || die "unit $u failed to start — check: $UCTL status $u / journalctl --user -u $u"
+      else
+        info "unit $u already active and unchanged"
+      fi
+    done
+    # health verify (core face)
+    if ! wait_health "http://127.0.0.1:$CT_PORT/health" 90; then
+      warn "core face :$CT_PORT did not become healthy in 90s"
+      warn "  inspect: $POD logs ${CT_NAME}-core ; rollback: restore the quadlet .bak + daemon-reload"
+      die "container install FAILED health verify"
+    fi
+    ok "health: http://127.0.0.1:$CT_PORT/health -> 200"
+  else
+    local u
+    for u in $(ct_units); do printf "  [dry] systemctl --user start %s (enabled by the quadlet generator)\n" "$u" >&2; done
+  fi
+
+  echo
+  ok "container install complete — $GHCR_CORE:$CT_TAG$( $CT_MESH_ON && echo " + $GHCR_MESH:$CT_MESH_TAG" ), name $CT_NAME, port $CT_PORT"
+  info "data (host, bind-mounted): $CT_DATADIR/{data,vault}"
+  [[ -n "$DEST" ]] && info "SANDBOX: layout under $DEST — nothing pulled/enabled"
+  $first || info "re-provision (manifest updated; unchanged quadlets were not restarted)"
+}
+
+cmd_container_uninstall() {
+  compute_container_paths
+  [[ -f "$CT_MANIFEST" ]] || die "no container install recorded at $CT_MANIFEST"
+  MANIFEST="$CT_MANIFEST"
+  CT_NAME="$(mf_get name)"; CT_NAME="${CT_NAME:-vesmaro}"
+  CT_MESH_ON=false; [[ "$(mf_get mesh_on)" == "true" ]] && CT_MESH_ON=true
+  local POD="" UCTL=""
+  if [[ -z "$DEST" ]]; then POD="$(podman_bin)"; UCTL="$(userctl_bin)"; fi
+
+  local u q
+  for u in $(ct_units); do
+    [[ -n "$UCTL" ]] && { $UCTL disable --now "$u" 2>/dev/null || true; }
+  done
+  if [[ -n "$POD" ]]; then
+    $POD rm -f "${CT_NAME}-core" >/dev/null 2>&1 && info "removed container ${CT_NAME}-core"
+    $POD rm -f "${CT_NAME}-mesh" >/dev/null 2>&1 && info "removed container ${CT_NAME}-mesh"
+  fi
+  for q in core mesh; do
+    rm -f "${DEST}${CT_QUADDIR}/${CT_NAME}-${q}.container" \
+          "${DEST}${CT_QUADDIR}/${CT_NAME}-${q}.container.gen" 2>/dev/null || true
+    rm -f "${DEST}${CT_QUADDIR}"/"${CT_NAME}-${q}".container.bak-* 2>/dev/null || true
+  done
+  [[ -n "$UCTL" ]] && $UCTL daemon-reload
+
+  if $PURGE; then
+    local img
+    if [[ -n "$POD" ]]; then
+      for img in $(mf_get images | tr ',' ' '); do
+        $POD rmi "$img" >/dev/null 2>&1 && info "removed image $img" || warn "image not removed: $img (in use?)"
+      done
+    fi
+    rm -f "${DEST}${CT_CONFDIR}/node.container.yaml" "${DEST}${CT_CONFDIR}/mesh.container.yaml"
+    rm -rf "${DEST}${CT_RUNDIR}"
+    if $KEEP_DATA; then
+      ok "uninstalled (--purge + --keep-data): containers+units+images+configs removed; DATA KEPT at $(mf_get data_dir)"
+    else
+      rm -rf "$(mf_get data_dir)" && info "removed data dir $(mf_get data_dir)"
+      ok "uninstalled (--purge): containers+units+images+configs+data removed"
+    fi
+  else
+    ok "uninstalled: containers + units removed; images, configs and DATA kept (data: $(mf_get data_dir))"
+    info "full cleanup: rerun with --purge (add --keep-data to spare the data dir)"
+  fi
+  rm -f "$CT_MANIFEST"
+}
+
+container_status() {  # appended to `status` when a container manifest exists
+  compute_container_paths
+  [[ -f "$CT_MANIFEST" ]] || return 1
+  local saved_manifest="$MANIFEST"; MANIFEST="$CT_MANIFEST"
+  CT_NAME="$(mf_get name)"
+  local POD; POD="$(podman_bin)"
+  echo "  containers: name=$(mf_get name) core=$(mf_get core_tag) mesh=$(mf_get mesh_tag)$( [[ "$(mf_get mesh_on)" == "false" ]] && echo " (core-only)")"
+  if [[ -n "$POD" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && printf '    %s\n' "$line"
+    done < <($POD ps -a --filter "name=$(mf_get name)-" --format '{{.Names}} {{.Status}}' 2>/dev/null)
+    local h
+    h="$(curl -sf -m 2 "http://127.0.0.1:$(mf_get port)/health" 2>/dev/null || true)"
+    printf "    127.0.0.1:%-5s /health %s\n" "$(mf_get port)" "$([[ -n $h ]] && echo OK || echo DOWN)"
+  fi
+  MANIFEST="$saved_manifest"
+  return 0
+}
+
 # ── INSTALL / UPGRADE ────────────────────────────────────────────────
 
 # Mutating commands must resolve paths the SAME way the manifest was
@@ -1194,7 +1496,16 @@ cmd_upgrade() {
 cmd_status() {
   detect_sys
   compute_paths
-  manifest_exists || die "no install recorded at $MANIFEST — run 'install' first (or --user/--dest to match)"
+  compute_container_paths
+  if ! manifest_exists; then
+    # container-only node? print its block and stop
+    if [[ -f "$CT_MANIFEST" ]]; then
+      echo "vesmaro-node status (container install) — $(date '+%Y-%m-%d %H:%M:%S')"
+      container_status
+      return 0
+    fi
+    die "no install recorded at $MANIFEST — run 'install' first (or --user/--dest to match)"
+  fi
   local adopted cv mv cvbin mvbin
   adopted="$(mf_get adopted)"
   if [[ "$adopted" == "yes" ]]; then
@@ -1281,13 +1592,24 @@ PY
       echo "  pair      : ($(mf_get core_tag), $(mf_get mesh_ref)) — NOT in ledger (unknown compatibility)"
     fi
   fi
+
+  container_status   # appends the container block when one is recorded
 }
 
 # ── UNINSTALL ────────────────────────────────────────────────────────
 cmd_uninstall() {
   detect_sys
   compute_paths
-  manifest_exists || die "no install recorded at $MANIFEST"
+  compute_container_paths
+  if ! manifest_exists; then
+    # container-only node
+    if [[ -f "$CT_MANIFEST" ]]; then
+      $ASSUME_YES || die "uninstall is destructive — pass --yes to proceed"
+      cmd_container_uninstall
+      return 0
+    fi
+    die "no install recorded at $MANIFEST"
+  fi
   local adopted; adopted="$(mf_get adopted)"
 
   if $SANDBOX; then
@@ -1328,15 +1650,21 @@ cmd_uninstall() {
     info "full cleanup: rerun with --purge"
   fi
   [[ "$adopted" != "yes" ]] && rm -f "$MANIFEST"
+
+  # a container install on the same node goes too (same --yes/--purge)
+  if [[ -f "$CT_MANIFEST" ]]; then
+    info "container install also recorded — removing it too"
+    cmd_container_uninstall
+  fi
 }
 
 # ── arg parsing ──────────────────────────────────────────────────────
 [[ $# -ge 1 ]] || usage
 CMD="$1"; SCRIPT_CMD="$CMD"; shift
 case "$CMD" in
-  install|upgrade|status|uninstall) : ;;
+  install|upgrade|status|uninstall|container-install) : ;;
   --help|-h|help) usage ;;
-  *) die "unknown subcommand: $CMD (install|upgrade|status|uninstall)" ;;
+  *) die "unknown subcommand: $CMD (install|container-install|upgrade|status|uninstall)" ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -1363,11 +1691,17 @@ while [[ $# -gt 0 ]]; do
     --gen-certs) GEN_CERTS=true; shift ;;
     --check) CHECK=true; shift ;;
     --purge) PURGE=true; shift ;;
-    --keep-data) shift ;;  # default behaviour (data kept unless --purge)
+    --keep-data) KEEP_DATA=true; shift ;;  # protects the data dir under --purge (container mode)
     --yes) ASSUME_YES=true; shift ;;
     --include-adopted) INCLUDE_ADOPTED=true; shift ;;
     --workdir) WORKDIR="$2"; shift 2 ;;
     --python) PYBIN_FLAG="$2"; shift 2 ;;
+    --name) CT_NAME="$2"; shift 2 ;;
+    --tag) CT_TAG="$2"; shift 2 ;;
+    --mesh-tag) CT_MESH_TAG="$2"; shift 2 ;;
+    --port) CT_PORT="$2"; shift 2 ;;
+    --data-dir) CT_DATA_DIR="$2"; shift 2 ;;
+    --network) CT_NETWORK="$2"; shift 2 ;;
     --help|-h) usage ;;
     *) die "unknown flag: $1" ;;
   esac
@@ -1380,6 +1714,7 @@ fi
 
 case "$CMD" in
   install) cmd_install ;;
+  container-install) cmd_container_install ;;
   upgrade) cmd_upgrade ;;
   status) cmd_status ;;
   uninstall) cmd_uninstall ;;

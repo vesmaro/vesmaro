@@ -1,0 +1,30 @@
+# vesmaro-mesh.container — quadlet for the mesh daemon of the CONTAINER
+# install (rootless, systemd --user). Rendered by `vesmaro-node
+# container-install`; only deployed when the mTLS material is present.
+[Unit]
+Description=vesmaro mesh container — federation transport (@@NODE_ID@@)
+Documentation=https://github.com/Korrnals/mnemos-mesh
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+# ghcr image tag == git release tag (Release naming — see
+# contrib/node-install/README.md).
+Image=ghcr.io/korrnals/mnemos-mesh:@@MESH_TAG@@
+ContainerName=@@NAME@@-mesh
+# v1 COMPROMISE: host networking — dials the core on 127.0.0.1:8790 and
+# serves peers on :8443 (see the core quadlet note).
+Network=host
+Volume=@@CONFDIR@@/mesh.container.yaml:/etc/vesmaro/mesh.yaml:ro
+Volume=@@CONFDIR@@/pki:/etc/vesmaro/pki:ro
+Volume=@@STATEDIR@@/container-run:/run/vesmaro
+# Image entrypoint is /usr/local/bin/mnemos-mesh — Exec supplies args.
+Exec=serve -config /etc/vesmaro/mesh.yaml
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

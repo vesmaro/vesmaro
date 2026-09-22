@@ -2,7 +2,7 @@
 # Format (tab-separated, # = comment):
 #   core_tag <TAB> mesh_ref <TAB> mesh_version <TAB> verified <TAB> date
 #
-#   core_tag      git tag in the vesmaro repo (server venv is built from it)
+#   core_tag      git tag in the vesmaro repo (server venv/image is built from it)
 #   mesh_ref      git tag OR commit sha in the mnemos-mesh repo
 #   mesh_version  what `mnemos-mesh version` must print for that ref
 #   verified      how the pair was verified (live-laptop | staging | ...)
@@ -10,6 +10,17 @@
 # vesmaro-node resolves the DEFAULT install/upgrade pair from the LAST
 # data row of this file. An unknown (core, mesh) combination makes
 # `upgrade` refuse with a hint (add a row or --force).
+#
+# Tag formats (Release naming — see contrib/node-install/README.md):
+#   BOTH formats are valid ledger entries; the parser is format-agnostic
+#   (any tag string is accepted as core_tag/mesh_ref identity).
+#     historical : v4.3.7-mesh.2   (-mesh.N suffix; append-only history —
+#                                    do NOT rewrite old rows)
+#     new rows   : vX.Y.Z / vA.B.C (bare, no suffix) — from the next
+#                  release the git tag carries NO -mesh suffix, and the
+#                  ghcr image tag EQUALS the git tag:
+#                  ghcr.io/korrnals/mnemos:<core_tag>,
+#                  ghcr.io/korrnals/mnemos-mesh:<mesh_ref>.
 #
 # Seeded with the live laptop pair (2026-09-22). NOTE: the vesmaro
 # pyproject still says 4.3.0 under tag v4.3.7-mesh.2 — the LEDGER is
