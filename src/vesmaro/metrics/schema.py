@@ -19,14 +19,17 @@ Privacy is by structure, not by filter (ADR-0026):
 """
 
 # ── PROVENANCE ────────────────────────────────────────────────────────
-# Ported from mnemos-vitals main 9933be7 (2026-09-20), review APPROVE.
-# Master copy + methodology: ~/LABs/Projects/Project-Mnemos/mnemos-vitals.
-# Sync rule: sink/schema changes land there first, then are ported here
-# in the same wave (drift-guard tests on both sides must stay green).
+# Vendored from mnemos-vitals main (phase A2, 2026-09-22). Master copy
+# + methodology: ~/LABs/Projects/Project-Mnemos/mnemos-vitals. Sync rule:
+# changes land there first, then are ported in the same wave
+# (drift-guard tests on both sides must stay green).
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass
+from typing import Any
 
 SIDECAR_FILENAME = "metrics.sqlite"
 
@@ -182,6 +185,7 @@ META_ALLOWLIST: frozenset[str] = frozenset(
         "error_type",  # exception CLASS name only — text never
         "budget",  # mcp-only: the requested budget
         "retry",  # int, background surfaces
+        "exit_code",  # int, CLI surface
         "queue_depth",  # int, processor/federation points
         "items",  # int count, background points
         "rule_id",  # scanner/watcher rule identifier (id, not text)
@@ -204,3 +208,66 @@ __all__ = [
     "TABLE_NAMES",
     "TABLE_SCHEMAS",
 ]
+
+
+# ── C5 meta gate (pure, enforced before any verb write) ──────────────────────
+
+#: ``error_type`` must look like an exception CLASS name — exception text
+#: never enters the sidecar.
+_ERROR_TYPE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,63}$")
+#: ``counters`` keys are identifier-capped (N4 — same drift-leak class the
+#: stats projection closed).
+_COUNTER_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,31}$")
+
+_META_STR_LIMIT = 64
+#: Keys whose values are integers by definition — strings refused.
+_INT_ONLY_KEYS = frozenset({"exit_code", "retry", "queue_depth", "items", "budget"})
+
+
+def validate_meta(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    """C5 gate for verb ``meta_json`` — fail-closed, enforced.
+
+    Returns the sanitised dict, or ``None`` when the meta must be
+    REFUSED: unknown key (not in ``META_ALLOWLIST``), non-scalar value,
+    non-finite float, over-long string, ``error_type`` that is not a
+    class name, or a ``counters`` dict with bad keys/sizes. The caller
+    logs the refusal — loud, never a silent drop, never fatal to the
+    host.
+    """
+    if meta is None:
+        return {}
+    if not isinstance(meta, dict):
+        return None
+    clean: dict[str, Any] = {}
+    for key, value in meta.items():
+        if key not in META_ALLOWLIST:
+            return None
+        if key == "counters":
+            # check BEFORE the scalar branch: bool/int would otherwise slip
+            # past the dict validation (m6)
+            if (
+                not isinstance(value, dict)
+                or len(value) > 16
+                or not all(isinstance(k, str) and _COUNTER_KEY_RE.match(k) for k in value)
+                or not all(
+                    isinstance(v, int) and not isinstance(v, bool) and abs(v) <= 10**12
+                    for v in value.values()
+                )
+            ):
+                return None
+            clean[key] = dict(value)
+        elif value is None or isinstance(value, (bool, int)):
+            clean[key] = value
+        elif isinstance(value, float):
+            if not math.isfinite(value):  # NaN/inf: json would emit garbage
+                return None
+            clean[key] = value
+        elif isinstance(value, str) and len(value) <= _META_STR_LIMIT:
+            if key == "error_type" and not _ERROR_TYPE_RE.match(value):
+                return None
+            if key in _INT_ONLY_KEYS:
+                return None  # integer-by-definition key carrying a string
+            clean[key] = value
+        else:
+            return None
+    return clean

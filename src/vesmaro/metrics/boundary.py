@@ -44,8 +44,33 @@ def create_vitals_store(settings: Settings) -> MetricsStore | None:
         )
         return None
     try:
-        settings.mnemos.data_dir.mkdir(parents=True, exist_ok=True)
-        return MetricsStore(settings.mnemos.data_dir / SIDECAR_FILENAME)
+        data_dir = settings.mnemos.data_dir.expanduser()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return MetricsStore(data_dir / SIDECAR_FILENAME)
     except Exception as exc:
         logger.warning("vitals: store unavailable (non-fatal): %s", exc)
         return None
+
+
+#: Per-data-dir cache for manager-less call sites (federation client,
+#: CLI). The store is a guest: creation failure → disabled, never fatal.
+_STANDALONE_STORES: dict[str, MetricsStore] = {}
+
+
+def record_verb_standalone(settings: Settings, **kwargs: object) -> None:
+    """Record a verb without a manager (best-effort, non-fatal).
+
+    Used by call sites that hold Settings but no MemoryManager — the
+    federation client and the CLI entry wrapper.
+    """
+    try:
+        key = str(settings.mnemos.data_dir)
+        store = _STANDALONE_STORES.get(key)
+        if store is None:
+            store = create_vitals_store(settings)
+            if store is None:
+                return
+            _STANDALONE_STORES[key] = store
+        store.record_verb(**kwargs)  # type: ignore[arg-type]
+    except Exception:  # guest contract: never fatal
+        logger.warning("vitals: standalone verb record failed (non-fatal)", exc_info=True)

@@ -47,13 +47,14 @@ Reference:
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import logging
 import threading
 import time
 from collections import defaultdict, deque
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
@@ -312,7 +313,37 @@ def _resolve_peer_token(peer: PeerConfig) -> str | None:
 # ── Main flow ─────────────────────────────────────────────────────────────────
 
 
-def handle_pull(
+def handle_pull(*args: Any, **kwargs: Any) -> tuple[PullResponse, int]:
+    """Vitals boundary #7 (A2): time the pull, then delegate."""
+    import time as _time
+
+    t0 = _time.monotonic()
+    try:
+        result = _handle_pull_impl(*args, **kwargs)
+    except Exception:
+        mgr = kwargs.get("manager")
+        if mgr is not None:
+            with contextlib.suppress(Exception):
+                mgr.record_verb_vitals(
+                    surface="background",
+                    verb="federation.pull",
+                    status="error",
+                    latency_ms=(_time.monotonic() - t0) * 1000,
+                )
+        raise
+    mgr = kwargs.get("manager")
+    if mgr is not None:
+        with contextlib.suppress(Exception):
+            mgr.record_verb_vitals(
+                surface="background",
+                verb="federation.pull",
+                status="ok",
+                latency_ms=(_time.monotonic() - t0) * 1000,
+            )
+    return result
+
+
+def _handle_pull_impl(
     request: PullRequest,
     *,
     settings: Settings,

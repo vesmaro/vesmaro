@@ -17,6 +17,7 @@ between the handler contract and the SDK request/response models.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import json
@@ -1492,7 +1493,59 @@ async def _canonical_tools() -> list[Tool]:
 # ── Tool call handler ──────────────────────────────────────────────────────────
 
 
+_KNOWN_TOOLS_CACHE: frozenset[str] | None = None
+
+
+async def _known_tool_names() -> frozenset[str]:
+    """Registered tool names — the verb cardinality allowlist (m2).
+
+    A client-supplied unknown name collapses to the fixed verb
+    ``unknown``: Prometheus label cardinality must stay bounded
+    (RL-S2), the raw name is never stored. Cached after the first call.
+    """
+    global _KNOWN_TOOLS_CACHE
+    if _KNOWN_TOOLS_CACHE is None:
+        try:
+            _KNOWN_TOOLS_CACHE = frozenset(t.name for t in await list_tools())
+        except Exception:
+            _KNOWN_TOOLS_CACHE = frozenset()
+    return _KNOWN_TOOLS_CACHE
+
+
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    """Time one MCP tool call and record it as a verb (A2 boundary #1).
+
+    Thin shell over :func:`_call_tool_dispatch` — every tool, including
+    ``mnemos_assemble_context``, lands in the verb ledger here (the
+    assemble row is a SEPARATE plane written inside the assemble
+    handler: ledger says who/what/how-long, the domain table says what
+    was assembled — two planes of fact, not double counting).
+    """
+    import time as _time
+
+    t0 = _time.monotonic()
+    try:
+        result = await _call_tool_dispatch(name, arguments)
+    except Exception:
+        with contextlib.suppress(Exception):  # telemetry never masks the error
+            get_manager().record_verb_vitals(
+                surface="mcp",
+                verb=name if name in await _known_tool_names() else "unknown",
+                status="error",
+                latency_ms=(_time.monotonic() - t0) * 1000,
+            )
+        raise
+    with contextlib.suppress(Exception):  # guest contract
+        get_manager().record_verb_vitals(
+            surface="mcp",
+            verb=name if name in await _known_tool_names() else "unknown",
+            status="ok",
+            latency_ms=(_time.monotonic() - t0) * 1000,
+        )
+    return result
+
+
+async def _call_tool_dispatch(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Dispatch a tool call and wrap the result in TextContent.
 
     Pre-2.x this was decorated with ``@server.call_tool()``; the port keeps

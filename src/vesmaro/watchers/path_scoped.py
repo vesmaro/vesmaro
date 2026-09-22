@@ -11,6 +11,7 @@ On file change → update memory. On delete → remove memory + vector entry.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -203,7 +204,40 @@ def remove_rule(manager: MemoryManager, file_path: Path) -> dict[str, Any]:
 # ── Batch operations ─────────────────────────────────────────────────────────
 
 
-def ingest_path_scoped_rules(
+def ingest_path_scoped_rules(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+    """Vitals boundary #9 (A2): time the rules ingest."""
+    import time as _time
+
+    t0 = _time.monotonic()
+    try:
+        result = _ingest_path_scoped_rules_impl(*args, **kwargs)
+    except Exception as exc:
+        manager = args[0] if args else kwargs.get("manager")
+        if manager is not None:
+            with contextlib.suppress(Exception):
+                # Vitals boundary #9 (A2) — error leg.
+                manager.record_verb_vitals(
+                    surface="background",
+                    verb="watcher.ingest",
+                    status="error",
+                    latency_ms=(_time.monotonic() - t0) * 1000,
+                    meta={"error_type": type(exc).__name__},
+                )
+        raise
+    with contextlib.suppress(Exception):
+        manager = args[0] if args else kwargs.get("manager")
+        if manager is not None:
+            manager.record_verb_vitals(
+                surface="background",
+                verb="watcher.ingest",
+                status="ok",
+                latency_ms=(_time.monotonic() - t0) * 1000,
+                meta={"counters": {"rules": len(result)}},
+            )
+    return result
+
+
+def _ingest_path_scoped_rules_impl(
     manager: MemoryManager,
     rules_dir: Path,
     *,

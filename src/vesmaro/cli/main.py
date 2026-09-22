@@ -1549,3 +1549,51 @@ app.add_typer(import_app, name="import")
 app.add_typer(logs_app, name="logs")
 app.add_typer(sync_app, name="sync")
 app.add_typer(scanner_app, name="scanner")
+
+
+def cli_main() -> None:
+    """Console-script entry: time the whole CLI invocation as one verb.
+
+    Vitals boundary #10 (A2). Best-effort on every step — the recorder
+    needs Settings (default resolution; a --config run still records
+    against the default data dir or skips), and a broken plane never
+    changes the command's exit code.
+    """
+    import sys as _sys
+    import time as _time
+
+    from vesmaro.config import load_settings as _load
+
+    t0 = _time.monotonic()
+    status, code = "ok", 0
+    try:
+        app()
+    except SystemExit as exc:  # typer exits non-zero on failures
+        code = int(exc.code or 0)
+        status = "ok" if code == 0 else "error"
+        raise
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        try:
+            argv = _sys.argv
+            cfg = None
+            if "--config" in argv:
+                i = argv.index("--config")
+                if i + 1 < len(argv):
+                    cfg = argv[i + 1]
+            settings = _load(cfg)
+            verb = f"cli:{argv[1]}" if len(argv) > 1 else "cli"
+            from vesmaro.metrics.boundary import record_verb_standalone
+
+            record_verb_standalone(
+                settings,
+                surface="cli",
+                verb=verb,
+                status=status,
+                latency_ms=(_time.monotonic() - t0) * 1000,
+                meta={"retry": code} if code else None,
+            )
+        except Exception:
+            pass

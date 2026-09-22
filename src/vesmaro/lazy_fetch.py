@@ -282,8 +282,7 @@ def confirm_fetch(stdin: TextIO, stdout: TextIO, is_tty: Callable[[], bool]) -> 
     """
     if not is_tty():
         stdout.write(
-            "fetch: confirmation required but stdin is not interactive — "
-            "pass --yes to proceed\n"
+            "fetch: confirmation required but stdin is not interactive — pass --yes to proceed\n"
         )
         return False
     stdout.write("Proceed with fetch? [y/N]: ")
@@ -443,9 +442,7 @@ def run_fetch(
                 # failure on one record must not abort the remaining
                 # records — log it fully and count it as an error (the
                 # exit code reflects it).
-                logger.exception(
-                    "lazy fetch import failed fed_id=%s peer=%s", record.id, peer_id
-                )
+                logger.exception("lazy fetch import failed fed_id=%s peer=%s", record.id, peer_id)
                 stats.errors += 1
                 continue
             if result.status is CompactImportStatus.WRITTEN:

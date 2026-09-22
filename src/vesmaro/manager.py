@@ -463,6 +463,7 @@ class MemoryManager:
             )
             self._vitals_store = None
         self._vitals_retention_last_ts: float = 0.0
+        self._vitals_rollup_last_ts: float = 0.0
         # ADR-0017 D1 (#125) — bounded registry for assemble_context
         # mode="async" results (handle -> (ContextBlock dict, session)).
         # In-memory, single-tenant, capped by
@@ -4414,7 +4415,20 @@ class MemoryManager:
                         processor_stats.get("legacy_queue_depth", 0),
                         processor_stats.get("refine_queue_depth", 0),
                     )
-                    result = self.run_pipeline(limit=200)
+                    _cycle_t0 = time.monotonic()
+                    try:
+                        result = self.run_pipeline(limit=200)
+                    except Exception as exc:
+                        # Vitals boundary #3 (A2) — the failure IS telemetry.
+                        self.record_verb_vitals(
+                            surface="background",
+                            verb="pipeline.cycle",
+                            status="error",
+                            latency_ms=(time.monotonic() - _cycle_t0) * 1000,
+                            meta={"error_type": type(exc).__name__},
+                        )
+                        raise
+                    _cycle_ms = (time.monotonic() - _cycle_t0) * 1000
                     logger.info(
                         "Processor: cycle done — published=%d single=%d stuck=%d "
                         "refined=%d noop=%d quarantined=%d",
@@ -4425,17 +4439,71 @@ class MemoryManager:
                         result.get("refined_noop", 0),
                         result.get("quarantined", 0),
                     )
+                    # Vitals boundary #3 (A2): the pipeline cycle as a verb.
+                    self.record_verb_vitals(
+                        surface="background",
+                        verb="pipeline.cycle",
+                        status="ok",
+                        latency_ms=_cycle_ms,
+                        meta={
+                            "counters": {
+                                "published": int(result.get("published", 0)),
+                                "refined": int(result.get("refined", 0)),
+                                "quarantined": int(result.get("quarantined", 0)),
+                            }
+                        },
+                    )
                 # Issue #170 (ADR-0019 Phase C) — idempotent lease-reclaim
                 # pass: processing rows whose lease expired (a worker died
                 # between the claim and its outcome write) re-enter the
                 # pending intake.
-                self.reclaim_stale_refinements()
+                _reclaim_t0 = time.monotonic()
+                try:
+                    self.reclaim_stale_refinements()
+                except Exception as exc:
+                    # Vitals boundary #5a (A2) — error leg.
+                    self.record_verb_vitals(
+                        surface="background",
+                        verb="refine.reclaim",
+                        status="error",
+                        latency_ms=(time.monotonic() - _reclaim_t0) * 1000,
+                        meta={"error_type": type(exc).__name__},
+                    )
+                    raise
+                # Vitals boundary #5a (A2).
+                self.record_verb_vitals(
+                    surface="background",
+                    verb="refine.reclaim",
+                    status="ok",
+                    latency_ms=(time.monotonic() - _reclaim_t0) * 1000,
+                )
                 # ADR-0019 §Swap — idempotent heal pass: refined rows whose
                 # embed is stale/missing (a failed post-swap upsert) get
                 # re-embedded; quarantined rows are skipped absolutely.
-                self.heal_stale_embeddings()
+                _heal_t0 = time.monotonic()
+                try:
+                    self.heal_stale_embeddings()
+                except Exception as exc:
+                    # Vitals boundary #5b (A2) — error leg.
+                    self.record_verb_vitals(
+                        surface="background",
+                        verb="embed.heal",
+                        status="error",
+                        latency_ms=(time.monotonic() - _heal_t0) * 1000,
+                        meta={"error_type": type(exc).__name__},
+                    )
+                    raise
+                # Vitals boundary #5b (A2).
+                self.record_verb_vitals(
+                    surface="background",
+                    verb="embed.heal",
+                    status="ok",
+                    latency_ms=(time.monotonic() - _heal_t0) * 1000,
+                )
                 # CCR cleanup tick — runs on its own interval, not every cycle.
                 self._maybe_run_ccr_cleanup()
+                # Vitals rollup tick (A2) — hourly, BEFORE retention.
+                self._maybe_run_vitals_rollup()
                 # Vitals retention tick (C4) — nightly cadence, own interval.
                 self._maybe_run_vitals_retention()
             except Exception:
@@ -4455,8 +4523,22 @@ class MemoryManager:
         if self._ccr_cleanup_last_ts and (now - self._ccr_cleanup_last_ts) < interval:
             return
         self._ccr_cleanup_last_ts = now
+        _ccr_t0 = time.monotonic()
         try:
             result = self.ccr_cleanup()
+            # Vitals boundary #4 (A2).
+            self.record_verb_vitals(
+                surface="background",
+                verb="ccr.cleanup",
+                status="ok",
+                latency_ms=(time.monotonic() - _ccr_t0) * 1000,
+                meta={
+                    "counters": {
+                        "ttl_deleted": int(result.get("ttl_deleted", 0)),
+                        "lru_evicted": int(result.get("lru_evicted", 0)),
+                    }
+                },
+            )
             if result["ttl_deleted"] or result["lru_evicted"]:
                 logger.info(
                     "CCR cleanup: ttl_deleted=%d lru_evicted=%d",
@@ -4464,6 +4546,14 @@ class MemoryManager:
                     result["lru_evicted"],
                 )
         except Exception:
+            # Vitals boundary #4 (A2) — the failure IS the telemetry.
+            self.record_verb_vitals(
+                surface="background",
+                verb="ccr.cleanup",
+                status="error",
+                latency_ms=(time.monotonic() - _ccr_t0) * 1000,
+                meta={"error_type": "CCRCleanupError"},
+            )
             logger.exception("CCR cleanup failed (non-fatal)")
 
     # ── Vitals (ADR-0026 phase A) ─────────────────────────────────────────
@@ -4490,6 +4580,82 @@ class MemoryManager:
             store.record_assemble(result)
         except Exception:  # the plane must never surface
             logger.warning("vitals: boundary record failed (non-fatal)", exc_info=True)
+
+    def record_verb_vitals(
+        self,
+        *,
+        surface: str,
+        verb: str,
+        status: str,
+        latency_ms: float,
+        status_code: int | None = None,
+        project: str | None = None,
+        agent: str | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        """Record one verb call into the vitals ledger (non-fatal).
+
+        Phase A2: one row per call on any metered surface (MCP dispatch,
+        REST middleware, background jobs, CLI). Meta passes the C5
+        allowlist gate (``validate_meta``) — a refused meta logs a
+        warning and the write is dropped loudly, never fatally.
+        """
+        store = self._vitals_store
+        if store is None:
+            return
+        try:
+            store.record_verb(
+                surface=surface,
+                verb=verb,
+                status=status,
+                latency_ms=latency_ms,
+                status_code=status_code,
+                project=project,
+                agent=agent,
+                meta=meta,
+            )
+        except Exception:
+            logger.warning("vitals: verb record failed (non-fatal)", exc_info=True)
+
+    def vitals_exposition(self) -> str:
+        """Prometheus text for the vitals plane ('' when disabled)."""
+        store = self._vitals_store
+        if store is None:
+            return ""
+        try:
+            from vesmaro.metrics.exposer import render_exposition
+
+            return render_exposition(store)
+        except Exception:
+            logger.warning("vitals: exposition render failed (non-fatal)", exc_info=True)
+            return ""
+
+    def _maybe_run_vitals_rollup(self) -> None:
+        """Hourly rollup tick (A2): aggregate the previous complete hour.
+
+        Runs BEFORE retention in the loop so raw verb rows are never
+        deleted unrolled. Same cadence pattern as the CCR cleanup tick.
+        """
+        store = self._vitals_store
+        if store is None:
+            return
+        now = time.monotonic()
+        if self._vitals_rollup_last_ts and (now - self._vitals_rollup_last_ts) < 3600:
+            return
+        self._vitals_rollup_last_ts = now
+        try:
+            # catch-up: roll every hour since the last rolled one (capped
+            # at a week — older gaps mean the plane was down longer than
+            # the raw TTL margin; the retention report surfaces that)
+            prev_hour = int(time.time() // 3600) - 1
+            first = max(store.last_rolled_hour() + 1, prev_hour - 168)
+            rows = 0
+            for hour in range(first, prev_hour + 1):
+                rows += store.rollup_hourly(hour=hour)
+            if rows:
+                logger.info("vitals rollup: %d rows", rows)
+        except Exception:
+            logger.error("vitals rollup failed (A2 gate alert)", exc_info=True)
 
     def _maybe_run_vitals_retention(self) -> None:
         """Nightly sidecar retention (C4): DELETE per-TTL + VACUUM.
