@@ -1538,12 +1538,14 @@ app.add_typer(doctor_app, name="doctor")
 
 # ── export / import / logs (M17 — backup/restore + trace viewer) ──────────────
 
+from vesmaro.cli.agent_token_cmd import agent_token_app  # noqa: E402
 from vesmaro.cli.export_cmd import export_app  # noqa: E402
 from vesmaro.cli.import_cmd import import_app  # noqa: E402
 from vesmaro.cli.logs import logs_app  # noqa: E402
 from vesmaro.cli.scanner_cmd import scanner_app  # noqa: E402
 from vesmaro.cli.sync_cmd import sync_app  # noqa: E402
 
+app.add_typer(agent_token_app, name="agent-token")
 app.add_typer(export_app, name="export")
 app.add_typer(import_app, name="import")
 app.add_typer(logs_app, name="logs")

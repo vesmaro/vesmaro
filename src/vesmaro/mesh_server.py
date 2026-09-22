@@ -885,6 +885,115 @@ class MnemosCoreServicer:
             cursor=cursor,
         )
 
+    # ── RPC: ReadMemory ───────────────────────────────────────────────────
+
+    def ReadMemory(  # noqa: N802 -- gRPC servicer override; name dictated by generated core_pb2_grpc.MnemosCoreServicer
+        self,
+        request: Any,
+        context: grpc.ServicerContext[Any, Any],
+    ) -> Any:
+        """Fetch ONE moderation-processed record by id (W3-v1, ADR-0018 am.3).
+
+        Serves the AgentGateway read path: the mesh forwards an
+        AgentReadMemory RPC here (token relay in gRPC metadata; the
+        agent-leg token gate itself is the W3 part-2 gateway wiring).
+        Core-leg semantics mirror :meth:`ListMemories` on a single record:
+
+        1. Resolve the caller's peer (same identity rules as ListMemories)
+           and enforce the TLS pin on the TCP leg.
+        2. Parse the id: a ``fed:<agent>:<uuid>`` CompactRecord id carries
+           the source ``memory.id`` as its tail; anything else is treated
+           as a raw memory id (unit-test / operator path).
+        3. Unknown id → ``NOT_FOUND``. ``mnemos:no-federate`` →
+           ``NOT_FOUND`` too — the record's very existence is not
+           disclosed (defence-in-depth layer 3).
+        4. ACL GATE (fail-closed, every request): untagged records are
+           never served on this path; the record's project must be in the
+           peer's effective allowed set; an explicit ``request.project``
+           must MATCH the record's project (narrowing only).
+        5. Build the CompactRecord via moderation; a moderation refuse →
+           ``REFUSED`` trigger code (the call itself succeeds — the code
+           is the outcome, mirroring the write path).
+        6. ``revision`` is stamped 0 (= "no revision information", the
+           documented proto default): the by-id fetch does not walk the
+           rowid list path; stamping a storage revision here would imply
+           LWW semantics this leg does not participate in.
+        """
+        record_id = str(request.record_id or "")
+        if not record_id:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("record_id must be non-empty")
+            return _mesh_gen.core_pb2.ReadMemoryResponse(trigger_code=_mesh_gen.fed_pb2.REFUSED)
+
+        peer_id = self._peer_id_from_context(context) or self._single_peer_id()
+        if peer_id is None:
+            logger.info("mesh_server: ReadMemory refused — no peer identity")
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("no peer identity and not exactly one peer configured")
+            return _mesh_gen.core_pb2.ReadMemoryResponse(trigger_code=_mesh_gen.fed_pb2.REFUSED)
+        pin_peer = _resolve_peer(self._settings, peer_id)
+        if pin_peer is not None and not self._enforce_tls_client_pin(pin_peer, context):
+            return _mesh_gen.core_pb2.ReadMemoryResponse(trigger_code=_mesh_gen.fed_pb2.REFUSED)
+
+        memory_id = record_id.rsplit(":", 1)[-1] if record_id.startswith("fed:") else record_id
+        memory = self._manager.get(memory_id)
+        if memory is None:
+            logger.info("mesh_server: ReadMemory miss — id=%s (peer_id=%s)", record_id, peer_id)
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(f"record {record_id!r} not found")
+            return _mesh_gen.core_pb2.ReadMemoryResponse(trigger_code=_mesh_gen.fed_pb2.REFUSED)
+        if NO_FEDERATE_TAG in memory.tags:
+            # Same posture as the list path's exclusion — plus id-oracle
+            # avoidance: a no-federate id is indistinguishable from absent.
+            logger.info(
+                "mesh_server: ReadMemory refused no-federate id=%s (peer_id=%s)",
+                record_id,
+                peer_id,
+            )
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(f"record {record_id!r} not found")
+            return _mesh_gen.core_pb2.ReadMemoryResponse(trigger_code=_mesh_gen.fed_pb2.REFUSED)
+
+        project = _tag_value(memory.tags, "project:")
+        allowed_projects = self._allowed_projects_for_peer(peer_id)
+        if not allowed_projects or not project or project not in allowed_projects:
+            logger.info(
+                "mesh_server: ReadMemory refused — project=%s not in allowed set for peer_id=%s",
+                project,
+                peer_id,
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(f"ACL REFUSED: project {project!r} not allowed")
+            return _mesh_gen.core_pb2.ReadMemoryResponse(trigger_code=_mesh_gen.fed_pb2.REFUSED)
+        if request.project and request.project != project:
+            logger.info(
+                "mesh_server: ReadMemory refused — request.project=%s ≠ record project=%s",
+                request.project,
+                project,
+            )
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(
+                f"ACL REFUSED: record does not belong to project {request.project!r}"
+            )
+            return _mesh_gen.core_pb2.ReadMemoryResponse(trigger_code=_mesh_gen.fed_pb2.REFUSED)
+
+        rec = build_compact_record(
+            memory,
+            source_agent=memory.agent or "unknown",
+            refuse_threshold=self._settings.federation.moderation_refuse_threshold,
+        )
+        if rec is None:
+            logger.info(
+                "mesh_server: ReadMemory moderation refused id=%s (peer_id=%s)",
+                record_id,
+                peer_id,
+            )
+            return _mesh_gen.core_pb2.ReadMemoryResponse(trigger_code=_mesh_gen.fed_pb2.REFUSED)
+        return _mesh_gen.core_pb2.ReadMemoryResponse(
+            record=_compact_to_proto(rec),
+            trigger_code=_mesh_gen.fed_pb2.EXHAUSTIVE,
+        )
+
     # ── RPC: WriteMemory ───────────────────────────────────────────────────
 
     def import_compact_record(self, compact: CompactRecord, *, peer_id: str) -> CompactImportResult:

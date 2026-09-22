@@ -133,6 +133,40 @@ message ListMemoriesResponse {
   string cursor = 4;
 }
 
+// ReadMemoryRequest — fetch a single record by id (W3-v1 gateway read path,
+// ADR-0018 amendment 3 + ADR-0018-T §Status: ReadMemory is the additive
+// core-proto RPC that did not exist in mnemos_core_api.proto before W3).
+//
+// The mesh's AgentGateway service (agent_gateway.proto) terminates agent
+// RPCs and forwards them here over the existing core leg — the mesh never
+// resolves content ACLs itself (criterion 5): mnemos re-derives the agent
+// identity from the token forwarded in gRPC metadata and applies the
+// fail-closed scope gate (token scope ∩ transport-peer ACL, ADR-0018-T §3).
+message ReadMemoryRequest {
+  // The CompactRecord id to fetch (`fed:<source_agent>:<local_uuid>` or a
+  // locally-minted id seen in a prior ListMemories/AgentListMemories page).
+  // Unknown id → NOT_FOUND. Id present but outside the caller's effective
+  // scope → PERMISSION_DENIED (fail-closed, same contract as ListMemories).
+  string record_id = 1;
+
+  // Optional project scope narrowing. Empty = resolve by id alone; the
+  // mnemos-side effective-scope gate still applies either way. Carried
+  // explicitly so the audit log can attribute the request to a project
+  // without parsing the record body.
+  string project = 2;
+}
+
+// ReadMemoryResponse — a single moderation-processed CompactRecord.
+message ReadMemoryResponse {
+  // The requested record, already moderation-processed (secrets redacted,
+  // PII anonymised) — identical guarantees to ListMemoriesResponse.records.
+  mnemos.federation.v1.CompactRecord record = 1;
+
+  // Trigger code describing the outcome (contract §9). EXHAUSTIVE on a
+  // clean fetch; REFUSED when moderation could not sanitize the record.
+  mnemos.federation.v1.TriggerCodes trigger_code = 2;
+}
+
 // ImportMode — mirrors the mnemos_import MCP tool modes (merge / restore).
 //
 // Source: mnemos-operations.instructions.md §1 ("restore = wipe all then
@@ -287,8 +321,10 @@ message UpsertIndexEntriesResponse {
 
 // MnemosCore — the mesh↔mnemos core service over Unix socket + gRPC.
 //
-// Six RPCs:
+// Seven RPCs:
 //   * ListMemories          — mnemos exports to mesh (mesh reads).
+//   * ReadMemory            — single-record fetch by id (W3-v1 gateway
+//                             read path, ADR-0018 amendment 3).
 //   * WriteMemory           — mesh imports to mnemos (mesh writes).
 //   * GetSubscriptionState  — cursor persistence (mesh reads on reconnect).
 //   * Heartbeat             — liveness probe (both directions).
@@ -305,6 +341,13 @@ service MnemosCore {
   // moderation-processed and compact-formatted. The mesh forwards the
   // resulting CompactRecord envelopes to peers over the FederationPeer API.
   rpc ListMemories(ListMemoriesRequest) returns (ListMemoriesResponse);
+
+  // ReadMemory — single-record fetch by id (W3-v1, ADR-0018 amendment 3).
+  // Serves the AgentGateway read path: the mesh forwards an
+  // AgentReadMemory RPC here after relaying the agent token in gRPC
+  // metadata; mnemos applies the fail-closed effective-scope gate before
+  // releasing the record. Additive — pre-W3 callers never see it.
+  rpc ReadMemory(ReadMemoryRequest) returns (ReadMemoryResponse);
 
   // WriteMemory — mesh imports a CompactRecord from a peer into mnemos.
   // Idempotent by CompactRecord.id. mnemos may apply its own import

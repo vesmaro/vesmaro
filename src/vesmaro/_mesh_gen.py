@@ -30,7 +30,7 @@ from __future__ import annotations
 import importlib
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 #: Absolute path to the gRPC-generated Python stubs directory.
 #:
@@ -65,5 +65,39 @@ core_pb2_grpc: Any = importlib.import_module("mnemos_core_api_pb2_grpc")
 #: federation.v1 messages shared between the peer and core APIs.
 fed_pb2: Any = importlib.import_module("federation_pb2")
 
+#: ``agent_gateway_pb2`` — W3-v1 AgentGateway service messages (agent leg,
+#: ADR-0018 variant (c)). Loaded LAZILY via module ``__getattr__`` (PEP
+#: 562): the generated stubs are gitignored and environments that have not
+#: re-run ``scripts/gen-proto.sh`` since W3 do not have the file — an eager
+#: import here would break them at ``vesmaro`` import time. The bare
+#: annotations below (no assignment) document the lazy names for static
+#: tools without creating the attributes.
+_AGENT_LAZY_MODULES: Final[dict[str, str]] = {
+    "gateway_pb2": "agent_gateway_pb2",
+    "gateway_pb2_grpc": "agent_gateway_pb2_grpc",
+}
 
-__all__ = ["_GEN_DIR", "core_pb2", "core_pb2_grpc", "fed_pb2"]
+gateway_pb2: Any
+gateway_pb2_grpc: Any
+
+
+def __getattr__(name: str) -> Any:
+    """Lazy re-export of the W3 agent-gateway generated modules.
+
+    Raises ``AttributeError`` with a pointer to ``scripts/gen-proto.sh``
+    when the stubs are missing, instead of a bare import error (the known
+    stale-gen trap documented in the script header).
+    """
+    module_name = _AGENT_LAZY_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    _ensure_gen_dir_on_path()
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:
+        raise AttributeError(
+            f"{name} unavailable — generated stubs missing. Run: bash scripts/gen-proto.sh"
+        ) from exc
+
+
+__all__ = ["_GEN_DIR", "core_pb2", "core_pb2_grpc", "fed_pb2", "gateway_pb2", "gateway_pb2_grpc"]

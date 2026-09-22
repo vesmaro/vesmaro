@@ -35,6 +35,7 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
   --grpc_python_out="${TMP_DIR}" \
   --pyi_out="${TMP_DIR}" \
   federation/proto/federation.proto \
+  federation/proto/agent_gateway.proto \
   federation/proto/mnemos_core_api.proto
 
 # --- gencode guard: embedded gencode major == protobuf runtime major ----
@@ -95,9 +96,13 @@ mkdir -p "${GEN_DIR}"
 # files dropped from the protos do not linger as stale stubs.
 rm -f "${GEN_DIR}"/federation_pb2.py "${GEN_DIR}"/federation_pb2_grpc.py \
       "${GEN_DIR}"/federation_pb2.pyi "${GEN_DIR}"/mnemos_core_api_pb2.py \
-      "${GEN_DIR}"/mnemos_core_api_pb2_grpc.py "${GEN_DIR}"/mnemos_core_api_pb2.pyi
+      "${GEN_DIR}"/mnemos_core_api_pb2_grpc.py "${GEN_DIR}"/mnemos_core_api_pb2.pyi \
+      "${GEN_DIR}"/agent_gateway_pb2.py "${GEN_DIR}"/agent_gateway_pb2_grpc.py \
+      "${GEN_DIR}"/agent_gateway_pb2.pyi
 mv "${TMP_DIR}"/federation_pb2.py "${TMP_DIR}"/federation_pb2_grpc.py \
    "${TMP_DIR}"/federation_pb2.pyi "${TMP_DIR}"/mnemos_core_api_pb2.py \
    "${TMP_DIR}"/mnemos_core_api_pb2_grpc.py "${TMP_DIR}"/mnemos_core_api_pb2.pyi \
+   "${TMP_DIR}"/agent_gateway_pb2.py "${TMP_DIR}"/agent_gateway_pb2_grpc.py \
+   "${TMP_DIR}"/agent_gateway_pb2.pyi \
    "${GEN_DIR}/"
 echo "regenerated federation/gen/python/ from federation/proto/*.proto"

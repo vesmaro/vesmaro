@@ -1,0 +1,159 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// mnemos-mesh Agent Gateway API — W3-v1 contract (ADR-0018 variant (c),
+// threat model ADR-0018-T, archcom amendments 2026-09-20).
+//
+// THE DEDICATED AGENT LEG (ADR-0018-T §2, variant (ii)): a SEPARATE gRPC
+// service with its own listener, served by the mesh node with server-TLS
+// (node leaf certificate). It is deliberately NOT the FederationPeer mTLS
+// listener — mixing agent auth strengths on one RequireAndVerifyClientCert
+// surface couples agent-leg DoS to the peer leg (ADR-0018-T rejected
+// variant (i)). The mesh CA stays node-scoped (criterion 3): agents are
+// NOT mesh nodes and never hold mesh certificates.
+//
+// AUTHENTICATION — bearer token in gRPC metadata, NEVER in message fields
+// (ADR-0018-T §2/§3): every RPC MUST carry
+//     authorization: Bearer <mnemos-minted agent token>
+// on the agent leg; the mesh relays it on the core leg the same way. A
+// token in a message field would leak into query logs (T7) and break the
+// "identity derives ONLY from the mnemos-validated token" rule (T3/T4).
+//
+// AUTHORIZATION — entirely mnemos-side (criterion 5): the mesh reads the
+// token header for routing, audit, and fast-fail ONLY (early reject when
+// aud ≠ self). Signature verification, revocation (jti/sub denylist), and
+// scope→ACL resolution happen in mnemos on EVERY request. The effective
+// scope = token scope ∩ transport-peer ACL (fail-closed allowed_projects);
+// an agent can never see more than the underlying peer leg permits (T5).
+//
+// W3-v1 SCOPE (ADR-0018 amendment 3): ListMemories + ReadMemory + the
+// WriteMemory class. Search is a LATER additive phase via core-proto —
+// deliberately absent here; do not add a free-text query field to
+// AgentListMemories without a contract amendment.
+//
+// Contract lineage:
+//   * ADR-0018-agent-gateway-boundary.md (Accepted, archcom 2026-09-20).
+//   * ADR-0018-threat-model.md §2 (leg shape), §3 (token scheme), §4
+//     (T1–T8 countermeasures), §5 (issuance UX launch condition).
+//   * Message reuse: WriteMemoryRequest/WriteMemoryResponse are the
+//     mnemos.core.v1 wire messages VERBATIM — the mesh relays them without
+//     re-marshalling (same pattern as MnemosCore.SyncMetadata reusing the
+//     FederationPeer messages).
+//
+// Codegen note: this file shares the Go package `mnemosmesh` with
+// federation.proto and mnemos_core_api.proto, so its message names are
+// Agent-prefixed to avoid Go identifier collisions with the core-leg
+// ListMemories* / ReadMemory* messages in the same generated package.
+
+syntax = "proto3";
+
+package mnemos.gateway.v1;
+
+// Go codegen import path + package name for the mnemos-mesh Go binary.
+// Same gen tree + Go package as the other two contract files — see the
+// note in buf.gen.yaml and agent_gateway.proto's header comment.
+option go_package = "github.com/Korrnals/mnemos-mesh/proto/gen;mnemosmesh";
+
+import "federation.proto";
+import "mnemos_core_api.proto";
+
+// AgentListMemoriesRequest — one page of the agent-visible corpus.
+//
+// Deliberately NARROWER than mnemos.core.v1.ListMemoriesRequest: no
+// include_no_federate (agents must never see no-federate records —
+// defence-in-depth layer 3 stays closed), no since (agents do not run
+// incremental refresh). Free-text search is NOT in W3-v1 (ADR-0018
+// amendment 3) — this is a filtered listing only.
+message AgentListMemoriesRequest {
+  // Restrict the listing to these project slugs. Empty = all projects the
+  // token scope ∩ peer ACL allows (the mnemos-side gate is the upper
+  // bound; this field can only narrow, never widen).
+  repeated string projects = 1;
+
+  // Page-size hint. 0 = mnemos default; values above the hard ceiling
+  // (mirror of the core leg's _MAX_PAGE_SIZE = 500) are clamped down
+  // (DoS guard, ADR-0018-T T6).
+  int32 limit = 2;
+
+  // Opaque continuation checkpoint previously minted in
+  // AgentListMemoriesResponse.cursor. OWNER: mnemos-core (ADR-0020
+  // semantics) — the mesh relays it byte-for-byte and never parses it
+  // (criterion 1). Empty = first page.
+  string cursor = 3;
+}
+
+// AgentListMemoriesResponse — a page of CompactRecord envelopes.
+message AgentListMemoriesResponse {
+  // The CompactRecord bodies for this page, already moderation-processed
+  // by mnemos — the mesh forwards them as-is (dumb transport).
+  repeated mnemos.federation.v1.CompactRecord records = 1;
+
+  // True if more pages are available. Re-call AgentListMemories with
+  // cursor set to the cursor minted in this response.
+  bool has_more = 2;
+
+  // Opaque continuation checkpoint (non-empty iff records is non-empty;
+  // same ADR-0020 semantics as the core leg's ListMemoriesResponse).
+  string cursor = 3;
+
+  // Trigger code describing this response (contract §9). REFUSED when the
+  // effective-scope gate denied the whole listing; PARTIAL when moderation
+  // filtered records out of an otherwise granted page.
+  mnemos.federation.v1.TriggerCodes trigger_code = 4;
+}
+
+// AgentReadRequest — fetch one record by id over the agent leg.
+message AgentReadRequest {
+  // The CompactRecord id to fetch (as seen in a prior
+  // AgentListMemoriesResponse page). Unknown id → NOT_FOUND; id outside
+  // the token's effective scope → PERMISSION_DENIED (fail-closed).
+  string record_id = 1;
+
+  // Optional project scope narrowing. Empty = resolve by id alone; the
+  // mnemos-side effective-scope gate applies either way.
+  string project = 2;
+}
+
+// AgentReadResponse — one moderation-processed CompactRecord.
+message AgentReadResponse {
+  // The requested record. Same redaction guarantees as the list path.
+  mnemos.federation.v1.CompactRecord record = 1;
+
+  // Trigger code describing the outcome (contract §9). EXHAUSTIVE on a
+  // clean fetch; REFUSED when moderation could not sanitize the record.
+  mnemos.federation.v1.TriggerCodes trigger_code = 2;
+}
+
+// AgentGateway — the agent→mesh leg (W3-v1, ADR-0018 variant (c)).
+//
+// Three RPCs, mirroring the W3-v1 scope (ListMemories + ReadMemory +
+// WriteMemory class, ADR-0018 amendment 3):
+//   * AgentListMemories — filtered listing, cursor-paginated.
+//   * AgentReadMemory   — single-record fetch by id.
+//   * AgentWriteMemory  — write path, token must carry the `rw` grant.
+//
+// EVERY RPC requires the bearer token in gRPC metadata `authorization`
+// (see the file header). The mesh terminates the RPC, logs
+// jti + agent_id + method + filter to the gateway_query category
+// (ADR-0018-T §6 — TTL ≤ 14 d, mode 0600, no token values, no bodies),
+// and forwards to mnemos over the core leg. The mesh MUST NOT accept
+// agent identity from any message field — only from the token (T4).
+service AgentGateway {
+  // AgentListMemories — one page of the agent-visible corpus. The token
+  // needs any scope class (read or rw); `project:<slug>` grants narrow
+  // the listing further (mnemos intersects token scope with the peer ACL).
+  rpc AgentListMemories(AgentListMemoriesRequest)
+      returns (AgentListMemoriesResponse);
+
+  // AgentReadMemory — single-record fetch by id. Same scope rules as
+  // AgentListMemories; per-record gate resolved in mnemos.
+  rpc AgentReadMemory(AgentReadRequest) returns (AgentReadResponse);
+
+  // AgentWriteMemory — write a CompactRecord through the gateway.
+  // Reuses the core-leg WriteMemory wire messages verbatim (the mesh
+  // relays without re-marshalling). The token MUST carry the `rw` scope
+  // grant — a read-class token gets PERMISSION_DENIED before the write
+  // reaches the core leg. RESTORE is refused outright on this leg (the
+  // restore hard gate stays an operator-side path, never an agent path).
+  rpc AgentWriteMemory(mnemos.core.v1.WriteMemoryRequest)
+      returns (mnemos.core.v1.WriteMemoryResponse);
+}
