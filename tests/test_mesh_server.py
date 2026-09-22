@@ -52,6 +52,7 @@ from unittest.mock import MagicMock
 
 import grpc
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import ValidationError
 
 from vesmaro import _mesh_gen
@@ -1723,6 +1724,35 @@ class TestAgentDataGate:
                 timeout=2.0,
             )
         assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+    def test_bad_signature_unauthenticated(self, server: MeshServer, settings: Settings) -> None:
+        """A well-formed token signed by a FOREIGN key → UNAUTHENTICATED.
+
+        The forge axis isolated: the envelope is minted against the REAL
+        registry (its jti is genuinely registered, agent id / aud / scope
+        are all genuine and even match the request metadata), so the ONLY
+        failing check is the Ed25519 signature — possession of the store
+        without the signing key must not pass step 1 of the check order.
+        """
+        store, _real_key = _token_mint_deps(settings)  # real key exists at the servicer path
+        attacker_key = Ed25519PrivateKey.generate()
+        token, _claims = issue_agent_token(
+            agent_id="harness-forge",
+            node_id=_PEER_ID,
+            scope_spec="read",
+            store=store,
+            key=attacker_key,
+        )
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ListMemories(
+                _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+                metadata=_agent_metadata(token, "harness-forge"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+        assert "bad_signature" in (exc_info.value.details() or "")
 
     def test_expired_token_unauthenticated(self, server: MeshServer, settings: Settings) -> None:
         """An expired token → UNAUTHENTICATED on the data path."""

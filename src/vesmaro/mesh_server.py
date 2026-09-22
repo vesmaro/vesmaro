@@ -866,8 +866,13 @@ class MnemosCoreServicer:
            ``x-mnemos-agent-id`` (the gateway relays the verdict id
            verbatim; a mismatch is a spoof or a broken relay) →
            ``PERMISSION_DENIED``.
-        4. A store/key initialisation failure → ``INTERNAL`` (never a
-           fabricated pass, never a serving-thread crash).
+        4. A store/key initialisation failure, or a mid-validation
+           runtime crash of the validator itself (e.g. a locked SQLite
+           hit during the jti denylist lookup) → ``INTERNAL`` with a
+           FIXED details string (the cause goes to the log only — an
+           uncaught exception would surface as ``UNKNOWN`` with the
+           raw error repr on the wire): never a fabricated pass, never
+           a serving-thread crash.
 
         The class grant (``rw`` ⊃ ``read``) is enforced by the CALLER
         (WriteMemory requires ``rw``); the project grants narrow the
@@ -901,7 +906,17 @@ class MnemosCoreServicer:
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(f"agent token validation backend unavailable: {exc}")
             return None
-        verdict = validate_agent_token(token, node_id, store=store, key=key)
+        # P3 review nit: a mid-validation crash (e.g. sqlite OperationalError
+        # on the jti lookup) must map to INTERNAL with a FIXED details string —
+        # uncaught it would surface as UNKNOWN with the raw error repr on the
+        # wire (leaking store paths to the mesh caller).
+        try:
+            verdict = validate_agent_token(token, node_id, store=store, key=key)
+        except Exception as exc:  # surfaced as INTERNAL, logged with cause
+            logger.error("mesh_server: agent data gate validation failed rpc=%s (%s)", rpc, exc)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details("agent token validation failed")
+            return None
         if not verdict.valid:
             logger.info(
                 "mesh_server: agent data gate rejected rpc=%s agent_id=%s jti=%s reason=%s",
@@ -1301,8 +1316,13 @@ class MnemosCoreServicer:
           or an empty ``gateway_node_id`` → ``INVALID_ARGUMENT`` (a
           malformed RPC from the mesh, not a token verdict);
         * a store/key initialisation failure (unreadable signing key,
-          locked DB) → ``INTERNAL`` — never crash the serving thread,
-          never return a fabricated ``valid=True``;
+          locked DB), or a mid-validation runtime crash of the
+          validator (e.g. a locked SQLite hit during the jti denylist
+          lookup) → ``INTERNAL`` with a FIXED details string (the
+          cause goes to the log only — an uncaught exception would
+          surface as ``UNKNOWN`` with the raw error repr on the wire)
+          — never crash the serving thread, never return a fabricated
+          ``valid=True``;
         * anything else → the honest verdict, including ``valid=False``
           with the per-check ``reason``.
         """
@@ -1325,7 +1345,17 @@ class MnemosCoreServicer:
             context.set_details(f"token validation backend unavailable: {exc}")
             return _mesh_gen.core_pb2.ValidateAgentTokenResponse()
 
-        verdict = validate_agent_token(token, node_id, store=store, key=key)
+        # P3 review nit: same mapping as the data gate — a mid-validation
+        # crash (e.g. sqlite OperationalError on the jti lookup) becomes
+        # INTERNAL with a FIXED details string, cause logged only; uncaught
+        # it would surface as UNKNOWN with the raw error repr on the wire.
+        try:
+            verdict = validate_agent_token(token, node_id, store=store, key=key)
+        except Exception as exc:  # surfaced as INTERNAL, logged with cause
+            logger.error("mesh_server: ValidateAgentToken validation failed (%s)", exc)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details("token validation failed")
+            return _mesh_gen.core_pb2.ValidateAgentTokenResponse()
         if not verdict.valid:
             logger.info(
                 "mesh_server: token rejected agent_id=%s jti=%s reason=%s",
