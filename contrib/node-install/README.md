@@ -17,6 +17,7 @@ contrib/node-install/
 ├── vesmaro-node        # the installer CLI (bash, shellcheck-clean)
 ├── compatibility.tsv   # known-good (core_tag, mesh_ref) ledger
 └── templates/          # node.yaml / board.yaml / mesh.yaml / env / units
+    └── containers/     # container-install: configs + quadlet templates
 ```
 
 ## Quick start
@@ -90,6 +91,93 @@ marked **dev**. The ledger is tag-based: the core *identity* is the git
 tag — the `mnemos --version` string may lag it (the live v4.3.7-mesh.2
 venv reports 4.3.0; `status` shows both).
 
+## Release naming
+
+From the **next** release the git tag carries **no `-mesh` suffix** —
+the mesh is part of the system, not a variant of it, and the suffix
+only overloaded the meaning. Rules:
+
+- new git tags are bare semver: `v4.3.8+` (core) / `v1.4.0+` (mesh);
+- the **ghcr image tag equals the git tag** exactly:
+  `ghcr.io/korrnals/mnemos:<core tag>`,
+  `ghcr.io/korrnals/mnemos-mesh:<mesh tag>` (rule already in effect);
+- `compatibility.tsv` keeps accepting BOTH formats: the old
+  `-mesh.N` rows (…`v4.3.7-mesh.2`) remain as append-only history and
+  must not be rewritten; new rows use bare tags. The ledger parser is
+  format-agnostic — no tooling change is needed, the tag string is the
+  pair identity (verified: `vesmaro-node` has no suffix assumptions;
+  it resolves pairs purely from the ledger).
+
+## Container install (flatpak-style)
+
+`container-install` is the second install mode: it never builds
+anything on the node — it pulls the READY release images from ghcr and
+drives them with **quadlets** (podman >= 4.4; the dev laptop runs
+podman 5.8) under **systemd --user**, rootless. Flatpak-style: the
+container carries CODE ONLY; configs, pki and **data stay on the host**
+(bind-mounts) — local-first is preserved, `uninstall` never orphans
+your memories, and the data dir is the same good old sqlite/vault tree.
+
+```bash
+# default: pair from the ledger's last row, name "vesmaro", port 8787
+./vesmaro-node container-install
+
+# test/sandbox example: second node on a free port, data in /tmp
+./vesmaro-node container-install --name vesmaro-test --port 17877 \
+    --data-dir /tmp/vesmaro-test --without-mesh
+
+./vesmaro-node status                       # shows the container block
+./vesmaro-node uninstall --yes              # containers+units; data kept
+./vesmaro-node uninstall --yes --purge      # + images+configs+data
+                                          # (--keep-data spares the data dir)
+```
+
+What it does: pull `ghcr.io/korrnals/mnemos:<core tag>` (+ the paired
+`ghcr.io/korrnals/mnemos-mesh:<mesh tag>`), render
+`~/.config/vesmaro/node.container.yaml` (loopback API, your port) and
+quadlets into `~/.config/containers/systemd/vesmaro-{core,mesh}.container`,
+`systemctl --user daemon-reload && enable --now`, then health-verify
+`/health` (90 s). Idempotent: re-running at the same pair re-provisions
+configs without restarting unchanged units; a changed tag re-renders
+the quadlet (backup `.bak` kept = manual rollback) and restarts. The
+mesh container deploys only when the mTLS material exists in
+`~/.config/vesmaro/pki/` — otherwise the install is core-only with a
+loud warning (the core fails fast on a TCP leg without readable certs),
+and rerunning after provisioning certs adds it.
+
+Decisions documented:
+
+- **quadlet over a hand-written unit** — podman generates and owns the
+  unit (start/stop/restart/dependencies stay consistent with the
+  container lifecycle); the host already uses quadlets
+  (`ollama-intel.container`). Supported since podman 4.4, running 5.8.
+- **`--network host` for v1 (compromise)** — the mesh container dials
+  the core on `127.0.0.1:8790` and serves peers on `:8443`; under host
+  networking both just work, and `healthz` on 127.0.0.1:9091 stays
+  loopback. Cost: no network-namespace isolation between the containers
+  and the host (rootless still applies: no root, user namespaces, and
+  the API itself binds loopback only). Bridge + published ports is the
+  planned follow-up.
+- **config by bind-mounted YAML, not env** — a YAML file value BEATS
+  env vars in the image (init-source precedence), so
+  `VESMARO_API__PORT` etc. cannot re-tune the shipped
+  `config.container.yaml`; the installer mounts its own
+  `node.container.yaml` and points the image at it via
+  `MNEMOS_CONFIG`/`VESMARO_CONFIG` (ADR-0031 dual prefix).
+
+### host-install vs container-install
+
+| | `install` (host bundle) | `container-install` |
+|---|---|---|
+| Artifacts | venv built from git tag + go-built mesh binary | ready ghcr images (tag == git tag) |
+| Build deps on node | python >= 3.11, `uv`, `git`, go (or prebuilt) | none (podman only) |
+| Isolation | none — processes on the host | rootless containers; **host network v1** (no netns isolation) |
+| Data | `~/.local/share/vesmaro/data` (host) | same host dir, bind-mounted (`/data`, `/vault` in the container) |
+| Upgrade | atomic pair swap + sqlite backup + auto-rollback | re-run with a new tag: pull + quadlet re-render + restart (`.bak` kept; auto-rollback NOT implemented) |
+| systemd | system units (`/etc/systemd/system`, `User=`) | user units via quadlets (`systemctl --user`) |
+| Uninstall | `--keep-data` default, `--purge` | same; `--purge` also removes the images |
+| Best for | the primary/laptop node (mesh pairing, rollbacks) | quick nodes, clean hosts, no toolchain |
+
 ## Adopt (take over an existing live install)
 
 `install --adopt --user NAME` registers the CURRENT live laptop
@@ -159,4 +247,8 @@ sudo ./vesmaro-node uninstall --purge    # configs+data+state too
 ```
 
 Sandbox: `uninstall --dest DIR` just removes the sandbox root. Adopted
-nodes additionally require `--include-adopted`.
+nodes additionally require `--include-adopted`. A recorded
+container-install is removed by the same command (or standalone when
+it is the only install): containers + quadlet units always; `--purge`
+additionally removes the images, container configs and — unless
+`--keep-data` is passed — the data dir.

@@ -1,0 +1,48 @@
+# mesh.container.yaml — mesh daemon config for the CONTAINER install
+# (rendered by `vesmaro-node container-install`; container paths only —
+# pki and the shared run dir are bind-mounts from the HOST).
+#
+# After the first cert-gen, fill in:
+#   - mnemos.core_fingerprint  (sha256 of core.pem),
+#   - mtls.peer_fingerprints   (peer node_id -> sha256 fingerprint),
+#   - peers[]                  (address + fingerprint + projects).
+# Until then the mesh runs single-node (safe: no peer dial-outs).
+
+node_id: @@NODE_ID@@
+# Peer gRPC listener (mTLS). LAN/WireGuard address for real peers —
+# reachable as-is under Network=host.
+listen: ":8443"
+# Rollback leg to the core (unix; shared /run/vesmaro volume).
+unix_socket: /run/vesmaro/core.sock
+
+mtls:
+  ca_cert: /etc/vesmaro/pki/ca.pem
+  node_cert: /etc/vesmaro/pki/node.pem
+  node_key: /etc/vesmaro/pki/node.key
+  rotation_days: 90
+  peer_fingerprints: {}
+    # peer-node-id: "sha256:..."
+
+peers: []
+  # - id: peer-node-id
+  #   address: "192.168.1.72:30843"
+  #   fingerprint: "sha256:..."
+  #   projects: ["shared-project"]
+
+# How THIS mesh daemon reaches the local core face: TCP leg with
+# server-side mTLS material from the core cert pair. Both containers
+# share the host network namespace, so loopback works.
+mnemos:
+  transport: tcp
+  address: "127.0.0.1:8790"
+  core_fingerprint: ""   # sha256:... of core.pem — fill after cert-gen
+  dial_timeout: 5s
+  heartbeat_interval: 30s
+
+logging:
+  level: info
+  format: json
+
+metrics:
+  # healthz + Prometheus scrape, loopback only.
+  listen: "127.0.0.1:9091"

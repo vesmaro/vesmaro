@@ -87,5 +87,12 @@ ENV MNEMOS_CONFIG=/app/config.yaml
 
 EXPOSE 8787
 
+# /health is auth-exempt (api middleware bypass list). Port comes from
+# the runtime env so the check stays correct when the operator overrides
+# it (vesmaro-node container-install mounts its own config with a custom
+# port). python3 is in the base image; no curl needed.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD python3 -c 'import os,urllib.request; urllib.request.urlopen("http://127.0.0.1:%s/health" % os.environ.get("MNEMOS_API__PORT", os.environ.get("VESMARO_API__PORT", "8787")), timeout=4)'
+
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["mnemos", "serve"]
