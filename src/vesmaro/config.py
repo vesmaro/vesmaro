@@ -704,6 +704,15 @@ class FederationConfig(BaseModel):
             ``mnemos fetch`` command only (mesh CLI binary + mesh yaml
             path); see :class:`FetchConfig`. Additive; no background
             behaviour.
+        agent_token_key_path: Optional override for the W3 AgentGateway
+            token signing key (ADR-0018-T §3). ``None`` (default) resolves
+            to ``<mnemos.data_dir>/agent-token-signing.key`` — generated
+            on first use with mode 0600, never leaves this host. Additive:
+            configs without the key parse unchanged.
+        agent_token_issuer: ``iss`` claim stamped into minted agent tokens
+            (ADR-0018-T §3). Default ``"mnemos"``. Informational for
+            routing/audit — validation relies on the Ed25519 signature,
+            not on this string.
     """
 
     shared_projects: list[str] = Field(default_factory=list)
@@ -713,6 +722,8 @@ class FederationConfig(BaseModel):
     access_log_path: str | None = Field(default=None, max_length=4096)
     index_title_blocklist: list[str] = Field(default_factory=list, max_length=256)
     meta_poll: MetaPollConfig = Field(default_factory=MetaPollConfig)
+    agent_token_key_path: str | None = Field(default=None, max_length=4096)
+    agent_token_issuer: str = Field(default="mnemos", min_length=1, max_length=64)
     fetch: FetchConfig = Field(default_factory=FetchConfig)
 
     @field_validator("shared_projects")

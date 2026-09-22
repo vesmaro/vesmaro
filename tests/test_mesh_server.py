@@ -1190,3 +1190,137 @@ class TestAclHardeningFailClosed:
         """
         with pytest.raises(ValidationError, match="blank project slug"):
             _settings_with_peer(tmp_path, allowed=[_PROJECT], shared=[""])
+
+
+# ── ReadMemory (W3-v1, ADR-0018 amendment 3) ─────────────────────────────────
+
+
+class TestReadMemory:
+    """Single-record fetch by id: mirror of the ListMemories gate matrix."""
+
+    def _list_one_fed_id(self, server: MeshServer) -> str:
+        """ListMemories once and return the first record id (a fed: id)."""
+        _wait_for_server(server)
+        stub = _stub(server)
+        response = stub.ListMemories(
+            _mesh_gen.core_pb2.ListMemoriesRequest(projects=[_PROJECT]),
+            timeout=2.0,
+        )
+        assert response.records, "seeded records missing — fixture drift"
+        return str(response.records[0].id)
+
+    def test_read_returns_record_by_fed_id(self, server: MeshServer) -> None:
+        """A fed:<agent>:<uuid> id from a prior page resolves to the record."""
+        record_id = self._list_one_fed_id(server)
+        stub = _stub(server)
+        response = stub.ReadMemory(
+            _mesh_gen.core_pb2.ReadMemoryRequest(record_id=record_id),
+            timeout=2.0,
+        )
+        assert response.record.id == record_id
+        assert response.trigger_code == _mesh_gen.fed_pb2.EXHAUSTIVE
+        assert response.record.title
+
+    def test_read_by_raw_memory_id(self, server: MeshServer) -> None:
+        """A raw memory id (non-fed) resolves too (operator/unit path)."""
+        record_id = self._list_one_fed_id(server)
+        raw_id = record_id.rsplit(":", 1)[-1]
+        stub = _stub(server)
+        response = stub.ReadMemory(
+            _mesh_gen.core_pb2.ReadMemoryRequest(record_id=raw_id),
+            timeout=2.0,
+        )
+        assert response.record.id.endswith(raw_id)
+
+    def test_read_unknown_id_not_found(self, server: MeshServer) -> None:
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ReadMemory(
+                _mesh_gen.core_pb2.ReadMemoryRequest(record_id="fed:agent:does-not-exist"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
+
+    def test_read_empty_id_invalid_argument(self, server: MeshServer) -> None:
+        _wait_for_server(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ReadMemory(_mesh_gen.core_pb2.ReadMemoryRequest(record_id=""), timeout=2.0)
+        assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+    def test_read_no_federate_is_not_found(self, server: MeshServer) -> None:
+        """no-federate ids are indistinguishable from absent (no id oracle)."""
+        servicer = server.servicer
+        assert servicer is not None
+        mem = servicer._manager.add(
+            MemoryCreate(
+                content="secret access key AKIAEXAMPLE123",
+                title="Should never be readable",
+                tags=[
+                    f"project:{_PROJECT}",
+                    f"agent:{_AGENT}",
+                    "mnemos:decision",
+                    "mnemos:no-federate",
+                ],
+                source=MemorySource.MANUAL,
+            ),
+            project=_PROJECT,
+            agent=_AGENT,
+        )
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ReadMemory(
+                _mesh_gen.core_pb2.ReadMemoryRequest(record_id=f"fed:{_AGENT}:{mem.id}"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
+
+    def test_read_denied_project_permission_denied(self, server: MeshServer) -> None:
+        """A record in a project outside the allowed set → PERMISSION_DENIED."""
+        servicer = server.servicer
+        assert servicer is not None
+        mem = servicer._manager.add(
+            MemoryCreate(
+                content="Cross-project record the peer must not see.",
+                title="Denied project record",
+                tags=[f"project:{_PROJECT_DENIED}", f"agent:{_AGENT}", "mnemos:decision"],
+                source=MemorySource.MANUAL,
+            ),
+            project=_PROJECT_DENIED,
+            agent=_AGENT,
+        )
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ReadMemory(
+                _mesh_gen.core_pb2.ReadMemoryRequest(record_id=f"fed:{_AGENT}:{mem.id}"),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_read_project_narrowing_mismatch_denied(self, server: MeshServer) -> None:
+        """request.project that does not match the record → PERMISSION_DENIED."""
+        record_id = self._list_one_fed_id(server)
+        stub = _stub(server)
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.ReadMemory(
+                _mesh_gen.core_pb2.ReadMemoryRequest(record_id=record_id, project=_PROJECT_DENIED),
+                timeout=2.0,
+            )
+        assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    def test_read_moderation_refuse_yields_refused_trigger(
+        self, server: MeshServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A moderation refuse is a SUCCESS with trigger_code=REFUSED."""
+        record_id = self._list_one_fed_id(server)
+        monkeypatch.setattr(
+            "vesmaro.mesh_server.build_compact_record", lambda *args, **kwargs: None
+        )
+        stub = _stub(server)
+        response = stub.ReadMemory(
+            _mesh_gen.core_pb2.ReadMemoryRequest(record_id=record_id),
+            timeout=2.0,
+        )
+        assert response.trigger_code == _mesh_gen.fed_pb2.REFUSED
+        assert not response.record.id
