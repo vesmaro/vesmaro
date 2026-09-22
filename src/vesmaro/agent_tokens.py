@@ -724,7 +724,7 @@ def validate_agent_token(
     # gRPC metadata limits will bound this on the wire, but the validator
     # stays cheap and bounded standalone too.
     if not token or len(token) > 8192:
-        return AgentTokenVerdict(rejected="malformed")
+        return AgentTokenVerdict(valid=False, reason="malformed")
 
     try:
         claims = decode_agent_token(token, key)
