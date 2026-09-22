@@ -60,6 +60,7 @@ usage() {
 
 # ── global option state ──────────────────────────────────────────────
 CMD=""
+SCRIPT_CMD=""  # first positional — used in host-context hints
 PROFILE=""
 STYLE="system"
 USER_NAME=""
@@ -815,10 +816,28 @@ verify_health() {  # $1 url, $2 timeout -> 0 ok (sandbox/test aware)
 }
 
 # ── INSTALL / UPGRADE ────────────────────────────────────────────────
+
+# Mutating commands must resolve paths the SAME way the manifest was
+# written. Inside a distrobox container getent resolves a different
+# $HOME (~/.distrobox/<box>/home), so an adopted node's manifest is
+# invisible → the adopted-gate would be bypassed and a fresh install
+# attempted against live legacy paths. Refuse with the way out instead.
+require_host_context() {
+  if [[ -n "${DEST}" ]]; then return 0; fi   # sandbox layouts are self-contained
+  if [[ -e /run/.containerenv || -n "${DISTROBOX_NAME:-}" ]]; then
+    die "refusing to run a mutating command from inside a container \
+(distrobox \$HOME differs from the host's — the manifest and the \
+adopted-gate would be bypassed). Run from the host: \
+distrobox-host-exec bash .../vesmaro-node $SCRIPT_CMD --user abyss \
+(see the Context section of contrib/node-install/README.md)."
+  fi
+}
+
 cmd_install() {
   detect_sys
   compute_paths
   require_root_unless_sandbox
+  require_host_context
 
   NODE_ID="${NODE_ID:-$(hostname -s)}"
   # inherit profile from an existing manifest unless given explicitly
@@ -1000,6 +1019,7 @@ cmd_upgrade() {
   detect_sys
   compute_paths
   require_root_unless_sandbox
+  require_host_context
   manifest_exists || die "no install recorded at $MANIFEST — run 'install' first"
   [[ -n "$PROFILE" ]] || PROFILE="$(mf_get profile)"
   local adopted; adopted="$(mf_get adopted)"
@@ -1312,7 +1332,7 @@ cmd_uninstall() {
 
 # ── arg parsing ──────────────────────────────────────────────────────
 [[ $# -ge 1 ]] || usage
-CMD="$1"; shift
+CMD="$1"; SCRIPT_CMD="$CMD"; shift
 case "$CMD" in
   install|upgrade|status|uninstall) : ;;
   --help|-h|help) usage ;;
