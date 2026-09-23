@@ -90,8 +90,33 @@ _LENS_CONTENT_TYPE: Final[dict[Lens, str]] = {Lens.CODE: "code"}
 #:      AND the group carries the same code evidence as #3 (comma, ``=``,
 #:      underscored/dotted token, comparison/bitwise operator — "node.js
 #:      (fs, cb)" vs "node.js (the runtime)"); the #368 review false-fired
-#:      the old whitespace-tolerant shape on exactly those prose shapes;
-#:   5. code-file paths (src/vesmaro/manager.py, app.ts);
+#:      the old whitespace-tolerant shape on exactly those prose shapes.
+#:      ACCEPTABLE LOSS (registered, #387 review): the group span
+#:      ``[^()]*`` cannot see through INNER parentheses, so a nested-call
+#:      argument like ``obj.method(f(x))`` never matches — the inner
+#:      group terminates the span before the evidence check runs. All
+#:      such losses are in the SAFE direction (ADR-0027 invariant 6): a
+#:      missed activation yields the identity projection (every row
+#:      kept), never a wrongly narrowed one; the outer call stays
+#:      coverable through its own evidence-bearing phrasing.
+#:   5. code-file paths in PATH-ISH CONTEXT ONLY (src/vesmaro/manager.py,
+#:      `app.ts`, 'config.toml' — #388): an extension-only token carries
+#:      a code signal only when the query marks it as a file reference,
+#:      not as an English dotted word. The DISCRIMINATOR is the token's
+#:      context — an extension match fires when the token contains a
+#:      path separator (``/`` or ``\`` — prose never writes inside a
+#:      word, so "src/vesmaro/lens.py" and "benchmarks/experiments/
+#:      e3_lanes/runner.py" are paths, while "node.js" and "a.b.c" are
+#:      dotted words) OR the token is wrapped in quotes/backticks (the
+#:      author fenced it as a literal filename — "check `lens.py`"). The
+#:      bare extension token ("node.js", "package.json", "some.sql")
+#:      is PROSE-AMBIGUOUS — "compare node.js (the runtime)" reads
+#:      ``node.js`` as the runtime's name, not a ``.js`` file — so it no
+#:      longer activates on its own (#388); a missed path-shaped-like-
+#:      prose query keeps the identity projection, the safe direction.
+#:      The dotfile form (".rb files") was already inert (the pattern
+#:      requires a word character before the dot) and stays so;
+#:      an ``.md`` path never matched the extension lexicon either way.
 #:   6. code-only operators (=> arrow, :: scope resolution).
 #: An import statement is deliberately NOT a signal on its own — the
 #: dotted-path form ("import vesmaro.manager") is already covered by the
@@ -102,8 +127,16 @@ _QUERY_CODE_SIGNALS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\bclass\s+[A-Za-z_]\w*\s*[:({]"),
     re.compile(r"\b[A-Za-z_]\w*\((?=[^()]*(?:[,=*<>&|]|\w[_.]\w))[^()]*\)"),
     re.compile(r"\b[A-Za-z_]\w*\.[A-Za-z_]\w*\((?=[^()]*(?:[,=*<>&|]|\w[_.]\w))[^()]*\)"),
+    # Signal 5 (#388): the extension lexicon fires ONLY in path-ish
+    # context — a path separator inside the token run (src/…, C:\…,
+    # ./run.sh) or a quoted/backticked fence around it (`lens.py`).
+    # The bare dotted token (node.js, a.b.c, package.json) is
+    # prose-ambiguous and no longer activates on its own.
     re.compile(
-        r"\b[\w./\\-]+\.(?:py|pyi|ts|tsx|js|jsx|mjs|rs|go|c|h|cc|cpp|java|kt|rb|sh|sql|toml)\b"
+        r"(?:[\w./\\-]*[/\\][\w./\\-]*"
+        r"\.(?:py|pyi|ts|tsx|js|jsx|mjs|rs|go|c|h|cc|cpp|java|kt|rb|sh|sql|toml)\b"
+        r"|[`'\"][\w./\\-]+"
+        r"\.(?:py|pyi|ts|tsx|js|jsx|mjs|rs|go|c|h|cc|cpp|java|kt|rb|sh|sql|toml)\b[`'\"])"
     ),
     re.compile(r"=>|::"),
 )
