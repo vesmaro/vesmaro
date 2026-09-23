@@ -26,9 +26,13 @@ FROM docker.io/library/python:3.12-slim AS gencode
 RUN pip install --no-cache-dir "grpcio-tools>=1.62,<2"
 WORKDIR /proto
 COPY federation/proto/ ./
+# agent_gateway.proto (W3 #55/#56) is REQUIRED in the set: the runtime
+# shim _mesh_gen.py lazy-imports agent_gateway_pb2 on the agent leg, and
+# the pre-push gate checks the stubs ship — leaving it out repeats the
+# #44 stale-stubs class of regression for W3.
 RUN mkdir -p /gen && python -m grpc_tools.protoc -I. \
       --python_out=/gen --pyi_out=/gen --grpc_python_out=/gen \
-      federation.proto mnemos_core_api.proto
+      federation.proto mnemos_core_api.proto agent_gateway.proto
 
 # ── base image (identical to repo Dockerfile) ─────────────────────────
 FROM docker.io/library/python:3.12-slim AS base
