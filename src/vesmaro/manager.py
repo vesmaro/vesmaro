@@ -1622,8 +1622,22 @@ class MemoryManager:
         entries whose served projection is the refined one
         (``pipeline_state='refined'``); NULL/legacy pipeline_state rows
         never match. Composable with every status mode above.
+
+        mnemos #400 — the QUERY boundary normalizes a non-empty
+        ``project`` with :func:`vesmaro.models.normalize_project_slug`
+        (single authority: the same normalization the checkpoint save
+        boundary and the tag-contract lax mode apply), so a
+        ``project='MyProject'`` filter hits the ``myproject`` rows instead
+        of silently returning zero in-scope rows and tripping the #313
+        soft fallback across projects. ``project=None``/empty stays the
+        EXPLICIT global mode — untouched.
         """
         _t0 = time.monotonic()
+
+        if project:
+            from vesmaro.models import normalize_project_slug
+
+            project = normalize_project_slug(project)
 
         scoped = self._search_core(
             query,
@@ -2186,7 +2200,16 @@ class MemoryManager:
         published knowledge" — so the query path passes ``include_raw=True``
         to surface recently-added entries regardless of pipeline status.
         The recency path (no query) already has no status filter.
+
+        mnemos #400 — ``query.project`` is normalized at the boundary
+        (single authority): the search leg inherits ``search``'s own
+        normalization, the recency leg normalizes here so
+        ``list_recent_for_agent`` predicates on the canonical slug.
         """
+        from vesmaro.models import normalize_project_slug
+
+        if query.project:
+            query = query.model_copy(update={"project": normalize_project_slug(query.project)})
         if query.query:
             return self.search(
                 query.query,
@@ -2221,7 +2244,28 @@ class MemoryManager:
         ``mnemos:checkpoint`` tags is used to rank checkpoints by relevance,
         then the top ``limit`` are returned. When ``query`` is omitted,
         checkpoints are returned by recency only.
+
+        mnemos #400 — the QUERY boundary normalizes the project slug with
+        :func:`vesmaro.models.normalize_project_slug` (the single
+        authority, the same normalization the save boundary and the tag
+        contract lax mode apply). A checkpoint saved as ``MyProject`` and
+        recalled as ``myproject`` is ONE namespace — a read surface can
+        never diverge from the write surface. Fail-loud on an
+        unsalvageable slug: a contract-invalid project means the caller
+        asked for a namespace that cannot exist. An empty project stays
+        the pre-existing global recency listing (CLI ``mnemos recall``
+        with no ``--project`` on an empty vault relies on it; the MCP
+        tool always passes a concrete project via the ``_detect_project``
+        fallback).
         """
+        from vesmaro.models import _PROJECT_RE, normalize_project_slug
+
+        project = normalize_project_slug(project)
+        if project and not _PROJECT_RE.match(f"project:{project}"):
+            raise ValueError(
+                f"project must be 1-64 characters of [a-z0-9_-] after normalization "
+                f"(got {project!r})"
+            )
         if query:
             results = self.search(
                 query=query,
@@ -2311,6 +2355,25 @@ class MemoryManager:
                 f"(got {len(session)} chars)"
             )
 
+        # mnemos #400 — project slug: normalize at the SAVE boundary (the
+        # single-authority doctrine of #263, applied to slugs). The MCP tool
+        # and the REST twin pass ``project`` directly (NOT through the tag
+        # contract like ``mnemos_add`` does), so without this gate a
+        # ``MyProject`` checkpoint persisted under a different store key than
+        # the ``myproject`` rows written via the tag-contract path — a silent
+        # namespace island. ``normalize_project_slug`` is the SAME
+        # normalization the tag-contract lax mode applies, so the checkpoint
+        # channel can never diverge from the tag channel. Fail-loud on an
+        # unsalvageable slug (never mint a silently-different namespace).
+        from vesmaro.models import _PROJECT_RE, normalize_project_slug
+
+        project = normalize_project_slug(project)
+        if not _PROJECT_RE.match(f"project:{project}"):
+            raise ValueError(
+                f"project must be 1-64 characters of [a-z0-9_-] after normalization "
+                f"(got {project!r})"
+            )
+
         # 2. Trivial-reject before any store side effect.
         normalized = {f: (fields.get(f) or "") for f in CHECKPOINT_FIELDS}
         if not any(normalized[f] for f in CHECKPOINT_FIELDS):
@@ -2394,6 +2457,16 @@ class MemoryManager:
         since: str | None = None,
         until: str | None = None,
     ) -> list[Memory]:
+        """Most recent memories (REST ``GET /memories``, MCP ``mnemos_list_recent``).
+
+        mnemos #400 — the QUERY boundary normalizes a non-empty
+        ``project`` (single authority, same as ``search`` /
+        ``recall_context``); ``None``/empty stays the unscoped listing.
+        """
+        if project:
+            from vesmaro.models import normalize_project_slug
+
+            project = normalize_project_slug(project)
         memories = self.sqlite.list_all(
             limit=limit,
             offset=offset,

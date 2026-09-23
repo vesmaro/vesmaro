@@ -148,8 +148,16 @@ def get_manager() -> Any:
 
 
 def _detect_project() -> str:
-    """Auto-detect project name from current working directory."""
-    return Path(os.getcwd()).name
+    """Auto-detect project name from current working directory.
+
+    mnemos #400 — normalize at the entry point: a PascalCase folder name
+    (``Project-Umbra``) must not become a different store key than the
+    same project saved with a typed slug. Same normalization as the
+    save/query boundaries (:func:`vesmaro.models.normalize_project_slug`).
+    """
+    from vesmaro.models import normalize_project_slug
+
+    return normalize_project_slug(Path(os.getcwd()).name)
 
 
 def _checkpoint_reminder() -> str | None:
