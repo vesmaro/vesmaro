@@ -1087,6 +1087,38 @@ class TestRepairSectionCap:
         composed = compose_pre_llm_awareness(manager, session=SESSION, project=PROJECT, agent=AGENT)
         assert len(composed["meta"]["agents"]) == AWARENESS_MAX_RENDERED_AGENTS
 
+    def test_pre_flight_response_capped_to_top_n(self, manager: MemoryManager) -> None:
+        """#278 item 1: the pre-flight MCP response carries the SAME
+        AWARENESS_MAX_RENDERED_AGENTS bound as render/blocks — the raw
+        ~200-slot delta dict never rides out of the tool."""
+        for i in range(AWARENESS_MAX_RENDERED_AGENTS + 2):
+            _checkpoint(
+                manager,
+                goals=f"neighbor {i} goal",
+                agent=f"awr-n{i:02d}",
+                session=f"sess-n{i:02d}",
+            )
+        result = pre_flight_snapshot(manager, project=PROJECT, agent=AGENT, session=SESSION)
+        assert len(result["delta"]["agents"]) == AWARENESS_MAX_RENDERED_AGENTS
+        # The MOST RECENT slots survive (the _capped_agents ordering); the
+        # truncation is observable, not silent.
+        assert result["delta"]["agents"][0]["agent"] == "awr-n09"
+        assert "awr-n00" not in [a["agent"] for a in result["delta"]["agents"]]
+        assert result["delta"]["counts"]["agents_capped_from"] == (
+            AWARENESS_MAX_RENDERED_AGENTS + 2
+        )
+        # Hints are computed over the capped list — never a wider surface.
+        hints_agents = [h["neighbor"] for h in result["conflict_hints"]]
+        assert set(hints_agents) <= {a["agent"] for a in result["delta"]["agents"]}
+        # The rendered section matches the capped payload (same list).
+        rendered = result["text"]
+        for slot in result["delta"]["agents"]:
+            assert slot["agent"] in rendered
+        # Read-only invariant intact under the cap path.
+        assert (
+            read_awareness_cursor(manager, project=PROJECT, agent=AGENT, session=SESSION) is None
+        )
+
 
 class TestRepairDisclaimerHardcoded:
     """P3-4: the disclaimer test must not be constant-vs-constant — the
