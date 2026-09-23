@@ -178,9 +178,15 @@ CONFLICT_HINT_MIN_SHARED_TOKENS: Final[int] = 2
 ABSTENTION_TASK_LABEL: Final[str] = "awareness_abstention"
 
 #: Metadata key that marks a row as federation-imported for the delta
-#: exclusion hook. Today NO import path stamps it (see
-#: :func:`is_delta_excluded`); it is the documented contract the
-#: #262-class ``origin=`` column work will formalize.
+#: exclusion hook. THREE import paths stamp it (all #254 review P2):
+#: the sync mapper (``cli/sync.py::_compact_record_to_memory_create``,
+#: value = the peer-side ``source_agent``), the JSON merge-import
+#: (``cli/import_.py``, value ``json-import`` — RESTORE mode stays
+#: unstamped: a self-restore of the operator's own backup is not a
+#: federated row) and the sqlite merge-import branch (value
+#: ``sqlite-merge-import``). See :func:`is_delta_excluded`; a
+#: first-class ``origin=`` column remains the tracker item that would
+#: replace this metadata convention.
 FEDERATED_ORIGIN_META_KEY: Final[str] = "federated_origin"
 
 #: Source-column exclusion set: machine-minted collapse projections are
@@ -362,19 +368,17 @@ def is_delta_excluded(memory: Memory) -> bool:
     device is false parallelism, and federated presence must not leak).
     CURRENT COLUMN REALITY: imported rows keep their MINT source — there
     is no ``FEDERATED`` :class:`MemorySource` and no import marker
-    column today (the sync pipeline stamps ``MCP``; see
-    ``cli/sync.py::_compact_record_to_memory_create``), and the
-    ``origin=`` provenance segment from PR #262 renders the same mint
-    ``source`` column at issuance time, so it cannot distinguish mint
-    site either. The hook therefore keys on the two signals available
-    today:
+    column today (the ``origin=`` provenance segment from PR #262
+    renders the same mint ``source`` column at issuance time, so it
+    cannot distinguish mint site either). The hook keys on two signals:
 
     * the machine-minted ``SYNTHESIZED`` source (collapse projections
       are not peer actions), and
-    * a truthy ``federated_origin`` metadata stamp — the documented
-      marker contract the #262-class origin column work will make
-      first-class. Extend THIS function when that lands; call sites
-      never inline the check.
+    * a truthy ``federated_origin`` metadata stamp — stamped by the
+      three import paths (sync mapper, JSON merge-import, sqlite
+      merge-import; see :data:`FEDERATED_ORIGIN_META_KEY`). Extend THIS
+      function when a first-class origin column lands; call sites never
+      inline the check.
     """
     if memory.source in DELTA_EXCLUDED_SOURCES:
         return True
@@ -889,6 +893,19 @@ def pre_flight_snapshot(
     hints + the rendered section. Consumption (cursor advance) belongs
     to the ``pre_llm_call`` composition alone — a pre-flight must never
     mark neighbor entries as consumed.
+
+    The response surface is CAPPED to the same render-level bound the
+    other surfaces obey (:data:`AWARENESS_MAX_RENDERED_AGENTS`): the
+    raw ``project_delta`` feed carries up to :data:`DELTA_FEED_LIMIT`
+    per-agent slots (~200 entries — a struct payload, not a rendered
+    section), and an MCP response that size defeats the D3 price
+    corridor the cap exists for. ``delta["agents"]`` keeps the top-N
+    most-recent slots (the identical :func:`_capped_agents` ordering —
+    the #224-replay neighbor leads), ``hints`` are recomputed over the
+    CAPPED list, and ``delta["counts"]["agents_capped_from"]`` records
+    the pre-cap slot count so the truncation is observable, never
+    silent. ``counts`` scalars (feed/excluded/redactions/high_water)
+    are aggregates and stay full-window.
     """
     _require_identity(agent, session)
     project = _require_project(project)
@@ -898,6 +915,10 @@ def pre_flight_snapshot(
     delta = project_delta(
         mgr, project=project, since=since_dt.isoformat(), exclude_agent=agent, now=now_dt
     )
+    slots = delta.get("agents", [])
+    capped = slots[:AWARENESS_MAX_RENDERED_AGENTS]
+    delta["counts"]["agents_capped_from"] = len(slots)
+    delta["agents"] = capped
     hints = conflict_hints(_my_goal(mgr, project=project, agent=agent), delta)
     return {
         "action": "pre_flight",
