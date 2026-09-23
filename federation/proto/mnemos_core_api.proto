@@ -209,8 +209,15 @@ message WriteMemoryRequest {
 
 // WriteMemoryResponse — result of a WriteMemory call.
 message WriteMemoryResponse {
-  // The id of the written record (same as WriteMemoryRequest.record.id
-  // on success). Echoed so the mesh can correlate with its pending queue.
+  // Storage id of the written record, minted by mnemos core — NOT
+  // WriteMemoryRequest.record.id. Core never reuses the incoming
+  // federation compact id as the storage id; the compact id is kept in
+  // the record's metadata under fed_id instead (E2E fact: the mesh
+  // integration test writes a record and matches the re-exported
+  // envelope by title + source_agent, because the storage id is fresh;
+  // see tests/test_mesh_integration.py). On a #359 duplicate
+  // (ALREADY_EXHAUSTED) the id of the EXISTING row is echoed; empty on
+  // refusal. Echoed so the mesh can correlate with its pending queue.
   string written_id = 1;
 
   // The mode actually applied. May differ from the request if mnemos
