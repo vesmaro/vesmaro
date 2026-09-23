@@ -263,7 +263,16 @@ class TestLensUnit:
             "e.g (note the caveat)",  # spaced word-only group, dotted trigger
             "what does v2.build (the new builder) do",  # spaced prose group
             "check config.get (the getter)",  # spaced prose group
-            "compare handle_request (the slow path)",  # spaced prose group
+            # #388 item 3 — precision on WHICH shapes the S4 tightening
+            # kills: the DOTTED-RECEIVER members (v2.build / config.get /
+            # node.js / e.g) are S4-killable — their receiver.identifier
+            # shape reaches the signal. The BARE-receiver shape below is
+            # NOT S4-killable: "handle_request" matches no dotted
+            # receiver, so signal #4 never sees it — its inertness here
+            # rests on signal #3 alone (a SPACE before the group means
+            # prose typography, and the word-only group carries no code
+            # evidence either way). Kept as a full-lens negative.
+            "compare handle_request (the slow path)",  # bare receiver — S3 inert
         ],
     )
     def test_prose_queries_do_not_activate(self, query: str) -> None:
@@ -282,11 +291,10 @@ class TestLensUnit:
         [
             # #368 item 1 — the two VERBATIM review false-fire shapes,
             # pinned against the signal-#4 pattern itself: after the fix
-            # the shape no longer matches (flush paren + evidence). They
-            # are NOT full-lens negatives — "compare node.js (the
-            # runtime)" still carries a signal-#5 file-path token
-            # ('node.js' reads as ``.js``), which is a pre-existing,
-            # documented lexicon overlap OUTSIDE this item's scope.
+            # the shape no longer matches (flush paren + evidence).
+            # Since #388 the first shape is ALSO a full-lens negative —
+            # the signal-#5 path-context requirement retired the last
+            # lexicon overlap ("node.js" reads as ``.js``).
             "compare node.js (the runtime)",
             "e.g (note)",
         ],
@@ -332,6 +340,134 @@ class TestLensUnit:
         when its content reads as prose words — the leading space is the
         discriminator, and its absence is code typography."""
         assert lens_active(Lens.CODE, query=query) is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # #387 rider (#388 item 2) — the signal-#4 NESTED-PAREN
+            # acceptable loss, registered in the lens.py doctrine: the
+            # group span ``[^()]*`` cannot see through inner parens, so
+            # a nested-call argument never reaches the evidence check.
+            # All losses safe-direction (ADR-0027 invariant 6): a missed
+            # activation is the identity projection, never a narrowing.
+            "obj.method(f(x)) returns what",
+            "trace obj.method(f(x), 2) closely",
+        ],
+    )
+    def test_signal4_nested_paren_loss_is_safe_direction(self, query: str) -> None:
+        """ACCEPTABLE LOSS (registered): a method call whose argument
+        carries an inner group does not activate the lens — the group
+        span cannot see through the inner parens. Safe per ADR-0027
+        invariant 6 (identity projection keeps every row)."""
+        assert lens_active(Lens.CODE, query=query) is False
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # The same nested-paren shape IS covered the moment another
+            # signal fires — the loss is per-signal, not per-query.
+            "obj.method(f(x)) — see src/vesmaro/lens.py for the span note",
+            "how does def run(self): handle obj.method(f(x))",
+        ],
+    )
+    def test_nested_paren_shape_rescued_by_other_signals(self, query: str) -> None:
+        """The registered loss is bounded: a query carrying the nested
+        shape AND a second code signal (a path-with-separator here, a
+        def there) still activates."""
+        assert lens_active(Lens.CODE, query=query) is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # #388 — the accidental-rescue shape. The old lexicon read
+            # the ".c" of "a.b.c" as the C extension; the path-context
+            # requirement killed that read. The shape is INERT through
+            # every signal: no separator, no fence, and the word-only
+            # group carries no call evidence (S3/S4 need a comma, ``=``,
+            # an underscored/dotted token, or an operator).
+            "a.b.c(x)",
+            "the a.b.c(x) shape from the issue",
+        ],
+    )
+    def test_abcx_accidental_rescue_is_inert(self, query: str) -> None:
+        """PINNED TRUTH (#388): "a.b.c(x)" does not activate the lens —
+        neither the lexicon (no path context) nor the call shapes (the
+        group "x" has no code evidence) fire. Safe direction."""
+        assert lens_active(Lens.CODE, query=query) is False
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # #388 main — the TWO verbatim issue prose shapes plus the
+            # wider dotted-token prose class: signal #5 no longer fires
+            # on an extension-only token. Prose dotted words ("node.js"
+            # the runtime, "e.g" the abbreviation) are not file paths.
+            "compare node.js (the runtime)",  # THE issue shape, verbatim
+            "see node.js (v2) docs",  # THE issue shape, verbatim
+            "the team upgraded node.js yesterday",
+            "the config.toml mention in the meeting notes",
+            "they pinned the gem version (see the note about .rb files)",
+            "writing a lexer in go (the language, not the game)",
+        ],
+    )
+    def test_prose_dotted_tokens_do_not_activate(self, query: str) -> None:
+        """#388 main pin: an extension-only token in a prose query keeps
+        the identity projection — "node.js" is the runtime's name, not a
+        ``.js`` file reference. The signal-#5 lexicon requires path-ish
+        context (a separator or a quote fence) before it fires."""
+        assert lens_active(Lens.CODE, query=query) is False
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # #388 main — genuine paths KEEP activating: a separator
+            # inside the token run (slash — POSIX, backslash — Windows,
+            # or a leading ./) or a quote/backtick fence around the token.
+            "check src/vesmaro/manager.py search",
+            "open benchmarks/experiments/e3_lanes/runner.py",
+            "look at scripts/gen-proto.sh output",
+            "run ./app.ts in dev mode",
+            "review `src/vesmaro/lens.py` against the doctrine",
+            "open 'config.toml' in the editor",
+            "the file at src\\vesmaro\\lens.py on windows",
+        ],
+    )
+    def test_path_context_queries_activate(self, query: str) -> None:
+        """#388 main pin: the narrowing keeps its true-path recall —
+        slash-component paths (the registered non-extension shapes that
+        MUST keep activating) and quoted/backticked filenames fire."""
+        assert lens_active(Lens.CODE, query=query) is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # Signal-#5 unit pin on the DISCRIMINATOR itself: the bare
+            # extension token is inert, the same token with a separator
+            # or a fence is a signal.
+            "node.js",
+            "node.js (the runtime)",
+            "app.ts",
+            "some.sql scripts they said",
+        ],
+    )
+    def test_signal5_pattern_requires_path_context(self, query: str) -> None:
+        """Unit pin on the hardened signal-#5 regex: an extension match
+        without path context (separator or quote fence) does not match."""
+        assert _LENS_SIGNALS[4].search(query) is None
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "src/vesmaro/lens.py",
+            "node.js/fs/index.js",
+            "./run.sh",
+            "`lens.py`",
+        ],
+    )
+    def test_signal5_pattern_fires_on_path_context(self, query: str) -> None:
+        """Unit twin of the negative pin: the same tokens WITH path
+        context match the signal-#5 pattern."""
+        assert _LENS_SIGNALS[4].search(query) is not None
 
     def test_admit_identity_when_inactive(self) -> None:
         assert lens_admits(Lens.CODE, query="deploy notes", content_type="prose") is True
