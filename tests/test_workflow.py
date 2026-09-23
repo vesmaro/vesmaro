@@ -372,12 +372,39 @@ class TestWorkflowGet:
 # ---------------------------------------------------------------------------
 
 
+def _strip_checkpoint_reminder(text: str) -> str:
+    """Strip a checkpoint reminder appended after the JSON payload.
+
+    ``mcp_server._checkpoint_reminder()`` may append a nudge like
+    ``\n\n⚠️ [mnemos] N tool calls since last checkpoint … Consider
+    calling mnemos_save_context …`` after the tool's JSON response. It is
+    informational metadata for MCP clients, NOT part of the tool's return
+    value — so a correct client must ignore it before parsing.
+
+    The module-global ``_checkpoint_tracker`` accumulates
+    ``calls_since_save`` across the whole test session, so the reminder can
+    fire mid-suite even when this module's own call count is low. Without
+    stripping, ``json.loads`` raises ``JSONDecodeError`` (extra data) on
+    ``"{…json…}\n\n⚠️ …"`` and the helper falls through to returning the
+    raw string, breaking downstream ``result["memory_id"]`` /
+    ``result["history"]`` assertions with ``TypeError: string indices
+    must be integers``.
+
+    Mirrors the same fix in ``test_workflow_e2e.py`` and
+    ``test_tags_grouped_e2e.py`` — one theme: dispatch helpers must ignore
+    the checkpoint reminder appended by ``mcp_server``.
+    """
+    marker = "\n\n⚠️ [mnemos]"
+    idx = text.find(marker)
+    return text[:idx] if idx != -1 else text
+
+
 async def _call_tool_real(real_manager: MemoryManager, name: str, args: dict):
     """Invoke the real MCP ``call_tool`` handler with an isolated manager."""
     with patch("vesmaro.mcp_server.get_manager", return_value=real_manager):
         contents = await call_tool(name, args)
     assert len(contents) == 1, f"expected exactly one TextContent, got {len(contents)}"
-    text = contents[0].text
+    text = _strip_checkpoint_reminder(contents[0].text)
     try:
         return json.loads(text)
     except (json.JSONDecodeError, TypeError):
