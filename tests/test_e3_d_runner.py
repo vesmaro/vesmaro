@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ from benchmarks.experiments.e3_d import runner
 from benchmarks.strata.e2_d.adversarial import ADVERSARIAL_SCENARIO
 
 from vesmaro.awareness import ABSTENTION_TASK_LABEL
+from vesmaro.lanes import awareness_cursor_key
 
 _TREATMENT = runner.LEGS[1]
 _CONTROL = runner.LEGS[0]
@@ -314,6 +316,67 @@ def test_abstention_chain_reconstructable_from_traces(tmp_path: Path) -> None:
         mgr.close()
 
 
+# ── per-pair isolation, pinned (review #294/#295) ─────────────────────────────
+
+
+def test_per_pair_isolation_row_mass_contract(tmp_path: Path) -> None:
+    """Isolation is PINNED, not just structural: one control and one
+    treatment store are re-opened and the materializer's row-mass
+    contract is asserted — the two arms of a paired probe materialize
+    IDENTICAL stores (same ids, same contents, same tag stamps), and
+    the treatment arm's composition adds exactly its ``awr:`` cursor
+    row (a meta-table entry, no memory row, no content drift).
+
+    This is the machine-checkable form of the manifest's
+    ``store_isolation`` wording (#295): identical MATERIALIZED store
+    bytes; the treatment composition writes its awareness cursor per
+    the registered composition.
+    """
+    case = runner.SCENARIO_CASES[0]  # a type-2 pair: the treatment arm composes
+    pair = case.artifact
+    control_dir = tmp_path / f"control-{case.view['view_id']}"
+    treatment_dir = tmp_path / f"treatment-{case.view['view_id']}"
+    runner.execute_arm(case, _CONTROL, control_dir)
+    runner.execute_arm(case, _TREATMENT, treatment_dir)
+
+    # Re-open each store fresh (what an auditor sees on disk).
+    control_mgr = runner._fresh_manager(control_dir)
+    treatment_mgr = runner._fresh_manager(treatment_dir)
+    try:
+        control_rows = control_mgr.list_recent(limit=1000, project=pair.project)
+        treatment_rows = treatment_mgr.list_recent(limit=1000, project=pair.project)
+        # ROW-MASS contract: the materializer writes the same row count
+        # in both arms, same neutral ids, same contents — byte-identical
+        # materialized stores (deterministic embedder, frozen clock).
+        assert len(control_rows) == len(treatment_rows), (
+            "the paired arms must materialize the same row mass"
+        )
+        assert [m.id for m in control_rows] == [m.id for m in treatment_rows]
+        assert [(m.id, m.content, m.tags, m.agent) for m in control_rows] == [
+            (m.id, m.content, m.tags, m.agent) for m in treatment_rows
+        ]
+        # The only composition write: the awareness cursor, and ONLY in
+        # the treatment store — a meta-table row, not a memory row
+        # (control stays cursor-less by construction). The cursor is the
+        # high-water + 1µs exclusive bound stamped by the composition.
+        awr_key = awareness_cursor_key(
+            project=pair.project, agent=pair.actor_agent, session=pair.actor_session
+        )
+        assert control_mgr.sqlite.get_meta(awr_key) is None
+        treatment_cursor = treatment_mgr.sqlite.get_meta(awr_key)
+        assert treatment_cursor is not None, "the treatment composition must stamp its cursor"
+        assert datetime.fromisoformat(treatment_cursor) <= runner.RUN_NOW.astimezone(UTC)
+        # the trace store is EMPTY in both arms: the abstention trace is
+        # the engine's composition-path record and lives in the
+        # treatment store only, keyed to this probe's task label.
+        assert not control_mgr.sqlite.list_traces(
+            project=pair.project, task_label=ABSTENTION_TASK_LABEL
+        )
+    finally:
+        control_mgr.close()
+        treatment_mgr.close()
+
+
 # ── the probe policy (unit pins on the registered instrument) ─────────────────
 
 
@@ -562,3 +625,133 @@ def test_record_refuses_mismatched_artifacts(tmp_path: Path) -> None:
     with pytest.raises(AssertionError):
         runner.record_run(tampered, {"scenarios": []}, tmp_path)  # type: ignore[arg-type]
     assert not list(tmp_path.iterdir())
+
+
+def test_record_refuses_foreign_run_id_before_schema_gate(
+    tmp_path: Path, collected: tuple[dict, dict]
+) -> None:
+    """Linkage BEFORE the schema gate (review #294/#295): an outcomes
+    dict carrying a FOREIGN top-level run_id is refused by name at the
+    linkage check — reachable now that it runs before verify_outcomes
+    (it was unreachable dead code at the tail of record_run)."""
+    manifest, outcomes = collected
+    foreign = {**outcomes, "run_id": "e3-d-foreign-id"}
+    with pytest.raises(AssertionError, match="run id mismatch"):
+        runner.record_run(manifest, foreign, tmp_path)  # type: ignore[arg-type]
+    assert not list(tmp_path.iterdir())
+
+
+# ── archived artifacts stay machine-checkable (review #294/#295) ──────────────
+
+
+def test_verify_recorded_roundtrip_on_archived_run(
+    tmp_path: Path, collected: tuple[dict, dict]
+) -> None:
+    """verify_recorded re-verifies an archived run directory: the
+    recorded outcomes carry the stamped ``run_id`` linkage key the bare
+    verify_outcomes rejects, so the helper strips it and re-runs both
+    gates — the archived artifact is machine-checkable, not frozen."""
+    manifest, outcomes = collected
+    run_dir = runner.record_run(manifest, outcomes, tmp_path)
+    on_disk_manifest, on_disk_outcomes = runner.verify_recorded(run_dir)
+    assert on_disk_manifest["manifest_sha256"] == manifest["manifest_sha256"]
+    assert on_disk_outcomes["scenarios"] == outcomes["scenarios"]
+    assert "run_id" not in on_disk_outcomes  # stripped linkage key
+
+    # a tampered archived artifact fails LOUD: flip an outcome row and
+    # the structural gate refuses the reload.
+    on_disk = json.loads((run_dir / "outcomes.json").read_text())
+    on_disk["scenarios"][0]["control"]["intruded"] = not on_disk["scenarios"][0]["control"][
+        "intruded"
+    ]
+    (run_dir / "outcomes.json").write_text(json.dumps(on_disk, indent=2) + "\n")
+    with pytest.raises(AssertionError):
+        runner.verify_recorded(run_dir)
+
+
+def test_verify_recorded_refuses_linkage_drift(
+    tmp_path: Path, collected: tuple[dict, dict]
+) -> None:
+    manifest, outcomes = collected
+    run_dir = runner.record_run(manifest, outcomes, tmp_path)
+    recorded = json.loads((run_dir / "outcomes.json").read_text())
+    recorded["run_id"] = "e3-d-other-run"  # tamper with the linkage stamp
+    (run_dir / "outcomes.json").write_text(json.dumps(recorded, indent=2) + "\n")
+    with pytest.raises(AssertionError, match="archived outcomes run_id"):
+        runner.verify_recorded(run_dir)
+
+
+# ── the statistics ban ignores case and spelling games (review #294/#295) ─────
+
+
+def test_stat_key_scan_is_case_and_spelling_tight(collected: tuple[dict, dict]) -> None:
+    """The recursive scan refuses the bypasses the case-sensitive
+    ``p.?value|ci\\d*`` pattern let through: P_VALUE, CI95, Verdict,
+    Pval, conf_int (any case), plus the registered lone-``p`` and
+    ``power`` spellings. The honest artifact still passes."""
+    _, outcomes = collected
+    for key in (
+        "P_VALUE",
+        "pValue",
+        "PValue",
+        "CI95",
+        "ci_95",
+        "Verdict",
+        "Pval",
+        "CONF_INT",
+        "conf_int",
+        "Statistical_Power",
+        "p",
+        "pval",
+    ):
+        smuggled = {
+            **outcomes,
+            "scenarios": [
+                {
+                    **outcomes["scenarios"][0],
+                    "control": {**outcomes["scenarios"][0]["control"], key: 0.03},
+                },
+                *outcomes["scenarios"][1:],
+            ],
+        }
+        with pytest.raises(AssertionError, match="must not carry statistical keys"):
+            runner.verify_outcomes(smuggled)
+
+
+def test_verify_manifest_gates_retrieval_pin_from_runner_2(
+    collected: tuple[dict, dict],
+) -> None:
+    """Regression (PR #411 review P1): the retrieval-pin gate is real —
+    a runner-2+ manifest WITHOUT the retrieval key is refused, while a
+    runner-1-stamped manifest without the key passes as history (the
+    gate fires only on runner_version == PINNED_RETRIEVAL_FROM)."""
+    manifest, _ = collected
+    stripped = {k: v for k, v in manifest.items() if k != "retrieval"}
+    # the stripped manifest must be internally consistent for the gate to
+    # fire on the PIN, not on an integrity hash mismatch: re-derive the
+    # core hash and the run_id from the stripped core.
+    core = {
+        k: v
+        for k, v in stripped.items()
+        if k not in ("created", "run_id", "manifest_sha256", "outcomes_sha256")
+    }
+    core_hash = runner._sha256(runner._canonical_json(core))
+    stripped["run_id"] = f"e3-d-{core_hash[:12]}"
+    body = {k: v for k, v in stripped.items() if k != "manifest_sha256"}
+    stripped["manifest_sha256"] = runner._sha256(runner._canonical_json(body))
+    with pytest.raises(AssertionError, match="must pin retrieval"):
+        runner.verify_manifest(stripped)
+
+    # runner-1-shaped history (runner_version != PINNED_RETRIEVAL_FROM)
+    # with the retrieval key absent still passes — no retroactive rule
+    # (re-derive the core hash: runner_version is part of the core).
+    history = {**stripped, "runner_version": "e3-d-runner-1"}
+    history_core = {
+        k: v
+        for k, v in history.items()
+        if k not in ("created", "run_id", "manifest_sha256", "outcomes_sha256")
+    }
+    history["run_id"] = f"e3-d-{runner._sha256(runner._canonical_json(history_core))[:12]}"
+    body1 = {k: v for k, v in history.items() if k != "manifest_sha256"}
+    history["manifest_sha256"] = runner._sha256(runner._canonical_json(body1))
+    runner.verify_manifest(history)  # does not raise

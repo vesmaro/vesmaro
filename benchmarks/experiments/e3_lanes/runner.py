@@ -264,7 +264,8 @@ def _leg_hybrid_alpha() -> float:
 
 
 def _core(manifest: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in manifest.items() if k not in ("created", "run_id", "manifest_sha256")}
+    excluded = ("created", "run_id", "manifest_sha256", "outcomes_sha256")
+    return {k: v for k, v in manifest.items() if k not in excluded}
 
 
 def manifest_core_hash(manifest: dict[str, Any]) -> str:
@@ -313,7 +314,7 @@ def verify_manifest(manifest: dict[str, Any]) -> None:
         raise AssertionError(
             f"runner_version {PINNED_RETRIEVAL_FROM} must pin retrieval.hybrid_alpha"
         )
-    body = {k: v for k, v in manifest.items() if k != "manifest_sha256"}
+    body = {k: v for k, v in manifest.items() if k not in ("manifest_sha256", "outcomes_sha256")}
     expected = _sha256(_canonical_json(body))
     if manifest["manifest_sha256"] != expected:
         raise AssertionError("manifest_sha256 does not match the manifest body")
@@ -520,7 +521,17 @@ _LEG_RATE_KEYS: frozenset[str] = frozenset(
 
 #: Any key matching this pattern ANYWHERE in the artifact (any depth,
 #: dicts inside lists included) marks it as carrying statistics — refused.
-_STAT_KEY_RE = re.compile(r"p.?value|ci\d*|verdict|signif|confiden")
+#: Case-INSENSITIVE (review #294/#295: P_VALUE/CI95/Verdict must not ride
+#: on a case flip), and the spellings close the pval/conf_int gap the
+#: bare ``p.?value`` / ``ci\\d*`` alternation left open. ``ci[\W_]?\d+``
+#: keeps the interval shape (ci95, ci_95) without false-firing on prose
+#: keys that merely contain "ci" as letters; the word-bounded ``p`` /
+#: ``pvals?`` arms close the lone ``"p": 0.03`` and ``"pval"`` rides.
+_STAT_KEY_RE = re.compile(
+    r"p.?values?|\bpvals?\b|\bp\b|power\b|ci[\W_]?\d+|verdict|signif"
+    r"|conf(?:iden|[\W_]?int)",
+    re.IGNORECASE,
+)
 
 
 def _stat_key_offenders(node: Any, path: str) -> list[str]:
@@ -585,6 +596,37 @@ def verify_outcomes(outcomes: dict[str, Any]) -> None:
 # ── collect / record ──────────────────────────────────────────────────────────
 
 
+def verify_recorded(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Re-verify an ARCHIVED run directory (machine-checkable history).
+
+    A recorded run persists ``manifest.json`` verbatim plus
+    ``outcomes.json`` in its RECORDED shape — with the linkage field
+    ``run_id`` stamped on (review #294/#295: the bare verify_* gates
+    reject exactly that key, so a plain re-check could never pass an
+    archived artifact). This helper loads both files, strips the
+    stamped linkage key, and runs the same structural gates the live
+    artifact passed: ``verify_manifest`` + ``verify_outcomes``. Raises
+    ``AssertionError`` on drift, ``FileNotFoundError`` when the run
+    directory is not a complete record.
+    """
+    manifest: dict[str, Any] = json.loads((run_dir / "manifest.json").read_text())
+    recorded: dict[str, Any] = json.loads((run_dir / "outcomes.json").read_text())
+    stamped = recorded.pop("run_id", None)
+    if stamped != manifest["run_id"]:
+        raise AssertionError(
+            f"archived outcomes run_id {stamped!r} does not match the manifest's "
+            f"run id {manifest['run_id']!r}"
+        )
+    verify_manifest(manifest)
+    expected = manifest.get("outcomes_sha256")
+    if expected is not None:  # runner-1 recorded runs predate the stamp
+        actual = hashlib.sha256(((run_dir / "outcomes.json").read_text()).encode()).hexdigest()
+        if actual != expected:
+            raise AssertionError(f"archived outcomes content hash drift: {actual} != {expected}")
+    verify_outcomes(recorded)
+    return manifest, recorded
+
+
 def collect_run(ledger: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Execute all legs and build (manifest, outcomes). Persists NOTHING.
 
@@ -618,9 +660,28 @@ def record_run(manifest: dict[str, Any], outcomes: dict[str, Any], runs_dir: Pat
             "recorded runs are write-once; a re-record is a new run state"
         )
     verify_manifest(manifest)
-    verify_outcomes(outcomes)
+    # Linkage BEFORE the schema gate (review #294/#295): verify_outcomes
+    # rejects ``run_id`` as a top-level key, so this check placed after it
+    # was unreachable dead code. A caller may pass the recorded shape
+    # (outcomes carrying the manifest's run_id) — but only with the
+    # MATCHING id; a foreign one is refused here, by name.
     if outcomes.get("run_id") not in (None, manifest["run_id"]):
-        raise AssertionError("outcomes/manifest run id mismatch")
+        raise AssertionError(
+            f"outcomes/manifest run id mismatch: {outcomes.get('run_id')!r} "
+            f"is not the manifest's run id {manifest['run_id']!r}"
+        )
+    verify_outcomes(outcomes)
+    recorded = {**outcomes, "run_id": manifest["run_id"]}
+    manifest = {
+        **manifest,
+        # Content hash of the RECORDED outcomes (the run_id-stamped shape,
+        # issue #295): verify_recorded re-checks it on reload, so a
+        # tampered archived artifact fails loud — outcomes were the only
+        # recorded file without an integrity link.
+        "outcomes_sha256": hashlib.sha256(
+            (json.dumps(recorded, indent=2) + "\n").encode()
+        ).hexdigest(),
+    }
     runs_dir.mkdir(parents=True, exist_ok=True)
     staging = runs_dir / f".tmp-{run_id}"
     if staging.exists():
@@ -628,7 +689,6 @@ def record_run(manifest: dict[str, Any], outcomes: dict[str, Any], runs_dir: Pat
     staging.mkdir()
     try:
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        recorded = {**outcomes, "run_id": manifest["run_id"]}
         (staging / "outcomes.json").write_text(json.dumps(recorded, indent=2) + "\n")
         try:
             staging.rename(run_dir)

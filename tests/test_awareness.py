@@ -1115,9 +1115,7 @@ class TestRepairSectionCap:
         for slot in result["delta"]["agents"]:
             assert slot["agent"] in rendered
         # Read-only invariant intact under the cap path.
-        assert (
-            read_awareness_cursor(manager, project=PROJECT, agent=AGENT, session=SESSION) is None
-        )
+        assert read_awareness_cursor(manager, project=PROJECT, agent=AGENT, session=SESSION) is None
 
 
 class TestRepairDisclaimerHardcoded:
