@@ -358,6 +358,30 @@ class TestUnsalvageableSlugRejected:
         finally:
             api_main._manager = None
 
+    def test_rest_twin_recall_maps_rejection_to_400(self, real_manager: MemoryManager) -> None:
+        """The recall twin mirrors the save twin's ValueError → 400 mapping.
+
+        #407 review P2-2: without the handler, an unsalvageable slug raised
+        through ``recall_context`` surfaced as a bare 500 (the save twin was
+        the only one carrying the mapping). A bad request must be a 4xx
+        with the actionable message, never a server error.
+        """
+        api_main._manager = real_manager
+        test_app = FastAPI(title="probe", lifespan=lifespan)
+        for route in app.routes:
+            test_app.routes.append(route)
+        try:
+            with TestClient(test_app) as tc:
+                resp = tc.post("/context/recall", json={"project": "my/project"})
+                assert resp.status_code == 400, resp.text
+                assert "project must be 1-64 characters" in resp.text
+                # The happy path keeps the legacy 200 "no context" shape.
+                ok = tc.post("/context/recall", json={"project": "valid-proj"})
+                assert ok.status_code == 200
+                assert ok.json()["checkpoints"] == []
+        finally:
+            api_main._manager = None
+
 
 # ---------------------------------------------------------------------------
 # End-to-end island regression — the exact June scenario, current APIs

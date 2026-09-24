@@ -1072,11 +1072,17 @@ async def save_context(req: SaveContextRequest) -> dict[str, Any]:
 async def recall_context(req: RecallContextRequest) -> dict[str, Any]:
     """Recall the most recent checkpoint memories for a project.
 
-    Mirrors the ``mnemos_recall_context`` MCP tool.
+    Mirrors the ``mnemos_recall_context`` MCP tool: the project slug is
+    normalized at the manager's query boundary (mnemos #400) and an
+    unsalvageable slug raises ``ValueError`` there — mapped to HTTP 400
+    here, mirroring the save twin's mapping above.
     """
     _track_http_call()
     mgr = get_manager()
-    memories = mgr.recall_context(project=req.project, query=req.query, limit=req.limit)
+    try:
+        memories = mgr.recall_context(project=req.project, query=req.query, limit=req.limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not memories:
         return {
             "project": req.project,
