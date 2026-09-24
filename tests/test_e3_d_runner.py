@@ -716,3 +716,42 @@ def test_stat_key_scan_is_case_and_spelling_tight(collected: tuple[dict, dict]) 
         }
         with pytest.raises(AssertionError, match="must not carry statistical keys"):
             runner.verify_outcomes(smuggled)
+
+
+def test_verify_manifest_gates_retrieval_pin_from_runner_2(
+    collected: tuple[dict, dict],
+) -> None:
+    """Regression (PR #411 review P1): the retrieval-pin gate is real —
+    a runner-2+ manifest WITHOUT the retrieval key is refused, while a
+    runner-1-stamped manifest without the key passes as history (the
+    gate fires only on runner_version == PINNED_RETRIEVAL_FROM)."""
+    manifest, _ = collected
+    stripped = {k: v for k, v in manifest.items() if k != "retrieval"}
+    # the stripped manifest must be internally consistent for the gate to
+    # fire on the PIN, not on an integrity hash mismatch: re-derive the
+    # core hash and the run_id from the stripped core.
+    core = {
+        k: v
+        for k, v in stripped.items()
+        if k not in ("created", "run_id", "manifest_sha256", "outcomes_sha256")
+    }
+    core_hash = runner._sha256(runner._canonical_json(core))
+    stripped["run_id"] = f"e3-d-{core_hash[:12]}"
+    body = {k: v for k, v in stripped.items() if k != "manifest_sha256"}
+    stripped["manifest_sha256"] = runner._sha256(runner._canonical_json(body))
+    with pytest.raises(AssertionError, match="must pin retrieval"):
+        runner.verify_manifest(stripped)
+
+    # runner-1-shaped history (runner_version != PINNED_RETRIEVAL_FROM)
+    # with the retrieval key absent still passes — no retroactive rule
+    # (re-derive the core hash: runner_version is part of the core).
+    history = {**stripped, "runner_version": "e3-d-runner-1"}
+    history_core = {
+        k: v
+        for k, v in history.items()
+        if k not in ("created", "run_id", "manifest_sha256", "outcomes_sha256")
+    }
+    history["run_id"] = f"e3-d-{runner._sha256(runner._canonical_json(history_core))[:12]}"
+    body1 = {k: v for k, v in history.items() if k != "manifest_sha256"}
+    history["manifest_sha256"] = runner._sha256(runner._canonical_json(body1))
+    runner.verify_manifest(history)  # does not raise
