@@ -250,6 +250,30 @@ _TASK_RE = re.compile(rf"^task:{_TASK_SLUG_PATTERN}\Z")
 _VESMARO_RE = re.compile(r"^mnemos:[a-z][a-z0-9\-]*\Z")
 
 
+def normalize_project_slug(value: str) -> str:
+    """Normalize a project slug to the canonical ``_PROJECT_RE`` form.
+
+    Single authority (#400, the save_checkpoint #263 single-authority
+    doctrine applied to slugs): lowercases, strips surrounding
+    whitespace, and replaces internal spaces with hyphens — the SAME
+    normalization the tag-contract lax mode applies to ``project:`` tags
+    (see ``validate_tag_contract``). Exposed so callers that build the
+    denormalised ``project`` field directly (checkpoint saves, recall
+    queries, ``_detect_project`` auto-derivation) can never diverge from
+    what the tag contract would mint for the same logical project.
+
+    Returns ``""`` for empty/whitespace-only input — callers decide
+    whether absence is valid (``recall_context`` requires a project,
+    ``search(project=None)`` is the explicit global mode).
+
+    A non-empty result is GUARANTEED to match ``_PROJECT_RE`` minus the
+    ``project:`` prefix (same slug alphabet), or the input is not a
+    salvageable slug and the caller must reject it — this helper never
+    mints a silently-different namespace.
+    """
+    return value.strip().lower().replace(" ", "-")
+
+
 class TagContractError(ValueError):
     """Raised when a tag set violates the Mnemos tag contract in strict mode."""
 
@@ -392,13 +416,14 @@ def validate_tag_contract(tags: list[str], *, strict: bool = True) -> list[str]:
     def _normalize_slug(tag: str, regex: re.Pattern[str], prefix: str) -> str | None:
         """Return a normalized form of ``tag`` if it can be salvaged, else None.
 
-        Strips leading/trailing whitespace, lowercases the slug portion, and
-        replaces spaces with hyphens. If the normalized form still does not
-        match ``regex``, the tag is not recoverable and the caller falls back
-        to the ``<prefix>unknown`` default.
+        Delegates to :func:`normalize_project_slug` (single authority,
+        #400) — the lax-mode tag patch and the direct-field callers
+        (checkpoint saves, recall queries) share ONE normalization, so
+        they can never diverge. If the normalized form still does not
+        match ``regex``, the tag is not recoverable and the caller falls
+        back to the ``<prefix>unknown`` default.
         """
-        slug = tag[len(prefix) :].strip()
-        normalized = prefix + slug.lower().replace(" ", "-")
+        normalized = prefix + normalize_project_slug(tag[len(prefix) :])
         return normalized if regex.match(normalized) else None
 
     if project_tags and not _PROJECT_RE.match(project_tags[0]):
